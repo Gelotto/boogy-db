@@ -4,6 +4,7 @@ pub mod page;
 pub mod row;
 pub mod file;
 pub mod filter;
+pub mod btree;
 
 pub use error::{BoogyError, Result};
 pub use value::{ColumnDef, Type, Value};
