@@ -6,7 +6,10 @@ pub mod file;
 pub mod filter;
 pub mod btree;
 pub mod wal;
+pub mod table;
+pub mod db;
 
 pub use error::{BoogyError, Result};
 pub use value::{ColumnDef, Type, Value};
 pub use filter::{Filter, FilterOp, FindOptions, Sort, SortDir};
+pub use db::{BoogyDb, Row};

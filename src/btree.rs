@@ -448,42 +448,7 @@ fn set_branch_child(page: &mut Page, idx: usize, child: u32) {
 }
 
 fn insert_branch_entry(page: &mut Page, child_idx: usize, key: &str, new_child: u32) {
-    let num_keys = page.num_rows() as usize;
-
-    // We need to insert a new key between child_idx and child_idx+1.
-    // Shift entries from child_idx..num_keys right by one slot.
-    // Also shift the last child pointer.
-
-    // Shift from right to left to avoid overwriting
-    // The last child (at position num_keys) needs to move to num_keys+1
-    let last_child = get_branch_child(page, num_keys);
-    set_branch_child(page, num_keys + 1, last_child);
-
-    // Shift entries [child_idx .. num_keys-1] right by one
-    for i in (child_idx..num_keys).rev() {
-        let src = PAGE_HEADER_SIZE + i * BRANCH_ENTRY_SIZE;
-        let dst = PAGE_HEADER_SIZE + (i + 1) * BRANCH_ENTRY_SIZE;
-        page.data.copy_within(src..src + BRANCH_ENTRY_SIZE, dst);
-    }
-
-    // Write the new entry at child_idx position
-    // The child at child_idx stays (it's the left child of the new key).
-    // We write: key at position child_idx, and new_child at position child_idx+1.
-    // But wait - the entry format is [child][key], so entry at child_idx has the left child.
-    // We need to set the key of entry child_idx to the separator,
-    // and child of entry child_idx+1 to new_child.
-    // But we already shifted, so entry child_idx+1 has the old entry child_idx.
-    // The old child at child_idx is still correct (left pointer).
-    // We just need to write the key at child_idx and set child at child_idx to...
-    //
-    // Actually, let's think step by step:
-    // Before: entries = [c0,k0], [c1,k1], ..., [cN-1,kN-1], [cN]
-    // After shifting entries[child_idx..] right by one:
-    //   [c0,k0], ..., [c_{idx-1},k_{idx-1}], [GAP], [c_{idx},k_{idx}], ..., [cN-1,kN-1], [cN]
-    // We fill the gap: the left child of the new key is the old c_{idx} which we need to keep,
-    // but we shifted it. So the gap's child should be the original child_idx's child.
-    //
-    // Hmm, this is getting complex. Let me just do it with the flat representation.
+    // Collect flat representation BEFORE any modifications
     let (children, keys) = collect_branch_flat(page);
     let mut new_children = children;
     let mut new_keys = keys;
@@ -624,5 +589,29 @@ mod tests {
         let mut tree = BTree::new(&mut pf, root);
         let all = tree.scan_all().unwrap();
         assert_eq!(all.len(), 20);
+    }
+
+    #[test]
+    fn test_500_uuid_inserts_separate_tree_instances() {
+        let tmp = NamedTempFile::new().unwrap();
+        let mut pf = PageFile::open(tmp.path()).unwrap();
+        let mut root = BTree::create(&mut pf).unwrap();
+
+        let mut ids = Vec::new();
+        for i in 0..500 {
+            let id = uuid::Uuid::new_v4().to_string();
+            let row = row::encode_row(&id, &[(0, &Value::Integer(i))]);
+            let mut tree = BTree::new(&mut pf, root);
+            root = tree.insert(&id, &row).unwrap();
+            pf.flush().unwrap();
+            ids.push(id);
+        }
+
+        // Verify all rows are findable
+        for (i, id) in ids.iter().enumerate() {
+            let mut tree = BTree::new(&mut pf, root);
+            let result = tree.search(id).unwrap();
+            assert!(result.is_some(), "missing row at i={i}, id={id}");
+        }
     }
 }
