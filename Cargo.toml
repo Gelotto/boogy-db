@@ -28,3 +28,6 @@ harness = false
 [[bench]]
 name = "concurrent_ops"
 harness = false
+[[bench]]
+name = "join_simulation"
+harness = false
