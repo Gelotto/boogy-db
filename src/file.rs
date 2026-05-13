@@ -6,16 +6,19 @@ use crate::error::{BoogyError, Result};
 use crate::page::{Page, PAGE_SIZE};
 
 /// Page-aligned file I/O with an in-memory page cache.
+///
+/// Pages and before-images are Box-allocated so Vec growth only copies
+/// pointers (8 bytes each) instead of 4KB page data.
 pub struct PageFile {
     file: File,
     /// Total number of pages in the file.
     num_pages: u32,
     /// Unified cache (clean + dirty pages), indexed by page number.
-    pages: Vec<Option<Page>>,
+    pages: Vec<Option<Box<Page>>>,
     /// Which pages need flushing to disk.
     dirty_flags: Vec<bool>,
     /// WAL before-images, indexed by page number.
-    before_images: Vec<Option<[u8; PAGE_SIZE]>>,
+    before_images: Vec<Option<Box<[u8; PAGE_SIZE]>>>,
     /// When false, skip 4KB memcpy for before-images (Durability::None).
     capture_before_images: bool,
 }
@@ -56,7 +59,7 @@ impl PageFile {
         let idx = page_no as usize;
         if self.pages[idx].is_none() {
             let page = self.read_page_from_disk(page_no)?;
-            self.pages[idx] = Some(page);
+            self.pages[idx] = Some(Box::new(page));
         }
         Ok(self.pages[idx].as_ref().unwrap())
     }
@@ -69,7 +72,7 @@ impl PageFile {
         if self.pages[idx].is_none() {
             if page_no < self.num_pages {
                 let page = self.read_page_from_disk(page_no)?;
-                self.pages[idx] = Some(page);
+                self.pages[idx] = Some(Box::new(page));
             } else {
                 return Err(BoogyError::Corruption(format!(
                     "page {page_no} out of range"
@@ -80,7 +83,7 @@ impl PageFile {
         if !self.dirty_flags[idx] {
             // Capture before-image before first mutation.
             if self.capture_before_images && self.before_images[idx].is_none() {
-                self.before_images[idx] = Some(self.pages[idx].as_ref().unwrap().data);
+                self.before_images[idx] = Some(Box::new(self.pages[idx].as_ref().unwrap().data));
             }
             self.dirty_flags[idx] = true;
         }
@@ -92,7 +95,7 @@ impl PageFile {
     pub fn allocate_page(&mut self) -> Result<u32> {
         let page_no = self.num_pages;
         self.num_pages += 1;
-        self.pages.push(Some(Page::default()));
+        self.pages.push(Some(Box::new(Page::default())));
         self.dirty_flags.push(true);
         self.before_images.push(None);
         Ok(page_no)
@@ -118,7 +121,7 @@ impl PageFile {
             if !self.dirty_flags[idx] {
                 // Not yet dirty -- capture from cached page if present.
                 if let Some(ref existing) = self.pages[idx] {
-                    self.before_images[idx] = Some(existing.data);
+                    self.before_images[idx] = Some(Box::new(existing.data));
                 }
             }
             // If already dirty, the original before-image was captured on first mutation.
@@ -127,7 +130,7 @@ impl PageFile {
         if page_no >= self.num_pages {
             self.num_pages = page_no + 1;
         }
-        self.pages[idx] = Some(page);
+        self.pages[idx] = Some(Box::new(page));
         self.dirty_flags[idx] = true;
     }
 
@@ -173,7 +176,7 @@ impl PageFile {
         let mut result = Vec::new();
         for (i, bi) in self.before_images.iter_mut().enumerate() {
             if let Some(data) = bi.take() {
-                result.push((i as u32, data));
+                result.push((i as u32, *data));
             }
         }
         result
@@ -194,7 +197,7 @@ impl PageFile {
     pub fn get_cached_page(&self, page_no: u32) -> Option<Page> {
         self.pages
             .get(page_no as usize)
-            .and_then(|opt| opt.as_ref())
+            .and_then(|opt| opt.as_deref())
             .cloned()
     }
 
