@@ -20,7 +20,7 @@ fn main() {
     ]).unwrap();
 
     // Seed
-    let mut boogy_ids: Vec<String> = Vec::new();
+    let mut boogy_ids: Vec<u64> = Vec::new();
     for i in 0..1000 {
         let id = db.insert("notes", &[
             ("title", Value::Text(format!("note_{i}"))),
@@ -77,7 +77,7 @@ struct Results {
     count_count: u64,
 }
 
-fn run_boogy(db: &BoogyDb, ids: &mut Vec<String>, duration: Duration) -> Results {
+fn run_boogy(db: &BoogyDb, ids: &mut Vec<u64>, duration: Duration) -> Results {
     let mut latencies = Vec::with_capacity(100_000);
     let mut rng_state: u64 = 12345;
     let mut insert_count = 0u64;
@@ -105,7 +105,7 @@ fn run_boogy(db: &BoogyDb, ids: &mut Vec<String>, duration: Duration) -> Results
             }
             30..60 => {
                 let idx = (rng_state >> 16) as usize % ids.len();
-                let _ = db.get("notes", &ids[idx]).unwrap();
+                let _ = db.get("notes", ids[idx]).unwrap();
                 get_count += 1;
             }
             60..85 => {

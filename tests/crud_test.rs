@@ -29,7 +29,7 @@ fn test_create_table_and_insert() {
         )
         .unwrap();
 
-    let row = db.get("users", &id).unwrap().unwrap();
+    let row = db.get("users", id).unwrap().unwrap();
     assert_eq!(row.id, id);
     let name = row.columns.iter().find(|(n, _)| n == "name").unwrap();
     assert_eq!(name.1, Value::Text("alice".into()));
@@ -40,7 +40,7 @@ fn test_get_not_found() {
     let (db, _dir) = create_db();
     db.create_table("users", &[ColumnDef::new("name", Type::Text)])
         .unwrap();
-    assert!(db.get("users", "nonexistent").unwrap().is_none());
+    assert!(db.get("users", 999999).unwrap().is_none());
 }
 
 #[test]
@@ -65,10 +65,10 @@ fn test_update() {
         )
         .unwrap();
 
-    db.update("users", &id, &[("age", Value::Integer(31))])
+    db.update("users", id, &[("age", Value::Integer(31))])
         .unwrap();
 
-    let row = db.get("users", &id).unwrap().unwrap();
+    let row = db.get("users", id).unwrap().unwrap();
     let age = row.columns.iter().find(|(n, _)| n == "age").unwrap();
     assert_eq!(age.1, Value::Integer(31));
 }
@@ -82,9 +82,9 @@ fn test_delete() {
     let id = db
         .insert("users", &[("name", Value::Text("alice".into()))])
         .unwrap();
-    assert!(db.delete("users", &id).unwrap());
-    assert!(db.get("users", &id).unwrap().is_none());
-    assert!(!db.delete("users", &id).unwrap());
+    assert!(db.delete("users", id).unwrap());
+    assert!(db.get("users", id).unwrap().is_none());
+    assert!(!db.delete("users", id).unwrap());
 }
 
 #[test]
@@ -220,7 +220,7 @@ fn test_many_inserts() {
     assert_eq!(db.count("data", &[]).unwrap(), 500);
 
     // Spot check
-    for (i, id) in ids.iter().enumerate().step_by(50) {
+    for (i, &id) in ids.iter().enumerate().step_by(50) {
         let row = db.get("data", id).unwrap().unwrap();
         let val = row.columns.iter().find(|(n, _)| n == "value").unwrap();
         assert_eq!(val.1, Value::Integer(i as i64));
@@ -238,7 +238,7 @@ fn test_duplicate_table_rejected() {
 fn test_table_not_found() {
     let (db, _dir) = create_db();
     assert!(db.insert("nonexistent", &[]).is_err());
-    assert!(db.get("nonexistent", "id").is_err());
+    assert!(db.get("nonexistent", 0).is_err());
 }
 
 #[test]
@@ -384,7 +384,7 @@ fn test_index_maintained_on_update() {
     let id = db.insert("t", &[("v", Value::Text("old".into()))]).unwrap();
     db.create_index("t", "idx_v", "v").unwrap();
 
-    db.update("t", &id, &[("v", Value::Text("new".into()))]).unwrap();
+    db.update("t", id, &[("v", Value::Text("new".into()))]).unwrap();
 
     let count_old = db.count("t", &[Filter::eq("v", "old")]).unwrap();
     let count_new = db.count("t", &[Filter::eq("v", "new")]).unwrap();
@@ -407,7 +407,7 @@ fn test_index_maintained_on_delete() {
     let count = db.count("t", &[Filter::eq("v", "hello")]).unwrap();
     assert_eq!(count, 1);
 
-    db.delete("t", &id).unwrap();
+    db.delete("t", id).unwrap();
 
     let count = db.count("t", &[Filter::eq("v", "hello")]).unwrap();
     assert_eq!(count, 0);
