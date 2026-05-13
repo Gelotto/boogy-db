@@ -7,7 +7,7 @@ use crate::error::{BoogyError, Result};
 use crate::file::{PageFile, WriteGuard};
 use crate::filter::{Filter, FilterOp, FindOptions, FindResult, SortDir};
 use crate::index::{self, IndexTreeReader, IndexTreeWriter};
-use crate::page::{Page, PAGE_SYSTEM};
+use crate::page::{Page, PAGE_SIZE, PAGE_SYSTEM};
 use crate::row;
 use crate::table::{IndexMeta, TableMeta};
 use crate::value::{ColumnDef, Type, Value};
@@ -200,6 +200,10 @@ fn serialize_system_page(
             data[offset..offset + 4].copy_from_slice(&idx.root_page.to_le_bytes());
             offset += 4;
         }
+
+        // encrypted flag
+        data[offset] = if meta.encrypted { 1 } else { 0 };
+        offset += 1;
     }
 
     page.update_checksum();
@@ -313,6 +317,16 @@ fn deserialize_system_page(
                 root_page: idx_root_page,
             });
         }
+
+        // encrypted flag
+        let encrypted = if offset < PAGE_SIZE - 4 {
+            let e = data[offset] != 0;
+            offset += 1;
+            e
+        } else {
+            false
+        };
+        meta.encrypted = encrypted;
 
         tables.push(meta);
     }
