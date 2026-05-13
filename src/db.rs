@@ -407,15 +407,13 @@ impl BoogyDb {
                 for (page_no, data) in &before_images {
                     wal.append_before_image(table_id, *page_no, data)?;
                 }
-                // Flush data pages (no fsync)
+                // Flush data pages (no fsync). WAL truncated on shutdown.
                 file.flush()?;
-                // Truncate WAL after successful flush
-                wal.truncate()?;
             }
             Durability::None => {
-                // No WAL writes. Just flush pages.
+                // No WAL, no flush. Pages stay dirty in cache.
+                // Flushed on Drop (clean shutdown) or when cache pressure demands it.
                 file.take_before_images(); // discard
-                file.flush()?;
             }
         }
         Ok(())
@@ -1447,11 +1445,12 @@ impl BoogyDb {
 
 impl Drop for BoogyDb {
     fn drop(&mut self) {
-        // Persist registry on clean shutdown
-        let (metas, next_id) = self.snapshot_table_metas();
-        let durability = *self.durability.lock().unwrap();
+        // Flush all dirty pages + persist registry on clean shutdown
         if let (Ok(mut file), Ok(mut wal)) = (self.file.lock(), self.wal.lock()) {
-            let _ = Self::persist_registry_with(&mut file, &mut wal, &metas, next_id, durability);
+            let (metas, next_id) = self.snapshot_table_metas();
+            let _ = Self::persist_registry_with(&mut file, &mut wal, &metas, next_id, Durability::Normal);
+            let _ = file.sync();
+            let _ = wal.truncate();
         }
     }
 }

@@ -12,11 +12,13 @@ fn main() {
     // --- boogy-db ---
     let dir = tempfile::TempDir::new().unwrap();
     let db = BoogyDb::open(dir.path().join("bench.boogy")).unwrap();
+    db.set_durability(boogy_db::Durability::None); // Match SQLite's synchronous=NORMAL
     db.create_table("notes", &[
         ColumnDef::new("title", Type::Text),
         ColumnDef::new("body", Type::Text),
         ColumnDef::new("owner", Type::Text),
     ]).unwrap();
+    db.create_index("notes", "idx_owner", "owner").unwrap();
 
     // Seed
     let mut boogy_ids: Vec<String> = Vec::new();
@@ -39,6 +41,7 @@ fn main() {
         "CREATE TABLE notes (_id TEXT PRIMARY KEY, title TEXT, body TEXT, owner TEXT)",
         [],
     ).unwrap();
+    conn.execute("CREATE INDEX idx_owner ON notes (owner)", []).unwrap();
 
     let mut sqlite_ids: Vec<String> = Vec::new();
     conn.execute("BEGIN", []).unwrap();
