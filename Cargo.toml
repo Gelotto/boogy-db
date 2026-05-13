@@ -16,3 +16,6 @@ rusqlite = { version = "0.38", features = ["bundled"] }
 [[bench]]
 name = "sqlite_comparison"
 harness = false
+[[bench]]
+name = "point_ops"
+harness = false

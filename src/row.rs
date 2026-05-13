@@ -9,19 +9,45 @@ const TAG_REAL: u8 = 3;
 const TAG_BLOB: u8 = 4;
 const TAG_BOOLEAN: u8 = 5;
 
-/// Encode a row (_id + columns) into compact binary format.
+/// Encode a row (_id + columns) into compact binary format with offset directory.
 ///
-/// Layout: [id_len:2][id_bytes][num_cols:2][col_id:2][tag:1][value]...
+/// Layout:
+///   [id_len:2][id_bytes]
+///   [num_cols:2]
+///   [offset_directory: num_cols × 4 bytes]
+///     for each column (sorted by col_id): [col_id:2][data_offset:2]
+///   [column_data]
+///     for each column: [type_tag:1][value_bytes]
+///
+/// The offset directory enables O(1) column access via binary search on col_id.
 pub fn encode_row(id: &str, columns: &[(u16, &Value)]) -> Vec<u8> {
     let mut buf = Vec::with_capacity(64);
     let id_bytes = id.as_bytes();
     buf.extend_from_slice(&(id_bytes.len() as u16).to_le_bytes());
     buf.extend_from_slice(id_bytes);
     buf.extend_from_slice(&(columns.len() as u16).to_le_bytes());
-    for &(col_id, val) in columns {
-        buf.extend_from_slice(&col_id.to_le_bytes());
-        encode_value(&mut buf, val);
+
+    // Sort columns by col_id for binary search
+    let mut sorted: Vec<(u16, &Value)> = columns.to_vec();
+    sorted.sort_by_key(|(id, _)| *id);
+
+    // First pass: encode all column data to compute offsets
+    let mut col_data = Vec::with_capacity(48);
+    let mut offsets: Vec<(u16, u16)> = Vec::with_capacity(sorted.len());
+    for &(col_id, val) in &sorted {
+        let data_offset = col_data.len() as u16;
+        offsets.push((col_id, data_offset));
+        encode_value(&mut col_data, val);
     }
+
+    // Write offset directory
+    for &(col_id, data_offset) in &offsets {
+        buf.extend_from_slice(&col_id.to_le_bytes());
+        buf.extend_from_slice(&data_offset.to_le_bytes());
+    }
+
+    // Write column data
+    buf.extend_from_slice(&col_data);
     buf
 }
 
@@ -73,18 +99,27 @@ pub fn decode_row(data: &[u8]) -> Result<DecodedRow> {
         .map_err(|_| BoogyError::Corruption("invalid utf8 in _id".into()))?;
     offset += id_len;
 
-    // columns
+    // num columns
     ensure_bytes(data, offset, 2)?;
     let num_cols = u16::from_le_bytes(data[offset..offset + 2].try_into().unwrap()) as usize;
     offset += 2;
 
+    // Read offset directory
+    let dir_size = num_cols * 4;
+    ensure_bytes(data, offset, dir_size)?;
+    let dir_start = offset;
+    offset += dir_size;
+
+    // Column data starts here
+    let col_data_start = offset;
+
     let mut columns = Vec::with_capacity(num_cols);
-    for _ in 0..num_cols {
-        ensure_bytes(data, offset, 2)?;
-        let col_id = u16::from_le_bytes(data[offset..offset + 2].try_into().unwrap());
-        offset += 2;
-        let (val, consumed) = decode_value(&data[offset..])?;
-        offset += consumed;
+    for i in 0..num_cols {
+        let entry = dir_start + i * 4;
+        let col_id = u16::from_le_bytes(data[entry..entry + 2].try_into().unwrap());
+        let data_offset = u16::from_le_bytes(data[entry + 2..entry + 4].try_into().unwrap()) as usize;
+        let abs_offset = col_data_start + data_offset;
+        let (val, _) = decode_value(&data[abs_offset..])?;
         columns.push((col_id, val));
     }
 
@@ -100,7 +135,7 @@ pub fn extract_id(data: &[u8]) -> Result<&str> {
         .map_err(|_| BoogyError::Corruption("invalid utf8 in _id".into()))
 }
 
-/// Extract a single column value by column ID without decoding all columns.
+/// Extract a single column value by column ID in O(1) via binary search on the offset directory.
 pub fn extract_column(data: &[u8], target_col_id: u16) -> Result<Option<Value>> {
     let mut offset = 0;
 
@@ -114,16 +149,31 @@ pub fn extract_column(data: &[u8], target_col_id: u16) -> Result<Option<Value>> 
     let num_cols = u16::from_le_bytes(data[offset..offset + 2].try_into().unwrap()) as usize;
     offset += 2;
 
-    for _ in 0..num_cols {
-        ensure_bytes(data, offset, 2)?;
-        let col_id = u16::from_le_bytes(data[offset..offset + 2].try_into().unwrap());
-        offset += 2;
-        if col_id == target_col_id {
-            let (val, _) = decode_value(&data[offset..])?;
-            return Ok(Some(val));
+    if num_cols == 0 {
+        return Ok(None);
+    }
+
+    let dir_start = offset;
+    let col_data_start = dir_start + num_cols * 4;
+
+    // Binary search the offset directory for target_col_id
+    let mut lo = 0usize;
+    let mut hi = num_cols;
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        let entry = dir_start + mid * 4;
+        ensure_bytes(data, entry, 4)?;
+        let col_id = u16::from_le_bytes(data[entry..entry + 2].try_into().unwrap());
+        match col_id.cmp(&target_col_id) {
+            std::cmp::Ordering::Less => lo = mid + 1,
+            std::cmp::Ordering::Greater => hi = mid,
+            std::cmp::Ordering::Equal => {
+                let data_offset = u16::from_le_bytes(data[entry + 2..entry + 4].try_into().unwrap()) as usize;
+                let abs_offset = col_data_start + data_offset;
+                let (val, _) = decode_value(&data[abs_offset..])?;
+                return Ok(Some(val));
+            }
         }
-        // Skip this value
-        offset += value_byte_size(&data[offset..])?;
     }
     Ok(None)
 }
@@ -160,21 +210,6 @@ fn decode_value(data: &[u8]) -> Result<(Value, usize)> {
             ensure_bytes(data, 1, 1)?;
             Ok((Value::Boolean(data[1] != 0), 2))
         }
-        tag => Err(BoogyError::Corruption(format!("unknown type tag: {tag}"))),
-    }
-}
-
-fn value_byte_size(data: &[u8]) -> Result<usize> {
-    ensure_bytes(data, 0, 1)?;
-    match data[0] {
-        TAG_NULL => Ok(1),
-        TAG_TEXT | TAG_BLOB => {
-            ensure_bytes(data, 1, 4)?;
-            let len = u32::from_le_bytes(data[1..5].try_into().unwrap()) as usize;
-            Ok(5 + len)
-        }
-        TAG_INTEGER | TAG_REAL => Ok(9),
-        TAG_BOOLEAN => Ok(2),
         tag => Err(BoogyError::Corruption(format!("unknown type tag: {tag}"))),
     }
 }
@@ -242,6 +277,20 @@ mod tests {
     }
 
     #[test]
+    fn test_extract_column_binary_search() {
+        // Test with many columns to verify binary search works
+        let values: Vec<Value> = (0..20).map(|i| Value::Integer(i * 100)).collect();
+        let cols: Vec<(u16, &Value)> = values.iter().enumerate().map(|(i, v)| (i as u16, v)).collect();
+        let encoded = encode_row("test", &cols);
+
+        // Access last column directly — should be O(1) via binary search
+        assert_eq!(extract_column(&encoded, 19).unwrap(), Some(Value::Integer(1900)));
+        assert_eq!(extract_column(&encoded, 0).unwrap(), Some(Value::Integer(0)));
+        assert_eq!(extract_column(&encoded, 10).unwrap(), Some(Value::Integer(1000)));
+        assert_eq!(extract_column(&encoded, 20).unwrap(), None);
+    }
+
+    #[test]
     fn test_blob_round_trip() {
         let blob_data = vec![0xFF, 0x00, 0xAB, 0xCD];
         let v0 = Value::Blob(blob_data.clone());
@@ -258,5 +307,20 @@ mod tests {
         let encoded = encode_row("empty", &cols);
         let decoded = decode_row(&encoded).unwrap();
         assert_eq!(decoded.columns[0].1, Value::Text(String::new()));
+    }
+
+    #[test]
+    fn test_unsorted_columns_get_sorted() {
+        let v0 = Value::Integer(100);
+        let v1 = Value::Integer(200);
+        let v2 = Value::Integer(300);
+        // Encode out of order
+        let cols = vec![(2u16, &v2), (0, &v0), (1, &v1)];
+        let encoded = encode_row("test", &cols);
+        // Decode should return sorted by col_id
+        let decoded = decode_row(&encoded).unwrap();
+        assert_eq!(decoded.columns[0], (0, Value::Integer(100)));
+        assert_eq!(decoded.columns[1], (1, Value::Integer(200)));
+        assert_eq!(decoded.columns[2], (2, Value::Integer(300)));
     }
 }
