@@ -1344,18 +1344,25 @@ impl BoogyDb {
                 })
             };
 
+            // Build patches: (col_id, &Value) pairs for patch_row_multi
+            let patches: Vec<(u16, &Value)> = fields.iter()
+                .zip(field_col_ids.iter())
+                .filter_map(|((_, val), col_id)| col_id.map(|cid| (cid, val)))
+                .collect();
+
             let updater = |old_bytes: &[u8]| -> Vec<u8> {
-                let decoded = row::decode_row(old_bytes).unwrap();
-                let mut col_map: HashMap<u16, Value> =
-                    decoded.columns.into_iter().collect();
-                for (i, (_, val)) in fields.iter().enumerate() {
-                    if let Some(col_id) = field_col_ids[i] {
+                row::patch_row_multi(old_bytes, &patches).unwrap_or_else(|_| {
+                    // Fallback: full decode/encode if patch fails
+                    let decoded = row::decode_row(old_bytes).unwrap();
+                    let mut col_map: HashMap<u16, Value> =
+                        decoded.columns.into_iter().collect();
+                    for &(col_id, val) in &patches {
                         col_map.insert(col_id, val.clone());
                     }
-                }
-                let col_values: Vec<(u16, &Value)> =
-                    col_map.iter().map(|(k, v)| (*k, v)).collect();
-                row::encode_row(decoded.id, &col_values)
+                    let col_values: Vec<(u16, &Value)> =
+                        col_map.iter().map(|(k, v)| (*k, v)).collect();
+                    row::encode_row(decoded.id, &col_values)
+                })
             };
 
             let mut tree = BTreeWriter::new(&mut guard, state.meta.root_page);

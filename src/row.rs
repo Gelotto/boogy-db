@@ -78,6 +78,101 @@ fn encode_value(buf: &mut Vec<u8>, val: &Value) {
     }
 }
 
+/// Encode a single Value into bytes (type_tag + value_bytes).
+pub fn encode_value_to_vec(val: &Value) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(16);
+    encode_value(&mut buf, val);
+    buf
+}
+
+/// Patch a raw row by replacing a single column's value in-place.
+/// Returns a new Vec<u8> with the column replaced. Avoids full decode/encode.
+/// Much faster than decode_row → merge → encode_row for single-column updates.
+pub fn patch_row(data: &[u8], target_col_id: u16, new_val: &Value) -> Result<Vec<u8>> {
+    ensure_bytes(data, 0, 10)?; // rowid(8) + num_cols(2)
+    let num_cols = u16::from_le_bytes(data[8..10].try_into().unwrap()) as usize;
+    if num_cols == 0 {
+        return Ok(data.to_vec());
+    }
+
+    let dir_start = 10; // after rowid(8) + num_cols(2)
+    let col_data_start = dir_start + num_cols * 4;
+
+    // Binary search for the target column in the offset directory
+    let mut lo = 0usize;
+    let mut hi = num_cols;
+    let mut found_idx = None;
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        let entry = dir_start + mid * 4;
+        let col_id = u16::from_le_bytes(data[entry..entry + 2].try_into().unwrap());
+        match col_id.cmp(&target_col_id) {
+            std::cmp::Ordering::Less => lo = mid + 1,
+            std::cmp::Ordering::Greater => hi = mid,
+            std::cmp::Ordering::Equal => { found_idx = Some(mid); break; }
+        }
+    }
+
+    let col_idx = match found_idx {
+        Some(i) => i,
+        None => return Ok(data.to_vec()), // column not found, return unchanged
+    };
+
+    // Get the byte range of the old value
+    let entry = dir_start + col_idx * 4;
+    let old_data_offset = u16::from_le_bytes(data[entry + 2..entry + 4].try_into().unwrap()) as usize;
+    let old_abs_start = col_data_start + old_data_offset;
+    let old_abs_end = if col_idx + 1 < num_cols {
+        let next_entry = dir_start + (col_idx + 1) * 4;
+        col_data_start + u16::from_le_bytes(data[next_entry + 2..next_entry + 4].try_into().unwrap()) as usize
+    } else {
+        data.len()
+    };
+    let old_len = old_abs_end - old_abs_start;
+
+    // Encode the new value
+    let new_encoded = encode_value_to_vec(new_val);
+    let new_len = new_encoded.len();
+    let size_diff = new_len as isize - old_len as isize;
+
+    if size_diff == 0 {
+        // Same size: direct overwrite, no offset updates needed
+        let mut result = data.to_vec();
+        result[old_abs_start..old_abs_end].copy_from_slice(&new_encoded);
+        return Ok(result);
+    }
+
+    // Different size: splice and update subsequent offsets
+    let new_total_len = (data.len() as isize + size_diff) as usize;
+    let mut result = Vec::with_capacity(new_total_len);
+
+    // Copy everything before the old value
+    result.extend_from_slice(&data[..old_abs_start]);
+    // Insert new value
+    result.extend_from_slice(&new_encoded);
+    // Copy everything after the old value
+    result.extend_from_slice(&data[old_abs_end..]);
+
+    // Update offset directory entries for columns AFTER the changed one
+    for i in (col_idx + 1)..num_cols {
+        let e = dir_start + i * 4;
+        let old_off = u16::from_le_bytes(result[e + 2..e + 4].try_into().unwrap()) as i32;
+        let new_off = (old_off + size_diff as i32) as u16;
+        result[e + 2..e + 4].copy_from_slice(&new_off.to_le_bytes());
+    }
+
+    Ok(result)
+}
+
+/// Patch a raw row by replacing multiple columns. Applies patches sequentially.
+pub fn patch_row_multi(data: &[u8], patches: &[(u16, &Value)]) -> Result<Vec<u8>> {
+    let mut result = data.to_vec();
+    for &(col_id, val) in patches {
+        result = patch_row(&result, col_id, val)?;
+    }
+    Ok(result)
+}
+
 /// Decoded row: the rowid and all column values.
 pub struct DecodedRow {
     pub id: u64,
