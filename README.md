@@ -14,6 +14,7 @@ A fast embedded storage engine for Rust, purpose-built for concurrent API worklo
   - [Mixed Workload (Concurrent)](#mixed-workload-concurrent)
   - [Join Simulation (User + Posts)](#join-simulation-user--posts)
   - [Bulk Operations](#bulk-operations)
+- [Encryption](#encryption)
 - [Architecture](#architecture)
 - [License](#license)
 
@@ -29,6 +30,7 @@ A fast embedded storage engine for Rust, purpose-built for concurrent API worklo
 - **Zero-copy filter evaluation** — `extract_column_raw` returns a slice into the page; `eval_filter_raw` compares raw bytes without allocating a `Value`
 - **In-place row patching** — `patch_row` splices raw bytes for single-column updates without full decode/encode
 - **Batch bulk operations** — `delete_matching`/`update_matching` walk the leaf chain once, rebuilding each page in a single pass instead of per-row tree surgery
+- **Per-table encryption** — opt-in AES-256-GCM at the page level. Plaintext in memory, ciphertext on disk. Zero overhead on unencrypted tables
 
 ## Quick Start
 
@@ -88,6 +90,8 @@ let n = db.count("users", &[Filter::eq("email", "alice@example.com")])?;
 | `create_index(table, name, column)` | Create a secondary index |
 | `drop_index(table, name)` | Drop an index |
 | `create_table(table, columns)` | Create a table |
+| `create_table_encrypted(table, columns, key)` | Create an encrypted table (AES-256-GCM) |
+| `unlock_table(table, key)` | Provide the key for an encrypted table after reopen |
 | `drop_table(table)` | Drop a table |
 | `transaction(fn)` | Multi-table transaction |
 
@@ -236,6 +240,56 @@ Batch insert, update, and delete operations. Bulk insert uses `insert_many` (boo
 
 boogy-db now beats SQLite on bulk inserts at ALL batch sizes (without index). Bulk delete wins at small batches. Bulk update and indexed bulk insert remain areas where SQLite leads.
 
+## Encryption
+
+boogy-db supports opt-in AES-256-GCM encryption at the table level. Encrypted tables store ciphertext on disk and in the WAL, while the in-memory page cache always holds plaintext. Unencrypted tables have zero encryption overhead.
+
+### Creating an Encrypted Table
+
+```rust
+let key: [u8; 32] = /* your 256-bit key */;
+
+db.create_table_encrypted("secrets", &[
+    ColumnDef::new("token", Type::Text),
+    ColumnDef::new("data", Type::Blob),
+], &key)?;
+
+// All operations work identically — encryption is transparent
+let id = db.insert("secrets", &[
+    ("token", Value::Text("sk_live_abc123".into())),
+    ("data", Value::Blob(sensitive_bytes)),
+])?;
+
+let row = db.get("secrets", id)?.unwrap();
+```
+
+### Reopening an Encrypted Database
+
+Keys are never stored on disk. On reopen, call `unlock_table` before accessing encrypted tables:
+
+```rust
+let db = BoogyDb::open("my.boogy")?;
+
+// Unencrypted tables work immediately
+let _ = db.get("public_table", 1)?;
+
+// Encrypted tables require the key
+db.unlock_table("secrets", &key)?;
+let _ = db.get("secrets", 1)?;
+
+// Without unlocking, operations return BoogyError::TableLocked
+```
+
+### How It Works
+
+- **Algorithm**: AES-256-GCM with random 12-byte nonces per page write. The GCM auth tag provides both confidentiality and integrity (stronger than CRC32).
+- **Encrypted page layout**: `[nonce:12][ciphertext:4068][auth_tag:16]` = 4096 bytes (same page size).
+- **Key management**: Caller provides a raw `[u8; 32]` key. Key derivation (Argon2, HKDF, etc.) is the caller's responsibility. Different tables can use different keys.
+- **Encryption points**: Pages are encrypted before writing to the WAL and data file, decrypted on cache miss when reading from disk. The page cache always holds plaintext for fast access.
+- **Wrong key detection**: `unlock_table` verifies the key by attempting to decrypt the table's root page. If the GCM auth tag doesn't match, it returns `BoogyError::InvalidKey`.
+- **Index encryption**: Secondary indexes on encrypted tables are encrypted with the same key.
+- **Performance impact**: ~1.5µs per page for AES-256-GCM with AES-NI. Only affects cache misses and WAL writes — cached reads have zero overhead.
+
 ## Architecture
 
 - **Storage**: Single file per database, 4 KB page-aligned. Page 0 is the system page (table registry). Each table is a separate B+ tree.
@@ -244,6 +298,7 @@ boogy-db now beats SQLite on bulk inserts at ALL batch sizes (without index). Bu
 - **Indexes**: Each secondary index is a separate B+ tree (`IndexTreeReader`/`IndexTreeWriter`) keyed by composite `(encoded_value, rowid)` bytes. Values are encoded for correct byte-order sorting (integers: big-endian with sign-flip; floats: IEEE 754 with sign normalization; text: null-terminated UTF-8). Index lookups use `scan_prefix` to find all rowids for a value, then `multi_get_sorted` to batch-fetch the matching rows.
 - **Concurrency**: Per-table `RwLock` for table metadata. Page cache is `RwLock<Vec<Option<Arc<Page>>>>` — readers take a shared lock, clone the `Arc` pointer, and release immediately. Writers get exclusive access to a `Mutex<WriteState>` dirty-page overlay via `WriteGuard`; `peek_dirty` provides zero-copy reads of dirty pages during tree traversal. `BTreeReader`/`IndexTreeReader` take `&PageFile` and never hold any lock during tree traversal.
 - **Lazy Row**: The public `Row` type stores raw bytes (`Vec<u8>`) and column names (`Arc<Vec<String>>`). `row.get("name")` decodes only the requested column via `extract_column` (binary search on the offset directory). `row.columns()` does full decode only when all columns are needed.
+- **Encryption**: Per-table AES-256-GCM via `Cipher` in `crypto.rs`. `TableMeta` stores `encrypted: bool` (persisted in system page) and `cipher: Option<Cipher>` (in-memory only). `commit_write` encrypts after-images before WAL append. `sync_all` encrypts pages before disk flush. `unlock_table` decrypts and preloads all table pages into cache. The system page is never encrypted (schema metadata stays plaintext).
 - **WAL**: Redo-log (after-image) design. `WriteGuard::commit()` publishes dirty pages to the shared cache and returns after-images. The commit path writes these after-images to the WAL — the data file is never modified during commits. On clean shutdown (`Drop`), all cached pages are flushed to the data file and the WAL is truncated. On crash recovery, the WAL is replayed forward to apply committed pages. Configurable durability: `Immediate` (fsync WAL every commit), `Normal` (WAL writes without fsync), `None` (no WAL writes).
 
 ## License
