@@ -2,11 +2,11 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 
-use crate::btree::BTree;
+use crate::btree::{BTreeReader, BTreeWriter};
 use crate::error::{BoogyError, Result};
-use crate::file::PageFile;
+use crate::file::{PageFile, WriteGuard};
 use crate::filter::{Filter, FilterOp, FindOptions, FindResult, SortDir};
-use crate::index::{self, IndexTree};
+use crate::index::{self, IndexTreeReader, IndexTreeWriter};
 use crate::page::{Page, PAGE_SYSTEM};
 use crate::row;
 use crate::table::{IndexMeta, TableMeta};
@@ -65,7 +65,7 @@ struct TableState {
 /// Uses per-table `RwLock`s so operations on different tables never block each
 /// other, and reads on the same table can proceed concurrently.
 pub struct BoogyDb {
-    file: Mutex<PageFile>,
+    file: PageFile,
     wal: Mutex<Wal>,
     tables: RwLock<HashMap<String, Arc<RwLock<TableState>>>>,
     next_table_id: Mutex<u32>,
@@ -359,20 +359,20 @@ impl BoogyDb {
         {
             let mut wal = Wal::open(&wal_path)?;
             if wal.entry_count() > 0 {
-                let mut file = PageFile::open(&path)?;
+                let file = PageFile::open(&path)?;
                 let entries = wal.read_entries()?;
                 // Undo: restore original pages (reverse order for correctness).
                 for entry in entries.iter().rev() {
                     let page = Page::from_bytes_unchecked(entry.page_data);
-                    file.put_page(entry.page_no, page);
+                    file.put_page_direct(entry.page_no, page);
                 }
-                file.sync()?;
+                file.sync_all()?;
                 wal.truncate()?;
             }
         }
 
         // Step 2: Normal open.
-        let mut file = PageFile::open(&path)?;
+        let file = PageFile::open(&path)?;
         let wal = Wal::open(&wal_path)?;
 
         // Step 3: Load table registry from system page if it exists.
@@ -380,7 +380,7 @@ impl BoogyDb {
         let mut next_table_id = 1u32;
 
         if file.page_count() > 0 {
-            let sys_page = file.read_page(0)?.clone();
+            let sys_page = file.read_page(0)?;
             if sys_page.flags() & PAGE_SYSTEM != 0 {
                 let (metas, next_id) = deserialize_system_page(&sys_page)?;
                 next_table_id = next_id;
@@ -393,7 +393,7 @@ impl BoogyDb {
         }
 
         Ok(Self {
-            file: Mutex::new(file),
+            file,
             wal: Mutex::new(wal),
             tables: RwLock::new(tables),
             next_table_id: Mutex::new(next_table_id),
@@ -405,9 +405,7 @@ impl BoogyDb {
     /// Set the durability level for writes.
     pub fn set_durability(&self, d: Durability) {
         self.durability.store(d as u8, std::sync::atomic::Ordering::Relaxed);
-        if let Ok(mut file) = self.file.lock() {
-            file.set_capture_before_images(!matches!(d, Durability::None));
-        }
+        self.file.set_capture_before_images(!matches!(d, Durability::None));
     }
 
     /// Get current durability level.
@@ -419,41 +417,34 @@ impl BoogyDb {
         }
     }
 
-    /// Write before-images from the PageFile to the WAL, then flush.
-    /// Called after every B+ tree mutation while holding both locks.
-    fn commit_with_wal(
-        file: &mut PageFile,
-        wal: &mut Wal,
+    /// Commit a WriteGuard, writing before-images to the WAL as appropriate
+    /// for the durability level. This is the single commit path used by all
+    /// write operations.
+    fn commit_write(
+        guard: WriteGuard,
+        wal: &Mutex<Wal>,
         durability: Durability,
         table_id: u32,
     ) -> Result<()> {
         match durability {
             Durability::Immediate => {
-                // Write before-images to WAL
-                let before_images = file.take_before_images();
+                let before_images = guard.commit(true)?;
+                let mut wal = wal.lock().unwrap();
                 for (page_no, data) in &before_images {
                     wal.append_before_image(table_id, *page_no, data)?;
                 }
-                // Fsync WAL first (durability guarantee)
                 wal.sync()?;
-                // Then flush data pages + fsync
-                file.sync()?;
-                // WAL entries are now obsolete -- truncate
                 wal.truncate()?;
             }
             Durability::Normal => {
-                // Write before-images to WAL (no fsync)
-                let before_images = file.take_before_images();
+                let before_images = guard.commit(true)?;
+                let mut wal = wal.lock().unwrap();
                 for (page_no, data) in &before_images {
                     wal.append_before_image(table_id, *page_no, data)?;
                 }
-                // Flush data pages (no fsync). WAL truncated on shutdown.
-                file.flush()?;
             }
             Durability::None => {
-                // No WAL, no flush. Pages stay dirty in cache.
-                // Flushed on Drop (clean shutdown) or when cache pressure demands it.
-                file.take_before_images(); // discard
+                guard.commit(false)?; // publish to cache only, no disk flush
             }
         }
         Ok(())
@@ -474,31 +465,30 @@ impl BoogyDb {
     }
 
     /// Persist the table registry to the system page (page 0).
-    /// Caller must hold file and wal locks.
-    fn persist_registry_with(
-        file: &mut PageFile,
-        wal: &mut Wal,
+    fn persist_registry(
+        file: &PageFile,
+        wal: &Mutex<Wal>,
         metas: &[TableMeta],
         next_table_id: u32,
         durability: Durability,
     ) -> Result<()> {
+        let mut guard = file.begin_write();
         // Ensure page 0 exists.
         if file.page_count() == 0 {
-            file.allocate_page()?;
+            guard.allocate_page()?;
         }
 
         let page = serialize_system_page(metas, next_table_id);
-        file.put_page(0, page);
+        guard.put_page(0, page);
 
-        // Commit the system page with WAL protection.
-        Self::commit_with_wal(file, wal, durability, 0)?;
+        Self::commit_write(guard, wal, durability, 0)?;
         Ok(())
     }
 
     /// Update all indexes for a row using encoded row bytes.
     /// remove=true deletes from indexes, remove=false inserts.
     fn index_update_row(
-        file: &mut PageFile,
+        guard: &mut WriteGuard,
         meta: &mut TableMeta,
         rowid: u64,
         row_bytes: &[u8],
@@ -515,7 +505,7 @@ impl BoogyDb {
                 let val = crate::row::extract_column(row_bytes, cid)?
                     .unwrap_or(Value::Null);
                 if let Some(key) = index::encode_index_key(ct, &val, rowid) {
-                    let mut tree = IndexTree::new(file, idx.root_page);
+                    let mut tree = IndexTreeWriter::new(guard, idx.root_page);
                     if remove {
                         tree.delete(&key)?;
                     } else {
@@ -584,18 +574,17 @@ impl BoogyDb {
             }
         }
 
-        // Allocate the root page (needs file lock + wal lock).
+        // Allocate the root page via WriteGuard.
         let (root, table_id) = {
-            let mut file = self.file.lock().unwrap();
-            let mut wal = self.wal.lock().unwrap();
             let durability = self.durability();
+            let mut guard = self.file.begin_write();
 
             // Ensure system page exists before any table pages.
-            if file.page_count() == 0 {
-                file.allocate_page()?; // page 0 = system page
+            if self.file.page_count() == 0 {
+                guard.allocate_page()?; // page 0 = system page
             }
 
-            let root = BTree::create(&mut file)?;
+            let root = BTreeWriter::create(&mut guard)?;
             let table_id = {
                 let mut next = self.next_table_id.lock().unwrap();
                 let id = *next;
@@ -603,7 +592,7 @@ impl BoogyDb {
                 id
             };
 
-            Self::commit_with_wal(&mut file, &mut wal, durability, table_id)?;
+            Self::commit_write(guard, &self.wal, durability, table_id)?;
             (root, table_id)
         };
 
@@ -621,14 +610,9 @@ impl BoogyDb {
         }
 
         // Persist registry to system page.
-        // Snapshot metadata first (no file lock held), then write.
         let (metas, next_id) = self.snapshot_table_metas();
         let durability = self.durability();
-        {
-            let mut file = self.file.lock().unwrap();
-            let mut wal = self.wal.lock().unwrap();
-            Self::persist_registry_with(&mut file, &mut wal, &metas, next_id, durability)?;
-        }
+        Self::persist_registry(&self.file, &self.wal, &metas, next_id, durability)?;
 
         Ok(())
     }
@@ -645,11 +629,7 @@ impl BoogyDb {
         // Persist updated registry.
         let (metas, next_id) = self.snapshot_table_metas();
         let durability = self.durability();
-        {
-            let mut file = self.file.lock().unwrap();
-            let mut wal = self.wal.lock().unwrap();
-            Self::persist_registry_with(&mut file, &mut wal, &metas, next_id, durability)?;
-        }
+        Self::persist_registry(&self.file, &self.wal, &metas, next_id, durability)?;
 
         Ok(())
     }
@@ -682,29 +662,22 @@ impl BoogyDb {
             .collect();
         let row_bytes = row::encode_row(rowid, &col_values);
 
-        // 6. Brief file lock for B-tree insert + index maintenance.
+        // 6. WriteGuard for B-tree insert + index maintenance.
         let durability = self.durability();
-        let new_root = {
-            let mut file = self.file.lock().unwrap();
-            let mut tree = BTree::new(&mut file, state.meta.root_page);
+        {
+            let mut guard = self.file.begin_write();
+            let mut tree = BTreeWriter::new(&mut guard, state.meta.root_page);
             let new_root = tree.insert(rowid, &row_bytes)?;
             state.meta.root_page = new_root;
 
             if !state.meta.indexes.is_empty() {
-                Self::index_update_row(&mut file, &mut state.meta, rowid, &row_bytes, false)?;
+                Self::index_update_row(&mut guard, &mut state.meta, rowid, &row_bytes, false)?;
             }
 
-            if matches!(durability, Durability::None) {
-                file.take_before_images();
-            } else {
-                let mut wal = self.wal.lock().unwrap();
-                Self::commit_with_wal(&mut file, &mut wal, durability, state.meta.table_id)?;
-            }
-            state.meta.root_page
-        };
+            Self::commit_write(guard, &self.wal, durability, state.meta.table_id)?;
+        }
 
         // 7. Update table state.
-        state.meta.root_page = new_root;
         state.meta.row_count += 1;
 
         Ok(rowid)
@@ -739,25 +712,20 @@ impl BoogyDb {
             .collect();
         let row_bytes = row::encode_row(rowid, &col_values);
 
-        // 6. Brief file lock for B-tree insert + index maintenance.
+        // 6. WriteGuard for B-tree insert + index maintenance.
         let durability = self.durability();
         {
-            let mut file = self.file.lock().unwrap();
-            let mut tree = BTree::new(&mut file, state.meta.root_page);
+            let mut guard = self.file.begin_write();
+            let mut tree = BTreeWriter::new(&mut guard, state.meta.root_page);
             let new_root = tree.insert(rowid, &row_bytes)?;
             state.meta.root_page = new_root;
 
             if !state.meta.indexes.is_empty() {
-                Self::index_update_row(&mut file, &mut state.meta, rowid, &row_bytes, false)?;
+                Self::index_update_row(&mut guard, &mut state.meta, rowid, &row_bytes, false)?;
             }
 
-            if matches!(durability, Durability::None) {
-                file.take_before_images();
-            } else {
-                let mut wal = self.wal.lock().unwrap();
-                Self::commit_with_wal(&mut file, &mut wal, durability, state.meta.table_id)?;
-            }
-        };
+            Self::commit_write(guard, &self.wal, durability, state.meta.table_id)?;
+        }
 
         // 7. Update table state.
         state.meta.row_count += 1;
@@ -779,14 +747,11 @@ impl BoogyDb {
         // 2. Read-lock the specific table.
         let state = table_state.read().unwrap();
 
-        // 3. Brief file lock for B-tree search.
-        let result = {
-            let mut file = self.file.lock().unwrap();
-            let mut tree = BTree::new(&mut file, state.meta.root_page);
-            tree.search(id)?
-        };
+        // 3. Concurrent read via BTreeReader (no file mutex).
+        let reader = BTreeReader::new(&self.file, state.meta.root_page);
+        let result = reader.search(id)?;
 
-        // 4. Decode outside any file lock.
+        // 4. Decode.
         match result {
             Some(bytes) => {
                 Ok(Some(Row::from_raw(&bytes, state.meta.col_names.clone())?))
@@ -812,41 +777,40 @@ impl BoogyDb {
         // 3. Type enforcement for indexed columns.
         Self::enforce_index_types(&state.meta, fields)?;
 
-        // 4. Read existing row, merge, write back (file lock + WAL lock).
-        {
-            let mut file = self.file.lock().unwrap();
-            let mut wal = self.wal.lock().unwrap();
-            let durability = self.durability();
-
-            // Read existing row.
-            let existing_bytes = {
-                let mut tree = BTree::new(&mut file, state.meta.root_page);
-                match tree.search(id)? {
-                    Some(bytes) => bytes,
-                    None => return Ok(false),
-                }
-            };
-            let existing = row::decode_row(&existing_bytes)?;
-
-            // Merge updates.
-            let mut col_map: HashMap<u16, Value> = existing.columns.into_iter().collect();
-            for (name, val) in fields {
-                if let Some(col_id) = state.meta.col_id(name) {
-                    col_map.insert(col_id, val.clone());
-                }
+        // 4. Read existing row via concurrent reader (safe: we hold table write lock).
+        let existing_bytes = {
+            let reader = BTreeReader::new(&self.file, state.meta.root_page);
+            match reader.search(id)? {
+                Some(bytes) => bytes,
+                None => return Ok(false),
             }
+        };
+        let existing = row::decode_row(&existing_bytes)?;
 
-            let col_values: Vec<(u16, &Value)> = col_map.iter().map(|(k, v)| (*k, v)).collect();
-            let new_row = row::encode_row(id, &col_values);
+        // Merge updates.
+        let mut col_map: HashMap<u16, Value> = existing.columns.into_iter().collect();
+        for (name, val) in fields {
+            if let Some(col_id) = state.meta.col_id(name) {
+                col_map.insert(col_id, val.clone());
+            }
+        }
+
+        let col_values: Vec<(u16, &Value)> = col_map.iter().map(|(k, v)| (*k, v)).collect();
+        let new_row = row::encode_row(id, &col_values);
+
+        // 5. Write via WriteGuard.
+        let durability = self.durability();
+        {
+            let mut guard = self.file.begin_write();
 
             // Remove old index entries.
             if !state.meta.indexes.is_empty() {
-                Self::index_update_row(&mut file, &mut state.meta, id, &existing_bytes, true)?;
+                Self::index_update_row(&mut guard, &mut state.meta, id, &existing_bytes, true)?;
             }
 
             // Delete + re-insert.
             {
-                let mut tree = BTree::new(&mut file, state.meta.root_page);
+                let mut tree = BTreeWriter::new(&mut guard, state.meta.root_page);
                 tree.delete(id)?;
                 let new_root = tree.insert(id, &new_row)?;
                 state.meta.root_page = new_root;
@@ -854,11 +818,11 @@ impl BoogyDb {
 
             // Insert new index entries.
             if !state.meta.indexes.is_empty() {
-                Self::index_update_row(&mut file, &mut state.meta, id, &new_row, false)?;
+                Self::index_update_row(&mut guard, &mut state.meta, id, &new_row, false)?;
             }
 
-            Self::commit_with_wal(&mut file, &mut wal, durability, state.meta.table_id)?;
-        };
+            Self::commit_write(guard, &self.wal, durability, state.meta.table_id)?;
+        }
 
         Ok(true)
     }
@@ -877,35 +841,33 @@ impl BoogyDb {
         // 2. Write-lock the specific table.
         let mut state = table_state.write().unwrap();
 
-        // 3. Brief file lock + WAL lock for B-tree delete.
+        // 3. Read the row before deletion for index maintenance (concurrent read, safe under table write lock).
+        let row_bytes_for_index = if !state.meta.indexes.is_empty() {
+            let reader = BTreeReader::new(&self.file, state.meta.root_page);
+            reader.search(id)?
+        } else {
+            None
+        };
+
+        // 4. Write via WriteGuard.
+        let durability = self.durability();
         let deleted = {
-            let mut file = self.file.lock().unwrap();
-            let mut wal = self.wal.lock().unwrap();
-            let durability = self.durability();
-
-            // Read the row before deletion for index maintenance.
-            let row_bytes_for_index = if !state.meta.indexes.is_empty() {
-                let mut tree = BTree::new(&mut file, state.meta.root_page);
-                tree.search(id)?
-            } else {
-                None
-            };
-
-            let mut tree = BTree::new(&mut file, state.meta.root_page);
+            let mut guard = self.file.begin_write();
+            let mut tree = BTreeWriter::new(&mut guard, state.meta.root_page);
             let deleted = tree.delete(id)?;
             state.meta.root_page = tree.root_page();
 
             if deleted {
                 if let Some(ref bytes) = row_bytes_for_index {
-                    Self::index_update_row(&mut file, &mut state.meta, id, bytes, true)?;
+                    Self::index_update_row(&mut guard, &mut state.meta, id, bytes, true)?;
                 }
             }
 
-            Self::commit_with_wal(&mut file, &mut wal, durability, state.meta.table_id)?;
+            Self::commit_write(guard, &self.wal, durability, state.meta.table_id)?;
             deleted
         };
 
-        // 4. Update row count.
+        // 5. Update row count.
         if deleted {
             state.meta.row_count -= 1;
         }
@@ -963,13 +925,11 @@ impl BoogyDb {
                 None // need all of them
             };
 
-            let mut file = self.file.lock().unwrap();
+            let idx_reader = IndexTreeReader::new(&self.file, idx_meta.root_page);
             let keys = if let Some(n) = need {
-                let mut tree = IndexTree::new(&mut file, idx_meta.root_page);
-                tree.scan_prefix_limit(&prefix, n)?
+                idx_reader.scan_prefix_limit(&prefix, n)?
             } else {
-                let mut tree = IndexTree::new(&mut file, idx_meta.root_page);
-                tree.scan_prefix(&prefix)?
+                idx_reader.scan_prefix(&prefix)?
             };
 
             let mut matching_rowids: Vec<u64> = keys
@@ -979,8 +939,8 @@ impl BoogyDb {
             matching_rowids.sort_unstable();
 
             // Batch-fetch rows via leaf-chain walk (much faster than N individual searches)
-            let mut tree = BTree::new(&mut file, state.meta.root_page);
-            let raw_rows = tree.multi_get_sorted(&matching_rowids)?;
+            let btree_reader = BTreeReader::new(&self.file, state.meta.root_page);
+            let raw_rows = btree_reader.multi_get_sorted(&matching_rowids)?;
 
             // Check if we need to apply additional filters beyond the indexed one
             let has_extra_filters = opts.filters.len() > 1;
@@ -1015,8 +975,7 @@ impl BoogyDb {
             let total: Option<u64> = if opts.include_total {
                 if need.is_some() {
                     // We limited the scan, so get the real count from the index.
-                    let mut tree = IndexTree::new(&mut file, idx_meta.root_page);
-                    Some(tree.count_prefix(&prefix)?)
+                    Some(idx_reader.count_prefix(&prefix)?)
                 } else {
                     Some(rows.len() as u64)
                 }
@@ -1037,8 +996,7 @@ impl BoogyDb {
             // Single filter: use scan_filtered (extract_column on raw bytes, no full decode)
             let f = &opts.filters[0];
             if let Some(col_id) = state.meta.col_id(&f.column) {
-                let mut file = self.file.lock().unwrap();
-                let mut tree = BTree::new(&mut file, state.meta.root_page);
+                let reader = BTreeReader::new(&self.file, state.meta.root_page);
                 // Only apply limit/offset if no sort (sorted results need full collection first)
                 let (lim, off) = if opts.sort.is_empty() {
                     (opts.limit, opts.offset)
@@ -1057,8 +1015,7 @@ impl BoogyDb {
                 } else {
                     None
                 };
-                let (raw_rows, count) = tree.scan_filtered(col_id, f.op, &f.value, lim, off, stop)?;
-                drop(file);
+                let (raw_rows, count) = reader.scan_filtered(col_id, f.op, &f.value, lim, off, stop)?;
                 let col_names = state.meta.col_names.clone();
                 let matching: Vec<Row> = raw_rows.iter()
                     .map(|(_, bytes)| Row::from_raw(bytes, col_names.clone()).unwrap())
@@ -1076,10 +1033,8 @@ impl BoogyDb {
             }
         } else if opts.filters.is_empty() {
             // No filters: full scan but skip decode, just collect raw
-            let mut file = self.file.lock().unwrap();
-            let mut tree = BTree::new(&mut file, state.meta.root_page);
-            let all = tree.scan_all()?;
-            drop(file);
+            let reader = BTreeReader::new(&self.file, state.meta.root_page);
+            let all = reader.scan_all()?;
             let total = if opts.include_total { Some(all.len() as u64) } else { None };
             let col_names = state.meta.col_names.clone();
             let matching: Vec<Row> = all.iter()
@@ -1088,10 +1043,8 @@ impl BoogyDb {
             (matching, total)
         } else {
             // Multi-filter: scan all, raw-byte filter, lazy Row
-            let mut file = self.file.lock().unwrap();
-            let mut tree = BTree::new(&mut file, state.meta.root_page);
-            let all = tree.scan_all()?;
-            drop(file);
+            let reader = BTreeReader::new(&self.file, state.meta.root_page);
+            let all = reader.scan_all()?;
             let col_names = state.meta.col_names.clone();
             let mut matching = Vec::new();
             for (_, bytes) in &all {
@@ -1182,9 +1135,8 @@ impl BoogyDb {
                     .map(|c| c.col_type);
                 if let Some(ct) = col_type {
                     if let Some(prefix) = index::encode_value_prefix(ct, &filters[0].value) {
-                        let mut file = self.file.lock().unwrap();
-                        let mut tree = IndexTree::new(&mut file, idx_meta.root_page);
-                        return tree.count_prefix(&prefix);
+                        let reader = IndexTreeReader::new(&self.file, idx_meta.root_page);
+                        return reader.count_prefix(&prefix);
                     }
                 }
             }
@@ -1194,18 +1146,15 @@ impl BoogyDb {
         if filters.len() == 1 {
             let f = &filters[0];
             if let Some(col_id) = state.meta.col_id(&f.column) {
-                let mut file = self.file.lock().unwrap();
-                let mut tree = BTree::new(&mut file, state.meta.root_page);
-                return tree.count_filtered(col_id, f.op, &f.value);
+                let reader = BTreeReader::new(&self.file, state.meta.root_page);
+                return reader.count_filtered(col_id, f.op, &f.value);
             }
             return Ok(0);
         }
 
         // Multi-filter: scan all, raw-byte filter
-        let mut file = self.file.lock().unwrap();
-        let mut tree = BTree::new(&mut file, state.meta.root_page);
-        let all = tree.scan_all()?;
-        drop(file);
+        let reader = BTreeReader::new(&self.file, state.meta.root_page);
+        let all = reader.scan_all()?;
 
         let mut count = 0u64;
         for (_, bytes) in &all {
@@ -1263,50 +1212,44 @@ impl BoogyDb {
             .map(|c| c.col_type)
             .unwrap();
 
-        // 3. Create the index B+ tree and populate from existing rows.
+        // 3. Read all existing rows first (concurrent read, no write guard).
+        let all = {
+            let reader = BTreeReader::new(&self.file, state.meta.root_page);
+            reader.scan_all()?
+        };
+
+        // 4. Create the index B+ tree and populate via WriteGuard.
         let idx_root = {
-            let mut file = self.file.lock().unwrap();
-            let mut wal = self.wal.lock().unwrap();
             let durability = self.durability();
-
-            let idx_root = IndexTree::create(&mut file)?;
-
-            // Scan all existing rows and insert into the index.
-            let all = {
-                let mut tree = BTree::new(&mut file, state.meta.root_page);
-                tree.scan_all()?
-            };
+            let mut guard = self.file.begin_write();
+            let idx_root = IndexTreeWriter::create(&mut guard)?;
 
             let mut current_root = idx_root;
             for (rowid, bytes) in &all {
                 let col_val = row::extract_column(bytes, col_id)?
                     .unwrap_or(Value::Null);
                 if let Some(key) = index::encode_index_key(col_type, &col_val, *rowid) {
-                    let mut tree = IndexTree::new(&mut file, current_root);
+                    let mut tree = IndexTreeWriter::new(&mut guard, current_root);
                     current_root = tree.insert(&key)?;
                 }
             }
 
-            Self::commit_with_wal(&mut file, &mut wal, durability, state.meta.table_id)?;
+            Self::commit_write(guard, &self.wal, durability, state.meta.table_id)?;
             current_root
         };
 
-        // 4. Register the index in table metadata.
+        // 5. Register the index in table metadata.
         state.meta.indexes.push(IndexMeta {
             name: index_name.to_string(),
             column: column.to_string(),
             root_page: idx_root,
         });
 
-        // 5. Persist registry.
+        // 6. Persist registry.
         drop(state);
         let (metas, next_id) = self.snapshot_table_metas();
         let durability = self.durability();
-        {
-            let mut file = self.file.lock().unwrap();
-            let mut wal = self.wal.lock().unwrap();
-            Self::persist_registry_with(&mut file, &mut wal, &metas, next_id, durability)?;
-        }
+        Self::persist_registry(&self.file, &self.wal, &metas, next_id, durability)?;
 
         Ok(())
     }
@@ -1338,11 +1281,7 @@ impl BoogyDb {
         drop(state);
         let (metas, next_id) = self.snapshot_table_metas();
         let durability = self.durability();
-        {
-            let mut file = self.file.lock().unwrap();
-            let mut wal = self.wal.lock().unwrap();
-            Self::persist_registry_with(&mut file, &mut wal, &metas, next_id, durability)?;
-        }
+        Self::persist_registry(&self.file, &self.wal, &metas, next_id, durability)?;
 
         Ok(())
     }
@@ -1369,47 +1308,44 @@ impl BoogyDb {
         // 3. Type enforcement for indexed columns.
         Self::enforce_index_types(&state.meta, fields)?;
 
-        // 4. Scan to find matching IDs, then apply updates.
-        let updated = {
-            let mut file = self.file.lock().unwrap();
-            let mut wal = self.wal.lock().unwrap();
-            let durability = self.durability();
+        // 4. Read candidates via concurrent reader (safe: hold table write lock).
+        let candidates = {
+            let reader = BTreeReader::new(&self.file, state.meta.root_page);
+            reader.scan_all()?
+        };
 
-            // Full scan to find candidates
-            let candidates: Vec<(u64, Vec<u8>)> = {
-                let mut tree = BTree::new(&mut file, state.meta.root_page);
-                tree.scan_all()?
-            };
-
-            // Filter and collect matching row IDs + old data + old bytes for index
-            let mut to_update: Vec<(u64, HashMap<u16, Value>, Vec<u8>)> = Vec::new();
-            for (_, bytes) in &candidates {
-                let passes = filters.iter().all(|f| {
-                    if let Some(col_id) = state.meta.col_id(&f.column) {
-                        if let Ok(Some(raw)) = row::extract_column_raw(bytes, col_id) {
-                            if let Some(result) = crate::filter::eval_filter_raw(raw, &f.op, &f.value) {
-                                return result;
-                            }
+        // Filter and collect matching row IDs + old data + old bytes for index
+        let mut to_update: Vec<(u64, HashMap<u16, Value>, Vec<u8>)> = Vec::new();
+        for (_, bytes) in &candidates {
+            let passes = filters.iter().all(|f| {
+                if let Some(col_id) = state.meta.col_id(&f.column) {
+                    if let Ok(Some(raw)) = row::extract_column_raw(bytes, col_id) {
+                        if let Some(result) = crate::filter::eval_filter_raw(raw, &f.op, &f.value) {
+                            return result;
                         }
-                        let col_val = row::extract_column(bytes, col_id).ok().flatten();
-                        let actual = col_val.as_ref().unwrap_or(&Value::Null);
-                        f.matches(actual)
-                    } else {
-                        f.matches(&Value::Null)
                     }
-                });
-
-                if passes {
-                    let decoded = row::decode_row(bytes)?;
-                    let rowid = decoded.id;
-                    let old_col_map: HashMap<u16, Value> = decoded.columns.into_iter().collect();
-                    to_update.push((rowid, old_col_map, bytes.clone()));
+                    let col_val = row::extract_column(bytes, col_id).ok().flatten();
+                    let actual = col_val.as_ref().unwrap_or(&Value::Null);
+                    f.matches(actual)
+                } else {
+                    f.matches(&Value::Null)
                 }
+            });
+
+            if passes {
+                let decoded = row::decode_row(bytes)?;
+                let rowid = decoded.id;
+                let old_col_map: HashMap<u16, Value> = decoded.columns.into_iter().collect();
+                to_update.push((rowid, old_col_map, bytes.to_vec()));
             }
+        }
 
-            let count = to_update.len() as u64;
+        let count = to_update.len() as u64;
 
-            // Apply updates
+        // 5. Apply updates via WriteGuard.
+        let durability = self.durability();
+        {
+            let mut guard = self.file.begin_write();
             for (id, old_col_map, old_bytes) in &to_update {
                 let mut col_map = old_col_map.clone();
                 for (name, val) in fields {
@@ -1424,25 +1360,24 @@ impl BoogyDb {
 
                 // Remove old index entries.
                 if !state.meta.indexes.is_empty() {
-                    Self::index_update_row(&mut file, &mut state.meta, *id, old_bytes, true)?;
+                    Self::index_update_row(&mut guard, &mut state.meta, *id, old_bytes, true)?;
                 }
 
-                let mut tree = BTree::new(&mut file, state.meta.root_page);
+                let mut tree = BTreeWriter::new(&mut guard, state.meta.root_page);
                 tree.delete(*id)?;
                 let new_root = tree.insert(*id, &new_row)?;
                 state.meta.root_page = new_root;
 
                 // Insert new index entries.
                 if !state.meta.indexes.is_empty() {
-                    Self::index_update_row(&mut file, &mut state.meta, *id, &new_row, false)?;
+                    Self::index_update_row(&mut guard, &mut state.meta, *id, &new_row, false)?;
                 }
             }
 
-            Self::commit_with_wal(&mut file, &mut wal, durability, state.meta.table_id)?;
-            count
-        };
+            Self::commit_write(guard, &self.wal, durability, state.meta.table_id)?;
+        }
 
-        Ok(updated)
+        Ok(count)
     }
 
     /// Delete all rows matching filters. Returns number of rows deleted.
@@ -1459,60 +1394,56 @@ impl BoogyDb {
         // 2. Write-lock the specific table.
         let mut state = table_state.write().unwrap();
 
-        // 3. Scan to find matching IDs, then delete.
-        let deleted = {
-            let mut file = self.file.lock().unwrap();
-            let mut wal = self.wal.lock().unwrap();
-            let durability = self.durability();
+        // 3. Read candidates via concurrent reader (safe: hold table write lock).
+        let candidates = {
+            let reader = BTreeReader::new(&self.file, state.meta.root_page);
+            reader.scan_all()?
+        };
 
-            // Full scan to find candidates
-            let candidates: Vec<(u64, Vec<u8>)> = {
-                let mut tree = BTree::new(&mut file, state.meta.root_page);
-                tree.scan_all()?
-            };
-
-            // Filter and collect matching row IDs + bytes for index removal
-            let mut to_delete: Vec<(u64, Vec<u8>)> = Vec::new();
-            for (_, bytes) in &candidates {
-                let passes = filters.iter().all(|f| {
-                    if let Some(col_id) = state.meta.col_id(&f.column) {
-                        if let Ok(Some(raw)) = row::extract_column_raw(bytes, col_id) {
-                            if let Some(result) = crate::filter::eval_filter_raw(raw, &f.op, &f.value) {
-                                return result;
-                            }
+        // Filter and collect matching row IDs + bytes for index removal
+        let mut to_delete: Vec<(u64, Vec<u8>)> = Vec::new();
+        for (_, bytes) in &candidates {
+            let passes = filters.iter().all(|f| {
+                if let Some(col_id) = state.meta.col_id(&f.column) {
+                    if let Ok(Some(raw)) = row::extract_column_raw(bytes, col_id) {
+                        if let Some(result) = crate::filter::eval_filter_raw(raw, &f.op, &f.value) {
+                            return result;
                         }
-                        let col_val = row::extract_column(bytes, col_id).ok().flatten();
-                        let actual = col_val.as_ref().unwrap_or(&Value::Null);
-                        f.matches(actual)
-                    } else {
-                        f.matches(&Value::Null)
                     }
-                });
-
-                if passes {
-                    let rowid = row::extract_id(bytes)?;
-                    to_delete.push((rowid, bytes.clone()));
+                    let col_val = row::extract_column(bytes, col_id).ok().flatten();
+                    let actual = col_val.as_ref().unwrap_or(&Value::Null);
+                    f.matches(actual)
+                } else {
+                    f.matches(&Value::Null)
                 }
+            });
+
+            if passes {
+                let rowid = row::extract_id(bytes)?;
+                to_delete.push((rowid, bytes.to_vec()));
             }
+        }
 
-            let count = to_delete.len() as u64;
+        let count = to_delete.len() as u64;
 
-            // Delete rows + remove index entries
+        // 4. Delete rows via WriteGuard.
+        let durability = self.durability();
+        {
+            let mut guard = self.file.begin_write();
             for (id, old_bytes) in &to_delete {
                 if !state.meta.indexes.is_empty() {
-                    Self::index_update_row(&mut file, &mut state.meta, *id, old_bytes, true)?;
+                    Self::index_update_row(&mut guard, &mut state.meta, *id, old_bytes, true)?;
                 }
-                let mut tree = BTree::new(&mut file, state.meta.root_page);
+                let mut tree = BTreeWriter::new(&mut guard, state.meta.root_page);
                 tree.delete(*id)?;
                 state.meta.root_page = tree.root_page();
             }
 
-            state.meta.row_count -= count;
-            Self::commit_with_wal(&mut file, &mut wal, durability, state.meta.table_id)?;
-            count
-        };
+            Self::commit_write(guard, &self.wal, durability, state.meta.table_id)?;
+        }
 
-        Ok(deleted)
+        state.meta.row_count -= count;
+        Ok(count)
     }
 
     /// Insert multiple rows in a single transaction. Returns list of assigned rowids.
@@ -1534,11 +1465,10 @@ impl BoogyDb {
             Self::enforce_index_types(&state.meta, row_data)?;
         }
 
-        // 4. Insert all rows under a single file lock session.
+        // 4. Insert all rows under a single WriteGuard.
+        let durability = self.durability();
         let ids = {
-            let mut file = self.file.lock().unwrap();
-            let mut wal = self.wal.lock().unwrap();
-            let durability = self.durability();
+            let mut guard = self.file.begin_write();
             let mut ids = Vec::with_capacity(rows.len());
 
             for row_data in rows {
@@ -1551,19 +1481,19 @@ impl BoogyDb {
                     .collect();
                 let row_bytes = row::encode_row(rowid, &col_values);
 
-                let mut tree = BTree::new(&mut file, state.meta.root_page);
+                let mut tree = BTreeWriter::new(&mut guard, state.meta.root_page);
                 let new_root = tree.insert(rowid, &row_bytes)?;
                 state.meta.root_page = new_root;
 
                 if !state.meta.indexes.is_empty() {
-                    Self::index_update_row(&mut file, &mut state.meta, rowid, &row_bytes, false)?;
+                    Self::index_update_row(&mut guard, &mut state.meta, rowid, &row_bytes, false)?;
                 }
 
                 state.meta.row_count += 1;
                 ids.push(rowid);
             }
 
-            Self::commit_with_wal(&mut file, &mut wal, durability, state.meta.table_id)?;
+            Self::commit_write(guard, &self.wal, durability, state.meta.table_id)?;
             ids
         };
 
@@ -1577,11 +1507,10 @@ impl BoogyDb {
     {
         let ctx = TransactionCtx { db: self };
         let result = f(&ctx)?;
-        // Flush all changes (individual operations already committed via WAL).
-        let mut file = self.file.lock().unwrap();
-        let mut wal = self.wal.lock().unwrap();
+        // Individual operations already committed. Do a final flush for consistency.
         let durability = self.durability();
-        Self::commit_with_wal(&mut file, &mut wal, durability, 0)?;
+        let guard = self.file.begin_write();
+        Self::commit_write(guard, &self.wal, durability, 0)?;
         Ok(result)
     }
 }
@@ -1589,10 +1518,18 @@ impl BoogyDb {
 impl Drop for BoogyDb {
     fn drop(&mut self) {
         // Flush all dirty pages + persist registry on clean shutdown
-        if let (Ok(mut file), Ok(mut wal)) = (self.file.lock(), self.wal.lock()) {
-            let (metas, next_id) = self.snapshot_table_metas();
-            let _ = Self::persist_registry_with(&mut file, &mut wal, &metas, next_id, Durability::Normal);
-            let _ = file.sync();
+        let (metas, next_id) = self.snapshot_table_metas();
+        {
+            let mut guard = self.file.begin_write();
+            if self.file.page_count() == 0 {
+                let _ = guard.allocate_page();
+            }
+            let page = serialize_system_page(&metas, next_id);
+            guard.put_page(0, page);
+            let _ = guard.commit(true);
+        }
+        let _ = self.file.sync_all();
+        if let Ok(mut wal) = self.wal.lock() {
             let _ = wal.truncate();
         }
     }
@@ -1996,7 +1933,7 @@ mod tests {
 
     #[test]
     fn test_scan_all_matches_count() {
-        use crate::btree::BTree;
+        use crate::btree::BTreeReader;
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("test.boogy");
         let db = BoogyDb::open(&path).unwrap();
@@ -2009,9 +1946,8 @@ mod tests {
         // Verify scan_all matches cached row_count
         let tables = db.tables.read().unwrap();
         let state = tables.get("t").unwrap().read().unwrap();
-        let mut file = db.file.lock().unwrap();
-        let mut tree = BTree::new(&mut file, state.meta.root_page);
-        let all = tree.scan_all().unwrap();
+        let reader = BTreeReader::new(&db.file, state.meta.root_page);
+        let all = reader.scan_all().unwrap();
         assert_eq!(all.len(), 100);
     }
 
