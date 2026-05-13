@@ -6,7 +6,7 @@ Embedded storage engine for SpinStack. In-place B+ tree with WAL, per-table conc
 
 | Module | Responsibility |
 |--------|---------------|
-| `db.rs` | Public API (`BoogyDb`). Table registry, system page (de)serialization, locking protocol, WAL commit path. All public methods go here. |
+| `db.rs` | Public API (`BoogyDb`). Table registry, system page (de)serialization, locking protocol, WAL commit path, ACID transaction support (`AcidTransaction` with private dirty page buffer). All public methods go here. |
 | `file.rs` | `PageFile` (shared read cache + disk I/O) and `WriteGuard` (exclusive dirty overlay). The concurrency boundary. |
 | `btree.rs` | `BTreeReader` (read-only, takes `&PageFile`) and `BTreeWriter` (takes `&mut WriteGuard`). u64-keyed B+ tree with leaf-chain walks. |
 | `index.rs` | `IndexTreeReader`/`IndexTreeWriter`. Composite-key B+ tree for secondary indexes. Key encoding (sortable integers, floats, null-terminated text). |
@@ -30,6 +30,7 @@ Embedded storage engine for SpinStack. In-place B+ tree with WAL, per-table conc
 - **`Row`** -- Public query result. Stores raw bytes + `Arc<Vec<String>>` column names. `get(column)` decodes one column. `columns()` decodes all.
 - **`Page`** -- `[u8; 4096]` buffer. 16-byte header, CRC32 checksum in last 4 bytes.
 - **`Cipher`** -- AES-256-GCM. Plaintext lives in the page cache; encryption only at disk I/O.
+- **`AcidTransaction`** -- ACID transaction guard. Holds a private `HashMap<u32, Box<Page>>` dirty buffer. Uses `inject_dirty`/`drain_dirty` on `WriteGuard` to run B+ tree operations against private pages. `commit()` publishes atomically; `Drop` without commit = rollback.
 - **`TableMeta`** -- Per-table metadata: columns, indexes, root page, row count, next rowid.
 
 ## Concurrency Model

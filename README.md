@@ -16,6 +16,7 @@ A fast embedded storage engine for Rust, purpose-built for concurrent API worklo
   - [Bulk Operations](#bulk-operations)
 - [Encryption](#encryption)
 - [Async API](#async-api)
+- [ACID Transactions](#acid-transactions)
 - [Architecture](#architecture)
 - [License](#license)
 
@@ -32,6 +33,7 @@ A fast embedded storage engine for Rust, purpose-built for concurrent API worklo
 - **In-place row patching** — `patch_row` splices raw bytes for single-column updates without full decode/encode
 - **Batch bulk operations** — `delete_matching`/`update_matching` walk the leaf chain once, rebuilding each page in a single pass instead of per-row tree surgery
 - **Per-table encryption** — opt-in AES-256-GCM at the page level. Plaintext in memory, ciphertext on disk. Zero overhead on unencrypted tables
+- **ACID transactions** — opt-in atomic multi-operation transactions with rollback via `set_acid(true)`. Zero overhead when disabled
 - **Async API** — optional `tokio` feature provides `AsyncBoogyDb` with zero-overhead async methods
 
 ## Quick Start
@@ -102,6 +104,7 @@ tx.commit()?;
 | `drop_table(table)` | Drop a table |
 | `transaction(fn)` | Multi-table transaction (callback-based) |
 | `begin()` | Begin a guard-based transaction (alternative to `transaction(fn)`) |
+| `set_acid(enabled)` | Enable/disable ACID transaction mode |
 
 ## Benchmarks
 
@@ -332,6 +335,37 @@ async fn main() -> boogy_db::Result<()> {
 ```
 
 `AsyncBoogyDb` is `Clone` (backed by `Arc<BoogyDb>`), so it can be shared across tasks cheaply. All methods from the sync API are available. The full sync `BoogyDb` is also accessible via `db.inner()`.
+
+## ACID Transactions
+
+Enable ACID mode for true multi-operation atomicity with rollback:
+
+```rust
+db.set_acid(true);
+
+// Multi-operation transaction — all-or-nothing
+let mut tx = db.begin()?;
+tx.insert("users", &[("name", Value::Text("Alice".into()))])?;
+tx.insert("posts", &[("title", Value::Text("Hello".into()))])?;
+tx.commit()?;  // atomic publish
+
+// Drop without commit = full rollback
+{
+    let mut tx = db.begin()?;
+    tx.insert("users", &[("name", Value::Text("Bob".into()))])?;
+    // dropped here — nothing is written
+}
+
+// Reads within a transaction see uncommitted writes
+let mut tx = db.begin()?;
+let id = tx.insert("users", &[("name", Value::Text("Carol".into()))])?;
+let row = tx.get("users", id)?.unwrap(); // sees Carol
+tx.commit()?;
+```
+
+When ACID mode is enabled, standalone operations outside `begin()` are automatically wrapped in mini-transactions. When disabled (the default), operations commit individually with zero overhead — one `AtomicBool` check per operation.
+
+ACID transactions hold a private dirty page buffer. The global write lock is acquired briefly per operation (microseconds), not for the transaction duration. Tables not touched by a transaction are completely unblocked.
 
 ## Architecture
 
