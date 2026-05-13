@@ -35,6 +35,8 @@ pub struct PageFile {
     num_pages: AtomicU32,
     pages: RwLock<Vec<Option<Arc<Page>>>>,
     write_state: Mutex<WriteState>,
+    /// Page-level cipher map. Pages in this map are encrypted before writing to disk.
+    page_ciphers: RwLock<HashMap<u32, Arc<crate::crypto::Cipher>>>,
 }
 
 impl PageFile {
@@ -59,6 +61,7 @@ impl PageFile {
                 dirty: HashMap::new(),
                 new_page_count: 0,
             }),
+            page_ciphers: RwLock::new(HashMap::new()),
         })
     }
 
@@ -147,16 +150,58 @@ impl PageFile {
         cache[page_no as usize] = Some(arc);
     }
 
+    /// Read raw page bytes from disk without caching or parsing.
+    pub fn read_page_raw(&self, page_no: u32) -> Result<[u8; PAGE_SIZE]> {
+        let mut disk = self.disk.lock().unwrap();
+        let offset = page_no as u64 * PAGE_SIZE as u64;
+        disk.seek(SeekFrom::Start(offset))?;
+        let mut buf = [0u8; PAGE_SIZE];
+        disk.read_exact(&mut buf)?;
+        Ok(buf)
+    }
+
+    /// Insert a plaintext page directly into the shared cache.
+    pub fn put_cached_page(&self, page_no: u32, page: Page) {
+        let mut cache = self.pages.write().unwrap();
+        while cache.len() <= page_no as usize {
+            cache.push(None);
+        }
+        cache[page_no as usize] = Some(Arc::new(page));
+    }
+
+    /// Check whether a page is already in the shared cache.
+    pub fn is_cached(&self, page_no: u32) -> bool {
+        let cache = self.pages.read().unwrap();
+        cache.get(page_no as usize).map_or(false, |slot| slot.is_some())
+    }
+
+    /// Register a cipher for a page so it is encrypted before writing to disk.
+    pub fn register_page_cipher(&self, page_no: u32, cipher: Arc<crate::crypto::Cipher>) {
+        let mut map = self.page_ciphers.write().unwrap();
+        map.insert(page_no, cipher);
+    }
+
     /// Flush ALL cached pages to disk and fsync. For clean shutdown.
     pub fn sync_all(&self) -> Result<()> {
         let cache = self.pages.read().unwrap();
+        let page_ciphers = self.page_ciphers.read().unwrap();
         let mut disk = self.disk.lock().unwrap();
 
         for (i, slot) in cache.iter().enumerate() {
             if let Some(arc) = slot {
-                let offset = i as u64 * PAGE_SIZE as u64;
+                let page_no = i as u32;
+                let offset = page_no as u64 * PAGE_SIZE as u64;
                 disk.seek(SeekFrom::Start(offset))?;
-                disk.write_all(&arc.data)?;
+
+                if let Some(cipher) = page_ciphers.get(&page_no) {
+                    // Encrypt before writing
+                    let encrypted = cipher.encrypt_page(
+                        &arc.data[..crate::crypto::ENCRYPTED_PAYLOAD_SIZE],
+                    )?;
+                    disk.write_all(&encrypted)?;
+                } else {
+                    disk.write_all(&arc.data)?;
+                }
             }
         }
 
