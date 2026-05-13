@@ -7,7 +7,7 @@ use crate::error::{BoogyError, Result};
 use crate::file::{PageFile, WriteGuard};
 use crate::filter::{Filter, FilterOp, FindOptions, FindResult, SortDir};
 use crate::index::{self, IndexTreeReader, IndexTreeWriter};
-use crate::page::{Page, PAGE_SYSTEM};
+use crate::page::{Page, PAGE_SIZE, PAGE_SYSTEM};
 use crate::row;
 use crate::table::{IndexMeta, TableMeta};
 use crate::value::{ColumnDef, Type, Value};
@@ -72,6 +72,7 @@ pub struct BoogyDb {
     durability: std::sync::atomic::AtomicU8,
     #[allow(dead_code)]
     path: PathBuf,
+    table_ciphers: RwLock<HashMap<u32, Arc<crate::crypto::Cipher>>>,
 }
 
 // System page (page 0) format:
@@ -200,6 +201,10 @@ fn serialize_system_page(
             data[offset..offset + 4].copy_from_slice(&idx.root_page.to_le_bytes());
             offset += 4;
         }
+
+        // encrypted flag
+        data[offset] = if meta.encrypted { 1 } else { 0 };
+        offset += 1;
     }
 
     page.update_checksum();
@@ -314,6 +319,16 @@ fn deserialize_system_page(
             });
         }
 
+        // encrypted flag
+        let encrypted = if offset < PAGE_SIZE - 4 {
+            let e = data[offset] != 0;
+            offset += 1;
+            e
+        } else {
+            false
+        };
+        meta.encrypted = encrypted;
+
         tables.push(meta);
     }
 
@@ -399,6 +414,7 @@ impl BoogyDb {
             next_table_id: Mutex::new(next_table_id),
             durability: std::sync::atomic::AtomicU8::new(Durability::Normal as u8),
             path,
+            table_ciphers: RwLock::new(HashMap::new()),
         })
     }
 
@@ -416,29 +432,57 @@ impl BoogyDb {
         }
     }
 
+    /// Check that an encrypted table has been unlocked before any operation.
+    fn check_table_accessible(meta: &TableMeta, table: &str) -> Result<()> {
+        if meta.encrypted && meta.cipher.is_none() {
+            return Err(BoogyError::TableLocked(table.to_string()));
+        }
+        Ok(())
+    }
+
     /// Commit a WriteGuard, writing before-images to the WAL as appropriate
     /// for the durability level. This is the single commit path used by all
     /// write operations.
     fn commit_write(
         guard: WriteGuard,
+        file: &PageFile,
         wal: &Mutex<Wal>,
         durability: Durability,
         table_id: u32,
+        cipher: Option<&crate::crypto::Cipher>,
     ) -> Result<()> {
         let after_images = guard.commit()?;
+
+        // Register page ciphers for encrypted tables so sync_all encrypts them.
+        if let Some(c) = cipher {
+            let arc = Arc::new(c.clone());
+            for (page_no, _) in &after_images {
+                file.register_page_cipher(*page_no, Arc::clone(&arc));
+            }
+        }
+
         match durability {
             Durability::Immediate => {
                 let mut wal = wal.lock().unwrap();
                 for (page_no, data) in &after_images {
-                    wal.append_before_image(table_id, *page_no, data)?;
+                    let write_data = if let Some(c) = cipher {
+                        c.encrypt_page(&data[..crate::crypto::ENCRYPTED_PAYLOAD_SIZE])?
+                    } else {
+                        *data
+                    };
+                    wal.append_before_image(table_id, *page_no, &write_data)?;
                 }
                 wal.sync()?;
-                // Do NOT truncate here -- WAL accumulates until checkpoint
             }
             Durability::Normal => {
                 let mut wal = wal.lock().unwrap();
                 for (page_no, data) in &after_images {
-                    wal.append_before_image(table_id, *page_no, data)?;
+                    let write_data = if let Some(c) = cipher {
+                        c.encrypt_page(&data[..crate::crypto::ENCRYPTED_PAYLOAD_SIZE])?
+                    } else {
+                        *data
+                    };
+                    wal.append_before_image(table_id, *page_no, &write_data)?;
                 }
             }
             Durability::None => {
@@ -479,7 +523,7 @@ impl BoogyDb {
         let page = serialize_system_page(metas, next_table_id);
         guard.put_page(0, page);
 
-        Self::commit_write(guard, wal, durability, 0)?;
+        Self::commit_write(guard, file, wal, durability, 0, None)?;
         Ok(())
     }
 
@@ -590,7 +634,7 @@ impl BoogyDb {
                 id
             };
 
-            Self::commit_write(guard, &self.wal, durability, table_id)?;
+            Self::commit_write(guard, &self.file, &self.wal, durability, table_id, None)?;
             (root, table_id)
         };
 
@@ -645,6 +689,7 @@ impl BoogyDb {
 
         // 2. Write-lock the specific table.
         let mut state = table_state.write().unwrap();
+        Self::check_table_accessible(&state.meta, table)?;
 
         // 3. Type enforcement for indexed columns.
         Self::enforce_index_types(&state.meta, data)?;
@@ -672,7 +717,7 @@ impl BoogyDb {
                 Self::index_update_row(&mut guard, &mut state.meta, rowid, &row_bytes, false)?;
             }
 
-            Self::commit_write(guard, &self.wal, durability, state.meta.table_id)?;
+            Self::commit_write(guard, &self.file, &self.wal, durability, state.meta.table_id, state.meta.cipher.as_ref())?;
         }
 
         // 7. Update table state.
@@ -694,6 +739,7 @@ impl BoogyDb {
 
         // 2. Write-lock the specific table.
         let mut state = table_state.write().unwrap();
+        Self::check_table_accessible(&state.meta, table)?;
 
         // 3. Type enforcement for indexed columns.
         Self::enforce_index_types(&state.meta, data)?;
@@ -722,7 +768,7 @@ impl BoogyDb {
                 Self::index_update_row(&mut guard, &mut state.meta, rowid, &row_bytes, false)?;
             }
 
-            Self::commit_write(guard, &self.wal, durability, state.meta.table_id)?;
+            Self::commit_write(guard, &self.file, &self.wal, durability, state.meta.table_id, state.meta.cipher.as_ref())?;
         }
 
         // 7. Update table state.
@@ -744,6 +790,7 @@ impl BoogyDb {
 
         // 2. Read-lock the specific table.
         let state = table_state.read().unwrap();
+        Self::check_table_accessible(&state.meta, table)?;
 
         // 3. Concurrent read via BTreeReader (no file mutex).
         let reader = BTreeReader::new(&self.file, state.meta.root_page);
@@ -771,6 +818,7 @@ impl BoogyDb {
 
         // 2. Write-lock the specific table.
         let mut state = table_state.write().unwrap();
+        Self::check_table_accessible(&state.meta, table)?;
 
         // 3. Type enforcement for indexed columns.
         Self::enforce_index_types(&state.meta, fields)?;
@@ -819,7 +867,7 @@ impl BoogyDb {
                 Self::index_update_row(&mut guard, &mut state.meta, id, &new_row, false)?;
             }
 
-            Self::commit_write(guard, &self.wal, durability, state.meta.table_id)?;
+            Self::commit_write(guard, &self.file, &self.wal, durability, state.meta.table_id, state.meta.cipher.as_ref())?;
         }
 
         Ok(true)
@@ -838,6 +886,7 @@ impl BoogyDb {
 
         // 2. Write-lock the specific table.
         let mut state = table_state.write().unwrap();
+        Self::check_table_accessible(&state.meta, table)?;
 
         // 3. Read the row before deletion for index maintenance (concurrent read, safe under table write lock).
         let row_bytes_for_index = if !state.meta.indexes.is_empty() {
@@ -861,7 +910,7 @@ impl BoogyDb {
                 }
             }
 
-            Self::commit_write(guard, &self.wal, durability, state.meta.table_id)?;
+            Self::commit_write(guard, &self.file, &self.wal, durability, state.meta.table_id, state.meta.cipher.as_ref())?;
             deleted
         };
 
@@ -885,6 +934,7 @@ impl BoogyDb {
 
         // 2. Read-lock the specific table.
         let state = table_state.read().unwrap();
+        Self::check_table_accessible(&state.meta, table)?;
 
         // Can we short-circuit (stop early without scanning everything)?
         // Only when: no sort (ordering requires full collection) and not requesting total.
@@ -1119,6 +1169,7 @@ impl BoogyDb {
 
         // 2. Read-lock the specific table.
         let state = table_state.read().unwrap();
+        Self::check_table_accessible(&state.meta, table)?;
 
         // Fast path: no filters, just return the cached count.
         if filters.is_empty() {
@@ -1189,6 +1240,7 @@ impl BoogyDb {
 
         // 2. Write-lock the specific table.
         let mut state = table_state.write().unwrap();
+        Self::check_table_accessible(&state.meta, table)?;
 
         // Check index doesn't already exist.
         if state.meta.find_index(index_name).is_some() {
@@ -1232,7 +1284,7 @@ impl BoogyDb {
                 }
             }
 
-            Self::commit_write(guard, &self.wal, durability, state.meta.table_id)?;
+            Self::commit_write(guard, &self.file, &self.wal, durability, state.meta.table_id, state.meta.cipher.as_ref())?;
             current_root
         };
 
@@ -1265,6 +1317,7 @@ impl BoogyDb {
 
         // 2. Write-lock the specific table.
         let mut state = table_state.write().unwrap();
+        Self::check_table_accessible(&state.meta, table)?;
 
         // Find and remove the index.
         let pos = state
@@ -1302,6 +1355,7 @@ impl BoogyDb {
 
         // 2. Write-lock the specific table.
         let mut state = table_state.write().unwrap();
+        Self::check_table_accessible(&state.meta, table)?;
 
         // 3. Type enforcement for indexed columns.
         Self::enforce_index_types(&state.meta, fields)?;
@@ -1397,7 +1451,7 @@ impl BoogyDb {
             }
 
             count = (in_place.len() + overflow.len()) as u64;
-            Self::commit_write(guard, &self.wal, durability, state.meta.table_id)?;
+            Self::commit_write(guard, &self.file, &self.wal, durability, state.meta.table_id, state.meta.cipher.as_ref())?;
         }
 
         Ok(count)
@@ -1416,6 +1470,7 @@ impl BoogyDb {
 
         // 2. Write-lock the specific table.
         let mut state = table_state.write().unwrap();
+        Self::check_table_accessible(&state.meta, table)?;
 
         // 3. Build col_id lookups needed by the predicate closure (avoids
         //    borrowing state.meta inside the closure).
@@ -1467,7 +1522,7 @@ impl BoogyDb {
             }
 
             count = deleted.len() as u64;
-            Self::commit_write(guard, &self.wal, durability, state.meta.table_id)?;
+            Self::commit_write(guard, &self.file, &self.wal, durability, state.meta.table_id, state.meta.cipher.as_ref())?;
         }
 
         state.meta.row_count -= count;
@@ -1487,6 +1542,7 @@ impl BoogyDb {
 
         // 2. Write-lock the specific table.
         let mut state = table_state.write().unwrap();
+        Self::check_table_accessible(&state.meta, table)?;
 
         // 3. Type enforcement for all rows.
         for row_data in rows {
@@ -1521,7 +1577,7 @@ impl BoogyDb {
                 ids.push(rowid);
             }
 
-            Self::commit_write(guard, &self.wal, durability, state.meta.table_id)?;
+            Self::commit_write(guard, &self.file, &self.wal, durability, state.meta.table_id, state.meta.cipher.as_ref())?;
             ids
         };
 
@@ -1538,8 +1594,164 @@ impl BoogyDb {
         // Individual operations already committed. Do a final flush for consistency.
         let durability = self.durability();
         let guard = self.file.begin_write();
-        Self::commit_write(guard, &self.wal, durability, 0)?;
+        Self::commit_write(guard, &self.file, &self.wal, durability, 0, None)?;
         Ok(result)
+    }
+
+    /// Create a new encrypted table. Data pages are encrypted at rest with
+    /// AES-256-GCM using the provided 32-byte key.
+    pub fn create_table_encrypted(&self, name: &str, columns: &[ColumnDef], key: &[u8; 32]) -> Result<()> {
+        {
+            let tables = self.tables.read().unwrap();
+            if tables.contains_key(name) {
+                return Err(BoogyError::TableExists(name.to_string()));
+            }
+        }
+
+        let durability = self.durability();
+        let (root, table_id) = {
+            let mut guard = self.file.begin_write();
+            if self.file.page_count() == 0 {
+                guard.allocate_page()?;
+            }
+            let root = BTreeWriter::create(&mut guard)?;
+            let table_id = {
+                let mut next = self.next_table_id.lock().unwrap();
+                let id = *next;
+                *next += 1;
+                id
+            };
+            Self::commit_write(guard, &self.file, &self.wal, durability, table_id, None)?;
+            (root, table_id)
+        };
+
+        let cipher = crate::crypto::Cipher::new(key);
+        let mut meta = TableMeta::new(name.to_string(), table_id, columns.to_vec(), root);
+        meta.encrypted = true;
+        meta.cipher = Some(cipher.clone());
+        let state = Arc::new(RwLock::new(TableState { meta }));
+
+        {
+            let mut tables = self.tables.write().unwrap();
+            if tables.contains_key(name) {
+                return Err(BoogyError::TableExists(name.to_string()));
+            }
+            tables.insert(name.to_string(), state);
+        }
+
+        // Register cipher for page-level encryption on sync.
+        {
+            let mut ciphers = self.table_ciphers.write().unwrap();
+            ciphers.insert(table_id, Arc::new(cipher));
+        }
+
+        let (metas, next_id) = self.snapshot_table_metas();
+        Self::persist_registry(&self.file, &self.wal, &metas, next_id, durability)?;
+        Ok(())
+    }
+
+    /// Unlock an encrypted table by providing its key. Operations on the
+    /// table will fail with `TableLocked` until this is called after open.
+    pub fn unlock_table(&self, name: &str, key: &[u8; 32]) -> Result<()> {
+        let table_state = {
+            let tables = self.tables.read().unwrap();
+            tables.get(name)
+                .ok_or_else(|| BoogyError::TableNotFound(name.to_string()))?
+                .clone()
+        };
+
+        let mut state = table_state.write().unwrap();
+        if !state.meta.encrypted {
+            return Err(BoogyError::SchemaMismatch(format!(
+                "table '{name}' is not encrypted"
+            )));
+        }
+        if state.meta.cipher.is_some() {
+            // Already unlocked
+            return Ok(());
+        }
+
+        let cipher = crate::crypto::Cipher::new(key);
+
+        // Verify key by attempting to decrypt the root page from disk.
+        let root_page_no = state.meta.root_page;
+        if root_page_no < self.file.page_count() {
+            match self.file.read_page_raw(root_page_no) {
+                Ok(raw) => {
+                    cipher.decrypt_page(&raw)
+                        .map_err(|_| BoogyError::InvalidKey(name.to_string()))?;
+                }
+                Err(_) => {
+                    // Page not on disk -- could be only in WAL. Accept the key.
+                }
+            }
+        }
+
+        // Key accepted. Store cipher.
+        let table_id = state.meta.table_id;
+        state.meta.cipher = Some(cipher.clone());
+
+        {
+            let mut ciphers = self.table_ciphers.write().unwrap();
+            ciphers.insert(table_id, Arc::new(cipher));
+        }
+
+        // Eagerly decrypt and cache all pages in the table's B+ tree.
+        self.preload_encrypted_table(&state)?;
+
+        Ok(())
+    }
+
+    /// Walk the B+ tree of an encrypted table, decrypt each page from disk,
+    /// and insert the plaintext into the page cache. This avoids any changes
+    /// to the normal read path (which validates CRC on cache miss).
+    fn preload_encrypted_table(&self, state: &TableState) -> Result<()> {
+        let cipher = state.meta.cipher.as_ref().unwrap();
+        let mut to_visit = vec![state.meta.root_page];
+
+        while let Some(page_no) = to_visit.pop() {
+            if self.file.is_cached(page_no) {
+                continue;
+            }
+
+            if page_no < self.file.page_count() {
+                match self.file.read_page_raw(page_no) {
+                    Ok(raw) => {
+                        let decrypted = cipher.decrypt_page(&raw)?;
+                        let mut padded = [0u8; PAGE_SIZE];
+                        padded[..crate::crypto::ENCRYPTED_PAYLOAD_SIZE].copy_from_slice(&decrypted);
+                        let mut page = Page::from_bytes_unchecked(padded);
+                        page.update_checksum();
+                        self.file.put_cached_page(page_no, page.clone());
+
+                        // Register this page's cipher for future sync_all
+                        self.file.register_page_cipher(page_no, Arc::new(cipher.clone()));
+
+                        if page.is_branch() {
+                            let num_keys = page.num_rows() as usize;
+                            for i in 0..=num_keys {
+                                let child = Self::get_branch_child_from_page(&page, i);
+                                to_visit.push(child);
+                            }
+                        }
+                        if page.is_leaf() {
+                            let next = page.next_leaf();
+                            if next != 0 {
+                                to_visit.push(next);
+                            }
+                        }
+                    }
+                    Err(_) => {} // page only in cache/WAL, skip
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Read a branch page child pointer at the given index.
+    fn get_branch_child_from_page(page: &Page, idx: usize) -> u32 {
+        let offset = 16 + idx * 12; // PAGE_HEADER_SIZE + idx * BRANCH_ENTRY_SIZE
+        u32::from_le_bytes(page.data[offset..offset + 4].try_into().unwrap())
     }
 }
 

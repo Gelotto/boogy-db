@@ -8,6 +8,7 @@ pub mod btree;
 pub mod wal;
 pub mod table;
 pub mod index;
+pub mod crypto;
 pub mod db;
 
 pub use error::{BoogyError, Result};

@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use crate::crypto::Cipher;
 use crate::value::ColumnDef;
 
 /// Metadata for a secondary index.
@@ -32,6 +33,10 @@ pub struct TableMeta {
     pub next_rowid: u64,
     /// Secondary indexes on this table.
     pub indexes: Vec<IndexMeta>,
+    /// Whether this table's pages are encrypted at rest.
+    pub encrypted: bool,
+    /// In-memory cipher for encrypt/decrypt (not persisted).
+    pub cipher: Option<Cipher>,
 }
 
 impl TableMeta {
@@ -52,6 +57,8 @@ impl TableMeta {
             row_count: 0,
             next_rowid: 1,
             indexes: Vec::new(),
+            encrypted: false,
+            cipher: None,
         }
     }
 
