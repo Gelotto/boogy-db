@@ -966,8 +966,9 @@ impl BoogyDb {
                 && state.meta.find_index_for_column(&f.column).is_some()
         });
 
-        // 4. Get candidate rows -- either via index or full scan.
-        let candidates: Vec<(String, Vec<u8>)> = if let Some(idx_filter) = index_candidate {
+        // 4. Get matching rows.
+        let (matching, total) = if let Some(idx_filter) = index_candidate {
+            // Index path: O(log n) lookup
             let idx_meta = state.meta.find_index_for_column(&idx_filter.column).unwrap();
             let mut file = self.file.lock().unwrap();
             let matching_ids =
@@ -977,42 +978,76 @@ impl BoogyDb {
             for id in &matching_ids {
                 let mut tree = BTree::new(&mut file, state.meta.root_page);
                 if let Some(bytes) = tree.search(id)? {
-                    rows.push((id.clone(), bytes));
+                    let decoded = row::decode_row(&bytes)?;
+                    rows.push(decoded_to_row(&decoded, &state.meta));
                 }
             }
-            rows
-        } else {
+            let total = rows.len() as u64;
+            (rows, total)
+        } else if opts.filters.len() == 1 {
+            // Single filter: use scan_filtered (extract_column on raw bytes, no full decode)
+            let f = &opts.filters[0];
+            if let Some(col_id) = state.meta.col_id(&f.column) {
+                let mut file = self.file.lock().unwrap();
+                let mut tree = BTree::new(&mut file, state.meta.root_page);
+                // Only apply limit/offset if no sort (sorted results need full collection first)
+                let (lim, off) = if opts.sort.is_empty() {
+                    (opts.limit, opts.offset)
+                } else {
+                    (None, None)
+                };
+                let (raw_rows, total) = tree.scan_filtered(col_id, f.op, &f.value, lim, off)?;
+                drop(file);
+                let matching: Vec<Row> = raw_rows.iter()
+                    .map(|(_, bytes)| {
+                        let decoded = row::decode_row(bytes).unwrap();
+                        decoded_to_row(&decoded, &state.meta)
+                    })
+                    .collect();
+                (matching, total)
+            } else {
+                // Column not found — no matches
+                (Vec::new(), 0)
+            }
+        } else if opts.filters.is_empty() {
+            // No filters: full scan but skip decode, just collect raw
             let mut file = self.file.lock().unwrap();
             let mut tree = BTree::new(&mut file, state.meta.root_page);
-            tree.scan_all()?
+            let all = tree.scan_all()?;
+            drop(file);
+            let total = all.len() as u64;
+            let matching: Vec<Row> = all.iter()
+                .map(|(_, bytes)| {
+                    let decoded = row::decode_row(bytes).unwrap();
+                    decoded_to_row(&decoded, &state.meta)
+                })
+                .collect();
+            (matching, total)
+        } else {
+            // Multi-filter: scan all, decode, filter
+            let mut file = self.file.lock().unwrap();
+            let mut tree = BTree::new(&mut file, state.meta.root_page);
+            let all = tree.scan_all()?;
+            drop(file);
+            let mut matching = Vec::new();
+            for (_, bytes) in &all {
+                let decoded = row::decode_row(bytes)?;
+                let row = decoded_to_row(&decoded, &state.meta);
+                let passes = opts.filters.iter().all(|f| {
+                    let col_val = row.columns.iter().find(|(name, _)| name == &f.column).map(|(_, v)| v);
+                    match col_val {
+                        Some(v) => f.matches(v),
+                        None => f.matches(&Value::Null),
+                    }
+                });
+                if passes { matching.push(row); }
+            }
+            let total = matching.len() as u64;
+            (matching, total)
         };
 
-        // 5. Decode and filter outside any file lock.
-        let mut matching: Vec<Row> = Vec::new();
-        for (_, bytes) in &candidates {
-            let decoded = row::decode_row(bytes)?;
-            let row = decoded_to_row(&decoded, &state.meta);
-
-            let passes = opts.filters.iter().all(|f| {
-                let col_val = row
-                    .columns
-                    .iter()
-                    .find(|(name, _)| name == &f.column)
-                    .map(|(_, v)| v);
-                match col_val {
-                    Some(v) => f.matches(v),
-                    None => f.matches(&Value::Null),
-                }
-            });
-
-            if passes {
-                matching.push(row);
-            }
-        }
-
-        let total = matching.len() as u64;
-
         // Sort.
+        let mut matching = matching;
         for sort in opts.sort.iter().rev() {
             matching.sort_by(|a, b| {
                 let va = a
@@ -1065,54 +1100,35 @@ impl BoogyDb {
             return Ok(state.meta.row_count);
         }
 
-        // Check if any Eq filter can use an index.
-        let index_candidate = filters.iter().find(|f| {
-            f.op == FilterOp::Eq
-                && state.meta.find_index_for_column(&f.column).is_some()
-        });
-
-        // 3. Get candidate rows -- either via index or full scan.
-        let candidates: Vec<(String, Vec<u8>)> = if let Some(idx_filter) = index_candidate {
-            let idx_meta = state.meta.find_index_for_column(&idx_filter.column).unwrap();
-            let mut file = self.file.lock().unwrap();
-            let matching_ids =
-                Self::index_lookup(&mut file, idx_meta.root_page, &idx_filter.value)?;
-
-            let mut rows = Vec::with_capacity(matching_ids.len());
-            for id in &matching_ids {
+        // Single filter: use count_filtered (extract_column on raw bytes)
+        if filters.len() == 1 {
+            let f = &filters[0];
+            if let Some(col_id) = state.meta.col_id(&f.column) {
+                let mut file = self.file.lock().unwrap();
                 let mut tree = BTree::new(&mut file, state.meta.root_page);
-                if let Some(bytes) = tree.search(id)? {
-                    rows.push((id.clone(), bytes));
-                }
+                return tree.count_filtered(col_id, f.op, &f.value);
             }
-            rows
-        } else {
-            let mut file = self.file.lock().unwrap();
-            let mut tree = BTree::new(&mut file, state.meta.root_page);
-            tree.scan_all()?
-        };
+            return Ok(0);
+        }
 
-        // 4. Decode and count outside any file lock.
+        // Multi-filter: scan all, decode, filter
+        let mut file = self.file.lock().unwrap();
+        let mut tree = BTree::new(&mut file, state.meta.root_page);
+        let all = tree.scan_all()?;
+        drop(file);
+
         let mut count = 0u64;
-        for (_, bytes) in &candidates {
+        for (_, bytes) in &all {
             let decoded = row::decode_row(bytes)?;
             let row = decoded_to_row(&decoded, &state.meta);
-
             let passes = filters.iter().all(|f| {
-                let col_val = row
-                    .columns
-                    .iter()
-                    .find(|(name, _)| name == &f.column)
-                    .map(|(_, v)| v);
+                let col_val = row.columns.iter().find(|(name, _)| name == &f.column).map(|(_, v)| v);
                 match col_val {
                     Some(v) => f.matches(v),
                     None => f.matches(&Value::Null),
                 }
             });
-
-            if passes {
-                count += 1;
-            }
+            if passes { count += 1; }
         }
 
         Ok(count)

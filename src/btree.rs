@@ -87,6 +87,92 @@ impl<'a> BTree<'a> {
         Ok(results)
     }
 
+    /// Scan rows, evaluating a filter on raw page bytes using extract_column.
+    /// Only decodes and collects rows that pass the filter.
+    /// Returns (matching rows as raw bytes, total matching count).
+    pub fn scan_filtered(
+        &mut self,
+        filter_col_id: u16,
+        filter_op: crate::filter::FilterOp,
+        filter_val: &crate::value::Value,
+        limit: Option<u32>,
+        offset: Option<u32>,
+    ) -> Result<(Vec<(String, Vec<u8>)>, u64)> {
+        let first_leaf = self.find_leftmost_leaf(self.root)?;
+        let mut total: u64 = 0;
+        let mut results = Vec::new();
+        let skip = offset.unwrap_or(0) as u64;
+        let take = limit.unwrap_or(u32::MAX) as u64;
+        let mut current = first_leaf;
+
+        loop {
+            let page = self.file.read_page(current)?.clone();
+            let num_rows = page.num_rows() as usize;
+            for i in 0..num_rows {
+                let (start, end) = row_bounds(&page, i, num_rows);
+                if start >= end || end > PAGE_SIZE {
+                    continue;
+                }
+                let data = &page.data[start..end];
+
+                // Extract just the filter column — no full decode
+                let col_val = row::extract_column(data, filter_col_id)?;
+                let actual = col_val.as_ref().unwrap_or(&crate::value::Value::Null);
+
+                if crate::filter::eval_filter_op(actual, &filter_op, filter_val) {
+                    total += 1;
+                    if total > skip && (total - skip) <= take {
+                        if let Ok(id) = row::extract_id(data) {
+                            results.push((id.to_string(), data.to_vec()));
+                        }
+                    }
+                }
+            }
+            let next = page.next_leaf();
+            if next == 0 {
+                break;
+            }
+            current = next;
+        }
+        Ok((results, total))
+    }
+
+    /// Count rows matching a filter using extract_column on raw bytes.
+    pub fn count_filtered(
+        &mut self,
+        filter_col_id: u16,
+        filter_op: crate::filter::FilterOp,
+        filter_val: &crate::value::Value,
+    ) -> Result<u64> {
+        let first_leaf = self.find_leftmost_leaf(self.root)?;
+        let mut count: u64 = 0;
+        let mut current = first_leaf;
+
+        loop {
+            let page = self.file.read_page(current)?.clone();
+            let num_rows = page.num_rows() as usize;
+            for i in 0..num_rows {
+                let (start, end) = row_bounds(&page, i, num_rows);
+                if start >= end || end > PAGE_SIZE {
+                    continue;
+                }
+                let data = &page.data[start..end];
+                let col_val = row::extract_column(data, filter_col_id)?;
+                let actual = col_val.as_ref().unwrap_or(&crate::value::Value::Null);
+
+                if crate::filter::eval_filter_op(actual, &filter_op, filter_val) {
+                    count += 1;
+                }
+            }
+            let next = page.next_leaf();
+            if next == 0 {
+                break;
+            }
+            current = next;
+        }
+        Ok(count)
+    }
+
     /// Scan all keys that start with the given prefix.
     /// Returns (id, row_bytes) pairs for matching entries.
     pub fn scan_prefix(&mut self, prefix: &str) -> Result<Vec<(String, Vec<u8>)>> {

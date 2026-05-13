@@ -55,6 +55,21 @@ impl Filter {
     }
 }
 
+/// Evaluate a filter op directly without a Filter struct. Used by B+ tree scan_filtered.
+pub fn eval_filter_op(actual: &Value, op: &FilterOp, expected: &Value) -> bool {
+    match actual.compare(expected) {
+        Some(ord) => match op {
+            FilterOp::Eq => ord == Ordering::Equal,
+            FilterOp::Ne => ord != Ordering::Equal,
+            FilterOp::Lt => ord == Ordering::Less,
+            FilterOp::Le => ord != Ordering::Greater,
+            FilterOp::Gt => ord == Ordering::Greater,
+            FilterOp::Ge => ord != Ordering::Less,
+        },
+        None => false,
+    }
+}
+
 // Convenience Into<Value> impls
 impl From<&str> for Value {
     fn from(s: &str) -> Self { Value::Text(s.to_string()) }
