@@ -106,14 +106,17 @@ impl<'a> BTree<'a> {
         let mut current = first_leaf;
 
         loop {
-            let page = self.file.read_page(current)?.clone();
-            let num_rows = page.num_rows() as usize;
+            // Read page data + next pointer, then release borrow immediately
+            let (page_data, num_rows, next) = {
+                let page = self.file.read_page(current)?;
+                (page.data, page.num_rows() as usize, page.next_leaf())
+            };
             for i in 0..num_rows {
-                let (start, end) = row_bounds(&page, i, num_rows);
+                let (start, end) = row_bounds_raw(&page_data, i, num_rows);
                 if start >= end || end > PAGE_SIZE {
                     continue;
                 }
-                let data = &page.data[start..end];
+                let data = &page_data[start..end];
 
                 // Extract just the filter column — no full decode
                 let col_val = row::extract_column(data, filter_col_id)?;
@@ -128,7 +131,6 @@ impl<'a> BTree<'a> {
                     }
                 }
             }
-            let next = page.next_leaf();
             if next == 0 {
                 break;
             }
@@ -149,14 +151,16 @@ impl<'a> BTree<'a> {
         let mut current = first_leaf;
 
         loop {
-            let page = self.file.read_page(current)?.clone();
-            let num_rows = page.num_rows() as usize;
+            let (page_data, num_rows, next) = {
+                let page = self.file.read_page(current)?;
+                (page.data, page.num_rows() as usize, page.next_leaf())
+            };
             for i in 0..num_rows {
-                let (start, end) = row_bounds(&page, i, num_rows);
+                let (start, end) = row_bounds_raw(&page_data, i, num_rows);
                 if start >= end || end > PAGE_SIZE {
                     continue;
                 }
-                let data = &page.data[start..end];
+                let data = &page_data[start..end];
                 let col_val = row::extract_column(data, filter_col_id)?;
                 let actual = col_val.as_ref().unwrap_or(&crate::value::Value::Null);
 
@@ -164,7 +168,6 @@ impl<'a> BTree<'a> {
                     count += 1;
                 }
             }
-            let next = page.next_leaf();
             if next == 0 {
                 break;
             }
