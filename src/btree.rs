@@ -375,6 +375,82 @@ impl<'a, 'b> BTreeWriter<'a, 'b> {
         Ok(deleted)
     }
 
+    /// Update all rows whose raw bytes satisfy `pred`. Walks the leaf chain once.
+    /// For each matching row, calls `updater(old_bytes)` to get new bytes, then
+    /// tries to replace in-place. If the page would overflow, the row is added to
+    /// the overflow list instead.
+    ///
+    /// Returns `(updated_in_place, overflow)`.
+    /// Each entry is `(rowid, old_bytes, new_bytes)`.
+    pub fn update_matching<F, U>(
+        &mut self,
+        pred: F,
+        updater: U,
+    ) -> Result<(Vec<(u64, Vec<u8>, Vec<u8>)>, Vec<(u64, Vec<u8>, Vec<u8>)>)>
+    where
+        F: Fn(&[u8]) -> bool,
+        U: Fn(&[u8]) -> Vec<u8>,
+    {
+        let first_leaf = self.find_leftmost_leaf_w(self.root)?;
+        let mut updated = Vec::new();
+        let mut overflow = Vec::new();
+        let mut current = first_leaf;
+
+        loop {
+            let page = (*self.guard.read_page(current)?).clone();
+            let num_rows = page.num_rows() as usize;
+            let next = page.next_leaf();
+
+            // Collect matches and their replacements.
+            let mut replacements: Vec<(usize, Vec<u8>, u64, Vec<u8>)> = Vec::new();
+            for i in 0..num_rows {
+                let (start, end) = row_bounds_raw(&page.data, i, num_rows);
+                if start >= end || end > PAGE_SIZE {
+                    continue;
+                }
+                let data = &page.data[start..end];
+                if pred(data) {
+                    let new_bytes = updater(data);
+                    if let Ok(id) = row::extract_id(data) {
+                        replacements.push((i, new_bytes, id, data.to_vec()));
+                    }
+                }
+            }
+
+            if !replacements.is_empty() {
+                // Build the replacement slice for write_leaf_with_replacements.
+                let repl_refs: Vec<(usize, &[u8])> = replacements
+                    .iter()
+                    .map(|(idx, new_bytes, _, _)| (*idx, new_bytes.as_slice()))
+                    .collect();
+
+                let snapshot = page.data;
+                let wp = self.guard.write_page(current)?;
+                let fits = write_leaf_with_replacements(wp, &snapshot, num_rows, &repl_refs);
+
+                if fits {
+                    // All replacements fit in-place.
+                    for (_, new_bytes, id, old_bytes) in replacements {
+                        updated.push((id, old_bytes, new_bytes));
+                    }
+                } else {
+                    // Overflow: restore the original page data.
+                    wp.data = snapshot;
+                    for (_, new_bytes, id, old_bytes) in replacements {
+                        overflow.push((id, old_bytes, new_bytes));
+                    }
+                }
+            }
+
+            if next == 0 {
+                break;
+            }
+            current = next;
+        }
+
+        Ok((updated, overflow))
+    }
+
     // --- Internal methods ---
 
     /// Navigate branch pages to find the leftmost leaf page.
@@ -734,6 +810,69 @@ fn write_leaf_without_multiple(
 
     page.set_num_rows(total as u16);
     page.set_free_space_offset(write_pos as u16);
+}
+
+/// Write a leaf page that contains the rows from `snapshot` with some rows
+/// replaced by new data. `replacements` is sorted by index.
+/// Returns false if the rebuilt page would overflow (total size > PAGE_SIZE).
+/// Preserves next_leaf/prev_leaf from the snapshot.
+fn write_leaf_with_replacements(
+    page: &mut Page,
+    snapshot: &[u8; PAGE_SIZE],
+    old_count: usize,
+    replacements: &[(usize, &[u8])],
+) -> bool {
+    // Pre-check: compute total size to see if it fits.
+    let data_start = PAGE_HEADER_SIZE + old_count * 2;
+    let mut total_data_size = 0usize;
+    let mut repl_ptr = 0usize;
+    for src_idx in 0..old_count {
+        if repl_ptr < replacements.len() && replacements[repl_ptr].0 == src_idx {
+            total_data_size += replacements[repl_ptr].1.len();
+            repl_ptr += 1;
+        } else {
+            let (s, e) = row_bounds_raw(snapshot, src_idx, old_count);
+            total_data_size += e - s;
+        }
+    }
+    if data_start + total_data_size + CHECKSUM_SIZE > PAGE_SIZE {
+        return false;
+    }
+
+    // Preserve leaf chain pointers from the snapshot.
+    let saved_next = u32::from_le_bytes(snapshot[8..12].try_into().unwrap());
+    let saved_prev = u32::from_le_bytes(snapshot[12..16].try_into().unwrap());
+
+    page.set_flags(PAGE_LEAF);
+    page.set_num_rows(0);
+    page.set_next_leaf(saved_next);
+    page.set_prev_leaf(saved_prev);
+
+    page.data[PAGE_HEADER_SIZE..PAGE_SIZE - CHECKSUM_SIZE].fill(0);
+
+    let mut write_pos = data_start;
+    let mut repl_ptr = 0usize;
+
+    for src_idx in 0..old_count {
+        if repl_ptr < replacements.len() && replacements[repl_ptr].0 == src_idx {
+            let new_data = replacements[repl_ptr].1;
+            page.data[write_pos..write_pos + new_data.len()].copy_from_slice(new_data);
+            page.set_row_offset(src_idx as u16, write_pos as u16);
+            write_pos += new_data.len();
+            repl_ptr += 1;
+        } else {
+            let (s, e) = row_bounds_raw(snapshot, src_idx, old_count);
+            let len = e - s;
+            page.data[write_pos..write_pos + len].copy_from_slice(&snapshot[s..e]);
+            page.set_row_offset(src_idx as u16, write_pos as u16);
+            write_pos += len;
+        }
+    }
+
+    page.set_num_rows(old_count as u16);
+    page.set_free_space_offset(write_pos as u16);
+    page.update_checksum();
+    true
 }
 
 /// Write a leaf page that contains the rows from `snapshot` except the row at
@@ -1105,6 +1244,73 @@ mod tests {
             let val = row::extract_column(bytes, 0).unwrap().unwrap();
             assert_ne!(val, Value::Integer(5));
         }
+    }
+
+    #[test]
+    fn test_update_matching() {
+        let tmp = NamedTempFile::new().unwrap();
+        let pf = PageFile::open(tmp.path()).unwrap();
+
+        let mut root;
+        {
+            let mut guard = pf.begin_write();
+            root = BTreeWriter::create(&mut guard).unwrap();
+
+            // Insert 100 rows: even rows get "active", odd rows get "idle".
+            for i in 0..100u64 {
+                let status = if i % 2 == 0 { "active" } else { "idle" };
+                let row = row::encode_row(i, &[(0, &Value::Text(status.into()))]);
+                let mut tree = BTreeWriter::new(&mut guard, root);
+                root = tree.insert(i, &row).unwrap();
+            }
+            guard.commit(false).unwrap();
+        }
+
+        // Update all "active" rows to "archived".
+        {
+            let mut guard = pf.begin_write();
+            let mut tree = BTreeWriter::new(&mut guard, root);
+            let (updated, overflow) = tree
+                .update_matching(
+                    |data| {
+                        if let Ok(Some(val)) = row::extract_column(data, 0) {
+                            val == Value::Text("active".into())
+                        } else {
+                            false
+                        }
+                    },
+                    |old_bytes| {
+                        let decoded = row::decode_row(old_bytes).unwrap();
+                        row::encode_row(decoded.id, &[(0, &Value::Text("archived".into()))])
+                    },
+                )
+                .unwrap();
+            assert_eq!(updated.len(), 50);
+            assert_eq!(overflow.len(), 0);
+            root = tree.root_page();
+            guard.commit(false).unwrap();
+        }
+
+        // Verify: 50 archived, 50 idle, 0 active.
+        let reader = BTreeReader::new(&pf, root);
+        let all = reader.scan_all().unwrap();
+        assert_eq!(all.len(), 100);
+        let mut archived = 0;
+        let mut idle = 0;
+        let mut active = 0;
+        for (_, bytes) in &all {
+            if let Ok(Some(val)) = row::extract_column(bytes, 0) {
+                match val {
+                    Value::Text(s) if s == "archived" => archived += 1,
+                    Value::Text(s) if s == "idle" => idle += 1,
+                    Value::Text(s) if s == "active" => active += 1,
+                    _ => {}
+                }
+            }
+        }
+        assert_eq!(archived, 50);
+        assert_eq!(idle, 50);
+        assert_eq!(active, 0);
     }
 
     #[test]
