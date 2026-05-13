@@ -191,7 +191,7 @@ impl<'a> IndexTree<'a> {
 
     /// Return all keys that start with `prefix`, in sorted order.
     pub fn scan_prefix(&mut self, prefix: &[u8]) -> Result<Vec<Vec<u8>>> {
-        let first_leaf = self.find_leftmost_leaf(self.root)?;
+        let first_leaf = self.find_leaf_for_key(self.root, prefix)?;
         let mut results = Vec::new();
         let mut current = first_leaf;
         let mut found_start = false;
@@ -225,7 +225,7 @@ impl<'a> IndexTree<'a> {
 
     /// Count entries whose key starts with `prefix` without collecting them.
     pub fn count_prefix(&mut self, prefix: &[u8]) -> Result<u64> {
-        let first_leaf = self.find_leftmost_leaf(self.root)?;
+        let first_leaf = self.find_leaf_for_key(self.root, prefix)?;
         let mut count = 0u64;
         let mut current = first_leaf;
         let mut found_start = false;
@@ -256,7 +256,7 @@ impl<'a> IndexTree<'a> {
 
     /// Same as scan_prefix but stops after collecting `max` keys.
     pub fn scan_prefix_limit(&mut self, prefix: &[u8], max: usize) -> Result<Vec<Vec<u8>>> {
-        let first_leaf = self.find_leftmost_leaf(self.root)?;
+        let first_leaf = self.find_leaf_for_key(self.root, prefix)?;
         let mut results = Vec::with_capacity(max.min(256));
         let mut current = first_leaf;
         let mut found_start = false;
@@ -290,13 +290,15 @@ impl<'a> IndexTree<'a> {
 
     // --- Internal methods ---
 
-    fn find_leftmost_leaf(&mut self, page_no: u32) -> Result<u32> {
+    /// Navigate the B+ tree to find the leaf page containing (or nearest to) `key`.
+    /// Uses branch keys for O(log n) routing instead of scanning from leftmost leaf.
+    fn find_leaf_for_key(&mut self, page_no: u32, key: &[u8]) -> Result<u32> {
         let page = self.file.read_page(page_no)?.clone();
         if page.is_leaf() {
             Ok(page_no)
         } else {
-            let child = get_idx_branch_child(&page, 0);
-            self.find_leftmost_leaf(child)
+            let (_, child) = find_idx_child(&page, key);
+            self.find_leaf_for_key(child, key)
         }
     }
 
