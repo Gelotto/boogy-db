@@ -1308,72 +1308,90 @@ impl BoogyDb {
         // 3. Type enforcement for indexed columns.
         Self::enforce_index_types(&state.meta, fields)?;
 
-        // 4. Read candidates via concurrent reader (safe: hold table write lock).
-        let candidates = {
-            let reader = BTreeReader::new(&self.file, state.meta.root_page);
-            reader.scan_all()?
-        };
+        // 4. Build col_id lookups needed by closures (avoids borrowing state.meta
+        //    inside the closures which would conflict with &mut guard).
+        let filter_col_ids: Vec<Option<u16>> = filters
+            .iter()
+            .map(|f| state.meta.col_id(&f.column))
+            .collect();
+        let field_col_ids: Vec<Option<u16>> = fields
+            .iter()
+            .map(|(name, _)| state.meta.col_id(name))
+            .collect();
 
-        // Filter and collect matching row IDs + old data + old bytes for index
-        let mut to_update: Vec<(u64, HashMap<u16, Value>, Vec<u8>)> = Vec::new();
-        for (_, bytes) in &candidates {
-            let passes = filters.iter().all(|f| {
-                if let Some(col_id) = state.meta.col_id(&f.column) {
-                    if let Ok(Some(raw)) = row::extract_column_raw(bytes, col_id) {
-                        if let Some(result) = crate::filter::eval_filter_raw(raw, &f.op, &f.value) {
-                            return result;
-                        }
-                    }
-                    let col_val = row::extract_column(bytes, col_id).ok().flatten();
-                    let actual = col_val.as_ref().unwrap_or(&Value::Null);
-                    f.matches(actual)
-                } else {
-                    f.matches(&Value::Null)
-                }
-            });
-
-            if passes {
-                let decoded = row::decode_row(bytes)?;
-                let rowid = decoded.id;
-                let old_col_map: HashMap<u16, Value> = decoded.columns.into_iter().collect();
-                to_update.push((rowid, old_col_map, bytes.to_vec()));
-            }
-        }
-
-        let count = to_update.len() as u64;
-
-        // 5. Apply updates via WriteGuard.
+        // 5. Batch update via single leaf-chain walk.
         let durability = self.durability();
+        let count;
         {
             let mut guard = self.file.begin_write();
-            for (id, old_col_map, old_bytes) in &to_update {
-                let mut col_map = old_col_map.clone();
-                for (name, val) in fields {
-                    if let Some(col_id) = state.meta.col_id(name) {
+
+            let pred = |data: &[u8]| -> bool {
+                filters.iter().enumerate().all(|(i, f)| {
+                    if let Some(col_id) = filter_col_ids[i] {
+                        if let Ok(Some(raw)) = row::extract_column_raw(data, col_id) {
+                            if let Some(result) =
+                                crate::filter::eval_filter_raw(raw, &f.op, &f.value)
+                            {
+                                return result;
+                            }
+                        }
+                        let col_val = row::extract_column(data, col_id).ok().flatten();
+                        let actual = col_val.as_ref().unwrap_or(&Value::Null);
+                        f.matches(actual)
+                    } else {
+                        f.matches(&Value::Null)
+                    }
+                })
+            };
+
+            let updater = |old_bytes: &[u8]| -> Vec<u8> {
+                let decoded = row::decode_row(old_bytes).unwrap();
+                let mut col_map: HashMap<u16, Value> =
+                    decoded.columns.into_iter().collect();
+                for (i, (_, val)) in fields.iter().enumerate() {
+                    if let Some(col_id) = field_col_ids[i] {
                         col_map.insert(col_id, val.clone());
                     }
                 }
-
                 let col_values: Vec<(u16, &Value)> =
                     col_map.iter().map(|(k, v)| (*k, v)).collect();
-                let new_row = row::encode_row(*id, &col_values);
+                row::encode_row(decoded.id, &col_values)
+            };
 
-                // Remove old index entries.
-                if !state.meta.indexes.is_empty() {
-                    Self::index_update_row(&mut guard, &mut state.meta, *id, old_bytes, true)?;
-                }
+            let mut tree = BTreeWriter::new(&mut guard, state.meta.root_page);
+            let (in_place, overflow) = tree.update_matching(pred, updater)?;
+            state.meta.root_page = tree.root_page();
 
+            // Handle overflow rows: delete + re-insert (they didn't fit in the
+            // original page after update).
+            for (id, _, new_bytes) in &overflow {
                 let mut tree = BTreeWriter::new(&mut guard, state.meta.root_page);
                 tree.delete(*id)?;
-                let new_root = tree.insert(*id, &new_row)?;
+                let new_root = tree.insert(*id, new_bytes)?;
                 state.meta.root_page = new_root;
+            }
 
-                // Insert new index entries.
-                if !state.meta.indexes.is_empty() {
-                    Self::index_update_row(&mut guard, &mut state.meta, *id, &new_row, false)?;
+            // Index maintenance for all updated rows (both in-place and overflow).
+            if !state.meta.indexes.is_empty() {
+                for (id, old_bytes, new_bytes) in in_place.iter().chain(overflow.iter()) {
+                    Self::index_update_row(
+                        &mut guard,
+                        &mut state.meta,
+                        *id,
+                        old_bytes,
+                        true,
+                    )?;
+                    Self::index_update_row(
+                        &mut guard,
+                        &mut state.meta,
+                        *id,
+                        new_bytes,
+                        false,
+                    )?;
                 }
             }
 
+            count = (in_place.len() + overflow.len()) as u64;
             Self::commit_write(guard, &self.wal, durability, state.meta.table_id)?;
         }
 
@@ -1394,51 +1412,56 @@ impl BoogyDb {
         // 2. Write-lock the specific table.
         let mut state = table_state.write().unwrap();
 
-        // 3. Read candidates via concurrent reader (safe: hold table write lock).
-        let candidates = {
-            let reader = BTreeReader::new(&self.file, state.meta.root_page);
-            reader.scan_all()?
-        };
+        // 3. Build col_id lookups needed by the predicate closure (avoids
+        //    borrowing state.meta inside the closure).
+        let filter_col_ids: Vec<Option<u16>> = filters
+            .iter()
+            .map(|f| state.meta.col_id(&f.column))
+            .collect();
 
-        // Filter and collect matching row IDs + bytes for index removal
-        let mut to_delete: Vec<(u64, Vec<u8>)> = Vec::new();
-        for (_, bytes) in &candidates {
-            let passes = filters.iter().all(|f| {
-                if let Some(col_id) = state.meta.col_id(&f.column) {
-                    if let Ok(Some(raw)) = row::extract_column_raw(bytes, col_id) {
-                        if let Some(result) = crate::filter::eval_filter_raw(raw, &f.op, &f.value) {
-                            return result;
-                        }
-                    }
-                    let col_val = row::extract_column(bytes, col_id).ok().flatten();
-                    let actual = col_val.as_ref().unwrap_or(&Value::Null);
-                    f.matches(actual)
-                } else {
-                    f.matches(&Value::Null)
-                }
-            });
-
-            if passes {
-                let rowid = row::extract_id(bytes)?;
-                to_delete.push((rowid, bytes.to_vec()));
-            }
-        }
-
-        let count = to_delete.len() as u64;
-
-        // 4. Delete rows via WriteGuard.
+        // 4. Batch delete via single leaf-chain walk.
         let durability = self.durability();
+        let count;
         {
             let mut guard = self.file.begin_write();
-            for (id, old_bytes) in &to_delete {
-                if !state.meta.indexes.is_empty() {
-                    Self::index_update_row(&mut guard, &mut state.meta, *id, old_bytes, true)?;
+
+            let pred = |data: &[u8]| -> bool {
+                filters.iter().enumerate().all(|(i, f)| {
+                    if let Some(col_id) = filter_col_ids[i] {
+                        if let Ok(Some(raw)) = row::extract_column_raw(data, col_id) {
+                            if let Some(result) =
+                                crate::filter::eval_filter_raw(raw, &f.op, &f.value)
+                            {
+                                return result;
+                            }
+                        }
+                        let col_val = row::extract_column(data, col_id).ok().flatten();
+                        let actual = col_val.as_ref().unwrap_or(&Value::Null);
+                        f.matches(actual)
+                    } else {
+                        f.matches(&Value::Null)
+                    }
+                })
+            };
+
+            let mut tree = BTreeWriter::new(&mut guard, state.meta.root_page);
+            let deleted = tree.delete_matching(pred)?;
+            state.meta.root_page = tree.root_page();
+
+            // Index maintenance on deleted rows.
+            if !state.meta.indexes.is_empty() {
+                for (id, old_bytes) in &deleted {
+                    Self::index_update_row(
+                        &mut guard,
+                        &mut state.meta,
+                        *id,
+                        old_bytes,
+                        true,
+                    )?;
                 }
-                let mut tree = BTreeWriter::new(&mut guard, state.meta.root_page);
-                tree.delete(*id)?;
-                state.meta.root_page = tree.root_page();
             }
 
+            count = deleted.len() as u64;
             Self::commit_write(guard, &self.wal, durability, state.meta.table_id)?;
         }
 
