@@ -513,15 +513,23 @@ impl BoogyDb {
         }
     }
 
-    /// Add a row_id to an index. One B+ tree insert — O(log n).
+    /// Add a row to an index. Stores the full row data (covering index).
+    /// One B+ tree insert — O(log n).
+    /// The entry is encoded as a normal row with composite key as the _id and
+    /// the original row bytes stored as a blob in column 0xFFFF.
     fn index_add(
         file: &mut PageFile,
         idx_root: u32,
         col_val: &Value,
         row_id: &str,
+        row_data: &[u8],
     ) -> Result<u32> {
         let key = Self::index_composite_key(col_val, row_id);
-        let entry = row::encode_row(&key, &[]); // minimal entry, key carries all info
+        // Encode as a row where _id = composite_key and a single blob column
+        // (col_id = 0xFFFF) holds the original row bytes. This keeps extract_id
+        // working for tree navigation while carrying the full row payload.
+        let blob = Value::Blob(row_data.to_vec());
+        let entry = row::encode_row(&key, &[(0xFFFF, &blob)]);
         let mut tree = BTree::new(file, idx_root);
         tree.insert(&key, &entry)
     }
@@ -539,20 +547,30 @@ impl BoogyDb {
         Ok(tree.root_page())
     }
 
-    /// Look up all row_ids for a given column value.
+    /// Look up all rows for a given column value. Returns (row_id, row_bytes) pairs.
     /// Uses scan_prefix: O(log n) to find start + O(k) to collect k matches.
+    /// Covering index: row bytes are extracted from the index entry (no data tree lookup).
     fn index_lookup(
         file: &mut PageFile,
         idx_root: u32,
         col_val: &Value,
-    ) -> Result<Vec<String>> {
+    ) -> Result<Vec<(String, Vec<u8>)>> {
         let prefix = format!("{}\0", Self::index_value_prefix(col_val));
         let mut tree = BTree::new(file, idx_root);
         let entries = tree.scan_prefix(&prefix)?;
-        Ok(entries.into_iter().map(|(key, _)| {
-            // row_id is everything after the prefix
-            key[prefix.len()..].to_string()
-        }).collect())
+        let mut results = Vec::with_capacity(entries.len());
+        for (key, entry_bytes) in entries {
+            let row_id = key[prefix.len()..].to_string();
+            // Extract the original row bytes from column 0xFFFF (the covering payload)
+            let row_bytes = match row::extract_column(&entry_bytes, 0xFFFF)? {
+                Some(Value::Blob(b)) => b,
+                _ => return Err(BoogyError::Corruption(
+                    "index entry missing covering payload".into()
+                )),
+            };
+            results.push((row_id, row_bytes));
+        }
+        Ok(results)
     }
 
     /// Create a new table.
@@ -674,7 +692,7 @@ impl BoogyDb {
                     .unwrap_or(Value::Null);
                 let root = state.meta.indexes[i].root_page;
                 state.meta.indexes[i].root_page =
-                    Self::index_add(&mut file, root, &col_val, &id)?;
+                    Self::index_add(&mut file, root, &col_val, &id, &row_bytes)?;
             }
 
             if matches!(durability, Durability::None) {
@@ -782,7 +800,7 @@ impl BoogyDb {
                     if old_val != new_val {
                         let root = state.meta.indexes[i].root_page;
                         let root = Self::index_remove(&mut file, root, &old_val, id)?;
-                        let root = Self::index_add(&mut file, root, &new_val, id)?;
+                        let root = Self::index_add(&mut file, root, &new_val, id, &new_row)?;
                         state.meta.indexes[i].root_page = root;
                     }
                 }
@@ -884,19 +902,17 @@ impl BoogyDb {
 
         // 4. Get matching rows.
         let (matching, total) = if let Some(idx_filter) = index_candidate {
-            // Index path: O(log n) lookup
+            // Covering index path: row data returned directly, no second tree lookup
             let idx_meta = state.meta.find_index_for_column(&idx_filter.column).unwrap();
             let mut file = self.file.lock().unwrap();
-            let matching_ids =
+            let index_results =
                 Self::index_lookup(&mut file, idx_meta.root_page, &idx_filter.value)?;
+            drop(file);
 
-            let mut rows = Vec::with_capacity(matching_ids.len());
-            for id in &matching_ids {
-                let mut tree = BTree::new(&mut file, state.meta.root_page);
-                if let Some(bytes) = tree.search(id)? {
-                    let decoded = row::decode_row(&bytes)?;
-                    rows.push(decoded_to_row(&decoded, &state.meta));
-                }
+            let mut rows = Vec::with_capacity(index_results.len());
+            for (_, bytes) in &index_results {
+                let decoded = row::decode_row(bytes)?;
+                rows.push(decoded_to_row(&decoded, &state.meta));
             }
             let total = rows.len() as u64;
             (rows, total)
@@ -1096,7 +1112,7 @@ impl BoogyDb {
                 let col_val = row::extract_column(bytes, col_id)?
                     .unwrap_or(Value::Null);
                 current_root =
-                    Self::index_add(&mut file, current_root, &col_val, row_id)?;
+                    Self::index_add(&mut file, current_root, &col_val, row_id, bytes)?;
             }
 
             Self::commit_with_wal(&mut file, &mut wal, durability, state.meta.table_id)?;
@@ -1193,16 +1209,7 @@ impl BoogyDb {
             let candidates: Vec<(String, Vec<u8>)> = if let Some(idx_filter) = index_candidate {
                 let idx_meta =
                     state.meta.find_index_for_column(&idx_filter.column).unwrap();
-                let matching_ids =
-                    Self::index_lookup(&mut file, idx_meta.root_page, &idx_filter.value)?;
-                let mut rows = Vec::with_capacity(matching_ids.len());
-                for id in &matching_ids {
-                    let mut tree = BTree::new(&mut file, state.meta.root_page);
-                    if let Some(bytes) = tree.search(id)? {
-                        rows.push((id.clone(), bytes));
-                    }
-                }
-                rows
+                Self::index_lookup(&mut file, idx_meta.root_page, &idx_filter.value)?
             } else {
                 let mut tree = BTree::new(&mut file, state.meta.root_page);
                 tree.scan_all()?
@@ -1267,7 +1274,7 @@ impl BoogyDb {
                                 &mut file, root, &old_val, id,
                             )?;
                             let root = Self::index_add(
-                                &mut file, root, &new_val, id,
+                                &mut file, root, &new_val, id, &new_row,
                             )?;
                             state.meta.indexes[i].root_page = root;
                         }
@@ -1311,16 +1318,7 @@ impl BoogyDb {
             let candidates: Vec<(String, Vec<u8>)> = if let Some(idx_filter) = index_candidate {
                 let idx_meta =
                     state.meta.find_index_for_column(&idx_filter.column).unwrap();
-                let matching_ids =
-                    Self::index_lookup(&mut file, idx_meta.root_page, &idx_filter.value)?;
-                let mut rows = Vec::with_capacity(matching_ids.len());
-                for id in &matching_ids {
-                    let mut tree = BTree::new(&mut file, state.meta.root_page);
-                    if let Some(bytes) = tree.search(id)? {
-                        rows.push((id.clone(), bytes));
-                    }
-                }
-                rows
+                Self::index_lookup(&mut file, idx_meta.root_page, &idx_filter.value)?
             } else {
                 let mut tree = BTree::new(&mut file, state.meta.root_page);
                 tree.scan_all()?
@@ -1423,7 +1421,7 @@ impl BoogyDb {
                         .unwrap_or(Value::Null);
                     let root = state.meta.indexes[i].root_page;
                     state.meta.indexes[i].root_page =
-                        Self::index_add(&mut file, root, &col_val, &id)?;
+                        Self::index_add(&mut file, root, &col_val, &id, &row_bytes)?;
                 }
 
                 state.meta.row_count += 1;
