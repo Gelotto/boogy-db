@@ -1,19 +1,22 @@
 use crate::error::{BoogyError, Result};
-use crate::file::PageFile;
+use crate::file::{PageFile, WriteGuard};
 use crate::page::{Page, PAGE_BRANCH, PAGE_HEADER_SIZE, PAGE_LEAF, PAGE_SIZE};
 use crate::row;
 
 /// Checksum occupies the last 4 bytes of each page.
 const CHECKSUM_SIZE: usize = 4;
 
-/// A B+ tree rooted at a given page number.
-pub struct BTree<'a> {
-    file: &'a mut PageFile,
+// ===========================================================================
+// BTreeReader — read-only access via &PageFile
+// ===========================================================================
+
+pub struct BTreeReader<'a> {
+    file: &'a PageFile,
     root: u32,
 }
 
-impl<'a> BTree<'a> {
-    pub fn new(file: &'a mut PageFile, root: u32) -> Self {
+impl<'a> BTreeReader<'a> {
+    pub fn new(file: &'a PageFile, root: u32) -> Self {
         Self { file, root }
     }
 
@@ -21,56 +24,18 @@ impl<'a> BTree<'a> {
         self.root
     }
 
-    /// Create a new empty B+ tree (single empty leaf page).
-    pub fn create(file: &mut PageFile) -> Result<u32> {
-        let page_no = file.allocate_page()?;
-        let page = Page::new_leaf();
-        file.put_page(page_no, page);
-        Ok(page_no)
-    }
-
-    /// Insert a row. Returns the (possibly new) root page number.
-    pub fn insert(&mut self, rowid: u64, row_data: &[u8]) -> Result<u32> {
-        let result = self.insert_recursive(self.root, rowid, row_data)?;
-        match result {
-            InsertResult::Fit => Ok(self.root),
-            InsertResult::Split {
-                new_page,
-                separator,
-            } => {
-                let new_root = self.file.allocate_page()?;
-                let mut root_page = Page::new_branch();
-                write_branch_entry(&mut root_page, 0, self.root, separator);
-                set_branch_child(&mut root_page, 1, new_page);
-                root_page.set_num_rows(1);
-                root_page.update_checksum();
-                self.file.put_page(new_root, root_page);
-                self.root = new_root;
-                Ok(self.root)
-            }
-        }
-    }
-
     /// Search for a row by rowid. Returns the raw row bytes if found.
-    pub fn search(&mut self, rowid: u64) -> Result<Option<Vec<u8>>> {
+    pub fn search(&self, rowid: u64) -> Result<Option<Vec<u8>>> {
         self.search_recursive(self.root, rowid)
     }
 
-    /// Delete a row by rowid. Returns true if the row existed.
-    pub fn delete(&mut self, rowid: u64) -> Result<bool> {
-        self.delete_recursive(self.root, rowid)
-    }
-
     /// Iterate all rows in key order. Returns (rowid, row_bytes) pairs.
-    pub fn scan_all(&mut self) -> Result<Vec<(u64, Vec<u8>)>> {
+    pub fn scan_all(&self) -> Result<Vec<(u64, Vec<u8>)>> {
         let first_leaf = self.find_leftmost_leaf(self.root)?;
         let mut results = Vec::new();
         let mut current = first_leaf;
         loop {
-            let page = match self.file.get_cached_page(current) {
-                Some(p) => p,
-                None => self.file.read_page(current)?.clone(),
-            };
+            let page = self.file.read_page(current)?;
             let num_rows = page.num_rows() as usize;
             for i in 0..num_rows {
                 let (start, end) = row_bounds(&page, i, num_rows);
@@ -94,7 +59,7 @@ impl<'a> BTree<'a> {
     /// tree traversal, then walks the leaf chain collecting matches.
     /// Much faster than N individual searches for clustered rowids.
     /// `rowids` MUST be sorted ascending.
-    pub fn multi_get_sorted(&mut self, rowids: &[u64]) -> Result<Vec<Vec<u8>>> {
+    pub fn multi_get_sorted(&self, rowids: &[u64]) -> Result<Vec<Vec<u8>>> {
         if rowids.is_empty() {
             return Ok(Vec::new());
         }
@@ -105,10 +70,7 @@ impl<'a> BTree<'a> {
         let mut current = leaf;
 
         while rid_idx < rowids.len() {
-            let page = match self.file.get_cached_page(current) {
-                Some(p) => p,
-                None => self.file.read_page(current)?.clone(),
-            };
+            let page = self.file.read_page(current)?;
             let num_rows = page.num_rows() as usize;
             for i in 0..num_rows {
                 let (start, end) = row_bounds(&page, i, num_rows);
@@ -142,22 +104,11 @@ impl<'a> BTree<'a> {
         Ok(results)
     }
 
-    /// Find the leaf page containing (or that would contain) the given rowid.
-    fn find_leaf_for_rowid(&mut self, page_no: u32, rowid: u64) -> Result<u32> {
-        let page = self.file.read_page(page_no)?.clone();
-        if page.is_leaf() {
-            Ok(page_no)
-        } else {
-            let (_, child) = find_child(&page, rowid);
-            self.find_leaf_for_rowid(child, rowid)
-        }
-    }
-
     /// Scan rows, evaluating a filter on raw page bytes using extract_column.
     /// Only decodes and collects rows that pass the filter.
     /// Returns (matching rows as raw bytes, total matching count).
     pub fn scan_filtered(
-        &mut self,
+        &self,
         filter_col_id: u16,
         filter_op: crate::filter::FilterOp,
         filter_val: &crate::value::Value,
@@ -173,16 +124,13 @@ impl<'a> BTree<'a> {
         let mut current = first_leaf;
 
         loop {
-            // Read page data + next pointer, then release borrow immediately
-            let (page_data, num_rows, next) = match self.file.get_cached_page(current) {
-                Some(p) => (p.data, p.num_rows() as usize, p.next_leaf()),
-                None => {
-                    let page = self.file.read_page(current)?;
-                    (page.data, page.num_rows() as usize, page.next_leaf())
-                }
-            };
+            let arc = self.file.read_page(current)?;
+            let page_data = &arc.data;
+            let num_rows = arc.num_rows() as usize;
+            let next = arc.next_leaf();
+
             for i in 0..num_rows {
-                let (start, end) = row_bounds_raw(&page_data, i, num_rows);
+                let (start, end) = row_bounds_raw(page_data, i, num_rows);
                 if start >= end || end > PAGE_SIZE {
                     continue;
                 }
@@ -227,7 +175,7 @@ impl<'a> BTree<'a> {
 
     /// Count rows matching a filter using extract_column on raw bytes.
     pub fn count_filtered(
-        &mut self,
+        &self,
         filter_col_id: u16,
         filter_op: crate::filter::FilterOp,
         filter_val: &crate::value::Value,
@@ -237,15 +185,13 @@ impl<'a> BTree<'a> {
         let mut current = first_leaf;
 
         loop {
-            let (page_data, num_rows, next) = match self.file.get_cached_page(current) {
-                Some(p) => (p.data, p.num_rows() as usize, p.next_leaf()),
-                None => {
-                    let page = self.file.read_page(current)?;
-                    (page.data, page.num_rows() as usize, page.next_leaf())
-                }
-            };
+            let arc = self.file.read_page(current)?;
+            let page_data = &arc.data;
+            let num_rows = arc.num_rows() as usize;
+            let next = arc.next_leaf();
+
             for i in 0..num_rows {
-                let (start, end) = row_bounds_raw(&page_data, i, num_rows);
+                let (start, end) = row_bounds_raw(page_data, i, num_rows);
                 if start >= end || end > PAGE_SIZE {
                     continue;
                 }
@@ -278,8 +224,8 @@ impl<'a> BTree<'a> {
 
     // --- Internal methods ---
 
-    fn find_leftmost_leaf(&mut self, page_no: u32) -> Result<u32> {
-        let page = self.file.read_page(page_no)?.clone();
+    fn find_leftmost_leaf(&self, page_no: u32) -> Result<u32> {
+        let page = self.file.read_page(page_no)?;
         if page.is_leaf() {
             Ok(page_no)
         } else {
@@ -288,13 +234,104 @@ impl<'a> BTree<'a> {
         }
     }
 
+    fn search_recursive(&self, page_no: u32, rowid: u64) -> Result<Option<Vec<u8>>> {
+        let page = self.file.read_page(page_no)?;
+
+        if page.is_leaf() {
+            let num_rows = page.num_rows() as usize;
+            if num_rows == 0 {
+                return Ok(None);
+            }
+
+            // Binary search for the target rowid.
+            let (pos, found) = find_insertion_point(&page, rowid)?;
+            if found {
+                let (start, end) = row_bounds(&page, pos, num_rows);
+                if start < end && end <= PAGE_SIZE {
+                    return Ok(Some(page.data[start..end].to_vec()));
+                }
+            }
+            Ok(None)
+        } else {
+            let (_, child_page_no) = find_child(&page, rowid);
+            self.search_recursive(child_page_no, rowid)
+        }
+    }
+
+    /// Find the leaf page containing (or that would contain) the given rowid.
+    fn find_leaf_for_rowid(&self, page_no: u32, rowid: u64) -> Result<u32> {
+        let page = self.file.read_page(page_no)?;
+        if page.is_leaf() {
+            Ok(page_no)
+        } else {
+            let (_, child) = find_child(&page, rowid);
+            self.find_leaf_for_rowid(child, rowid)
+        }
+    }
+}
+
+// ===========================================================================
+// BTreeWriter — write access via &mut WriteGuard
+// ===========================================================================
+
+pub struct BTreeWriter<'a, 'b> {
+    guard: &'a mut WriteGuard<'b>,
+    root: u32,
+}
+
+impl<'a, 'b> BTreeWriter<'a, 'b> {
+    pub fn new(guard: &'a mut WriteGuard<'b>, root: u32) -> Self {
+        Self { guard, root }
+    }
+
+    pub fn root_page(&self) -> u32 {
+        self.root
+    }
+
+    /// Create a new empty B+ tree (single empty leaf page).
+    pub fn create(guard: &mut WriteGuard) -> Result<u32> {
+        let page_no = guard.allocate_page()?;
+        let page = Page::new_leaf();
+        guard.put_page(page_no, page);
+        Ok(page_no)
+    }
+
+    /// Insert a row. Returns the (possibly new) root page number.
+    pub fn insert(&mut self, rowid: u64, row_data: &[u8]) -> Result<u32> {
+        let result = self.insert_recursive(self.root, rowid, row_data)?;
+        match result {
+            InsertResult::Fit => Ok(self.root),
+            InsertResult::Split {
+                new_page,
+                separator,
+            } => {
+                let new_root = self.guard.allocate_page()?;
+                let mut root_page = Page::new_branch();
+                write_branch_entry(&mut root_page, 0, self.root, separator);
+                set_branch_child(&mut root_page, 1, new_page);
+                root_page.set_num_rows(1);
+                root_page.update_checksum();
+                self.guard.put_page(new_root, root_page);
+                self.root = new_root;
+                Ok(self.root)
+            }
+        }
+    }
+
+    /// Delete a row by rowid. Returns true if the row existed.
+    pub fn delete(&mut self, rowid: u64) -> Result<bool> {
+        self.delete_recursive(self.root, rowid)
+    }
+
+    // --- Internal methods ---
+
     fn insert_recursive(
         &mut self,
         page_no: u32,
         rowid: u64,
         row_data: &[u8],
     ) -> Result<InsertResult> {
-        let page = self.file.read_page(page_no)?.clone();
+        let page = (*self.guard.read_page(page_no)?).clone();
 
         if page.is_leaf() {
             self.insert_into_leaf(page_no, &page, rowid, row_data)
@@ -328,11 +365,8 @@ impl<'a> BTree<'a> {
         }
 
         // Check if the new row fits in the current page.
-        // After insert we need:  header + (num_rows+1)*2 offsets + existing_data + new_row + checksum
         let offset_array_start = PAGE_HEADER_SIZE + num_rows * 2;
         let current_free = page.free_space_offset() as usize;
-        // existing_data_size: bytes of row data currently stored
-        // (row data lives between the old offset array end and free_space_offset)
         let existing_data_size = if current_free > offset_array_start {
             current_free - offset_array_start
         } else {
@@ -346,18 +380,14 @@ impl<'a> BTree<'a> {
 
         if needed <= PAGE_SIZE {
             // --- Fits: in-place insert ---
-            // Take a snapshot of the old page data so we can read from it while
-            // writing to the mutable page. This avoids per-row heap allocation:
-            // one stack-sized copy of 4 KiB instead of N String+Vec pairs.
             let snapshot = page.data;
 
-            let page = self.file.write_page(page_no)?;
+            let page = self.guard.write_page(page_no)?;
             write_leaf_with_insert(page, &snapshot, num_rows, pos, row_data);
             page.update_checksum();
             Ok(InsertResult::Fit)
         } else {
             // --- Split ---
-            // Snapshot the page, then build two halves directly.
             let snapshot = page.data;
             let next_leaf = page.next_leaf();
             let prev_leaf = page.prev_leaf();
@@ -365,14 +395,13 @@ impl<'a> BTree<'a> {
             let mid = total / 2;
 
             // Allocate right page first so we have its page_no for linking.
-            let new_page_no = self.file.allocate_page()?;
+            let new_page_no = self.guard.allocate_page()?;
 
             // Extract separator: the _id of the first row in the right half.
-            // We need to figure out which original row index that corresponds to.
             let separator = extract_id_at_virtual_pos(&snapshot, num_rows, pos, row_data, mid)?;
 
             // Write left half (indices 0..mid).
-            let left_page = self.file.write_page(page_no)?;
+            let left_page = self.guard.write_page(page_no)?;
             write_leaf_range(left_page, &snapshot, num_rows, pos, row_data, 0, mid);
             left_page.set_next_leaf(new_page_no);
             left_page.set_prev_leaf(prev_leaf);
@@ -392,11 +421,11 @@ impl<'a> BTree<'a> {
             right_page.set_prev_leaf(page_no);
             right_page.set_next_leaf(next_leaf);
             right_page.update_checksum();
-            self.file.put_page(new_page_no, right_page);
+            self.guard.put_page(new_page_no, right_page);
 
             // Fix up the old next page's prev pointer.
             if next_leaf != 0 {
-                let np = self.file.write_page(next_leaf)?;
+                let np = self.guard.write_page(next_leaf)?;
                 np.set_prev_leaf(new_page_no);
                 np.update_checksum();
             }
@@ -415,13 +444,13 @@ impl<'a> BTree<'a> {
         separator: u64,
         new_child: u32,
     ) -> Result<InsertResult> {
-        let page = self.file.read_page(page_no)?.clone();
+        let page = (*self.guard.read_page(page_no)?).clone();
         let num_keys = page.num_rows() as usize;
 
         let max_keys = (PAGE_SIZE - PAGE_HEADER_SIZE - 4 - CHECKSUM_SIZE) / BRANCH_ENTRY_SIZE;
 
         if num_keys < max_keys {
-            let page = self.file.write_page(page_no)?;
+            let page = self.guard.write_page(page_no)?;
             insert_branch_entry(page, child_idx, separator, new_child);
             page.update_checksum();
             Ok(InsertResult::Fit)
@@ -441,15 +470,15 @@ impl<'a> BTree<'a> {
             let right_keys = &new_keys[mid + 1..];
             let right_children = &new_children[mid + 1..];
 
-            let left_page = self.file.write_page(page_no)?;
+            let left_page = self.guard.write_page(page_no)?;
             rebuild_branch_flat(left_page, left_children, left_keys);
             left_page.update_checksum();
 
-            let new_page_no = self.file.allocate_page()?;
+            let new_page_no = self.guard.allocate_page()?;
             let mut new_page = Page::new_branch();
             rebuild_branch_flat(&mut new_page, right_children, right_keys);
             new_page.update_checksum();
-            self.file.put_page(new_page_no, new_page);
+            self.guard.put_page(new_page_no, new_page);
 
             Ok(InsertResult::Split {
                 new_page: new_page_no,
@@ -458,32 +487,8 @@ impl<'a> BTree<'a> {
         }
     }
 
-    fn search_recursive(&mut self, page_no: u32, rowid: u64) -> Result<Option<Vec<u8>>> {
-        let page = self.file.read_page(page_no)?.clone();
-
-        if page.is_leaf() {
-            let num_rows = page.num_rows() as usize;
-            if num_rows == 0 {
-                return Ok(None);
-            }
-
-            // Binary search for the target rowid.
-            let (pos, found) = find_insertion_point(&page, rowid)?;
-            if found {
-                let (start, end) = row_bounds(&page, pos, num_rows);
-                if start < end && end <= PAGE_SIZE {
-                    return Ok(Some(page.data[start..end].to_vec()));
-                }
-            }
-            Ok(None)
-        } else {
-            let (_, child_page_no) = find_child(&page, rowid);
-            self.search_recursive(child_page_no, rowid)
-        }
-    }
-
     fn delete_recursive(&mut self, page_no: u32, rowid: u64) -> Result<bool> {
-        let page = self.file.read_page(page_no)?.clone();
+        let page = (*self.guard.read_page(page_no)?).clone();
 
         if page.is_leaf() {
             let num_rows = page.num_rows() as usize;
@@ -502,7 +507,7 @@ impl<'a> BTree<'a> {
             let next_leaf = page.next_leaf();
             let prev_leaf = page.prev_leaf();
 
-            let page = self.file.write_page(page_no)?;
+            let page = self.guard.write_page(page_no)?;
             write_leaf_without(page, &snapshot, num_rows, pos);
             page.set_next_leaf(next_leaf);
             page.set_prev_leaf(prev_leaf);
@@ -826,14 +831,20 @@ mod tests {
     #[test]
     fn test_insert_and_search() {
         let tmp = NamedTempFile::new().unwrap();
-        let mut pf = PageFile::open(tmp.path()).unwrap();
-        let root = BTree::create(&mut pf).unwrap();
-        let mut tree = BTree::new(&mut pf, root);
+        let pf = PageFile::open(tmp.path()).unwrap();
 
-        let row = make_row(1, "alice");
-        tree.insert(1, &row).unwrap();
+        let root;
+        {
+            let mut guard = pf.begin_write();
+            root = BTreeWriter::create(&mut guard).unwrap();
+            let mut tree = BTreeWriter::new(&mut guard, root);
+            let row = make_row(1, "alice");
+            tree.insert(1, &row).unwrap();
+            guard.commit(false).unwrap();
+        }
 
-        let found = tree.search(1).unwrap();
+        let reader = BTreeReader::new(&pf, root);
+        let found = reader.search(1).unwrap();
         assert!(found.is_some());
         let decoded = row::decode_row(&found.unwrap()).unwrap();
         assert_eq!(decoded.id, 1);
@@ -843,92 +854,133 @@ mod tests {
     #[test]
     fn test_search_not_found() {
         let tmp = NamedTempFile::new().unwrap();
-        let mut pf = PageFile::open(tmp.path()).unwrap();
-        let root = BTree::create(&mut pf).unwrap();
-        let mut tree = BTree::new(&mut pf, root);
+        let pf = PageFile::open(tmp.path()).unwrap();
 
-        assert!(tree.search(999).unwrap().is_none());
+        let root;
+        {
+            let mut guard = pf.begin_write();
+            root = BTreeWriter::create(&mut guard).unwrap();
+            guard.commit(false).unwrap();
+        }
+
+        let reader = BTreeReader::new(&pf, root);
+        assert!(reader.search(999).unwrap().is_none());
     }
 
     #[test]
     fn test_duplicate_key_rejected() {
         let tmp = NamedTempFile::new().unwrap();
-        let mut pf = PageFile::open(tmp.path()).unwrap();
-        let root = BTree::create(&mut pf).unwrap();
-        let mut tree = BTree::new(&mut pf, root);
+        let pf = PageFile::open(tmp.path()).unwrap();
+
+        let mut guard = pf.begin_write();
+        let root = BTreeWriter::create(&mut guard).unwrap();
+        let mut tree = BTreeWriter::new(&mut guard, root);
 
         let row = make_row(1, "alice");
         tree.insert(1, &row).unwrap();
         assert!(tree.insert(1, &row).is_err());
+        guard.commit(false).unwrap();
     }
 
     #[test]
     fn test_many_inserts_trigger_split() {
         let tmp = NamedTempFile::new().unwrap();
-        let mut pf = PageFile::open(tmp.path()).unwrap();
-        let mut root = BTree::create(&mut pf).unwrap();
+        let pf = PageFile::open(tmp.path()).unwrap();
 
-        for i in 0..100u64 {
-            let row = make_row(i, &format!("name_{i}"));
-            let mut tree = BTree::new(&mut pf, root);
-            root = tree.insert(i, &row).unwrap();
+        let mut root;
+        {
+            let mut guard = pf.begin_write();
+            root = BTreeWriter::create(&mut guard).unwrap();
+
+            for i in 0..100u64 {
+                let row = make_row(i, &format!("name_{i}"));
+                let mut tree = BTreeWriter::new(&mut guard, root);
+                root = tree.insert(i, &row).unwrap();
+            }
+            guard.commit(false).unwrap();
         }
 
         // Verify all rows are findable
-        let mut tree = BTree::new(&mut pf, root);
+        let reader = BTreeReader::new(&pf, root);
         for i in 0..100u64 {
-            assert!(tree.search(i).unwrap().is_some(), "missing: {i}");
+            assert!(reader.search(i).unwrap().is_some(), "missing: {i}");
         }
     }
 
     #[test]
     fn test_delete() {
         let tmp = NamedTempFile::new().unwrap();
-        let mut pf = PageFile::open(tmp.path()).unwrap();
-        let root = BTree::create(&mut pf).unwrap();
-        let mut tree = BTree::new(&mut pf, root);
+        let pf = PageFile::open(tmp.path()).unwrap();
 
-        let row = make_row(1, "alice");
-        tree.insert(1, &row).unwrap();
-        assert!(tree.delete(1).unwrap());
-        assert!(tree.search(1).unwrap().is_none());
-        assert!(!tree.delete(1).unwrap()); // already deleted
+        let root;
+        {
+            let mut guard = pf.begin_write();
+            root = BTreeWriter::create(&mut guard).unwrap();
+            let mut tree = BTreeWriter::new(&mut guard, root);
+
+            let row = make_row(1, "alice");
+            tree.insert(1, &row).unwrap();
+            assert!(tree.delete(1).unwrap());
+            guard.commit(false).unwrap();
+        }
+
+        let reader = BTreeReader::new(&pf, root);
+        assert!(reader.search(1).unwrap().is_none());
+
+        // Try deleting again — already deleted
+        {
+            let mut guard = pf.begin_write();
+            let mut tree = BTreeWriter::new(&mut guard, root);
+            assert!(!tree.delete(1).unwrap());
+            guard.commit(false).unwrap();
+        }
     }
 
     #[test]
     fn test_scan_all() {
         let tmp = NamedTempFile::new().unwrap();
-        let mut pf = PageFile::open(tmp.path()).unwrap();
-        let mut root = BTree::create(&mut pf).unwrap();
+        let pf = PageFile::open(tmp.path()).unwrap();
 
-        for i in 0..20u64 {
-            let row = make_row(i, &format!("name_{i}"));
-            let mut tree = BTree::new(&mut pf, root);
-            root = tree.insert(i, &row).unwrap();
+        let mut root;
+        {
+            let mut guard = pf.begin_write();
+            root = BTreeWriter::create(&mut guard).unwrap();
+
+            for i in 0..20u64 {
+                let row = make_row(i, &format!("name_{i}"));
+                let mut tree = BTreeWriter::new(&mut guard, root);
+                root = tree.insert(i, &row).unwrap();
+            }
+            guard.commit(false).unwrap();
         }
 
-        let mut tree = BTree::new(&mut pf, root);
-        let all = tree.scan_all().unwrap();
+        let reader = BTreeReader::new(&pf, root);
+        let all = reader.scan_all().unwrap();
         assert_eq!(all.len(), 20);
     }
 
     #[test]
     fn test_500_sequential_inserts_separate_tree_instances() {
         let tmp = NamedTempFile::new().unwrap();
-        let mut pf = PageFile::open(tmp.path()).unwrap();
-        let mut root = BTree::create(&mut pf).unwrap();
+        let pf = PageFile::open(tmp.path()).unwrap();
 
-        for i in 0..500u64 {
-            let row = row::encode_row(i, &[(0, &Value::Integer(i as i64))]);
-            let mut tree = BTree::new(&mut pf, root);
-            root = tree.insert(i, &row).unwrap();
-            pf.flush().unwrap();
+        let mut root;
+        {
+            let mut guard = pf.begin_write();
+            root = BTreeWriter::create(&mut guard).unwrap();
+
+            for i in 0..500u64 {
+                let row = row::encode_row(i, &[(0, &Value::Integer(i as i64))]);
+                let mut tree = BTreeWriter::new(&mut guard, root);
+                root = tree.insert(i, &row).unwrap();
+            }
+            guard.commit(false).unwrap();
         }
 
         // Verify all rows are findable
+        let reader = BTreeReader::new(&pf, root);
         for i in 0..500u64 {
-            let mut tree = BTree::new(&mut pf, root);
-            let result = tree.search(i).unwrap();
+            let result = reader.search(i).unwrap();
             assert!(result.is_some(), "missing row at i={i}");
         }
     }
