@@ -83,13 +83,13 @@ cargo bench --bench point_ops # single benchmark
 ## Common Tasks
 
 ### Adding a new public API method
-See `skills/add-table-method.md`.
+See `skills/internal/add-table-method.md`.
 
 ### Adding a new benchmark
-See `skills/add-benchmark.md`.
+See `skills/internal/add-benchmark.md`.
 
 ### Optimizing a hot path
-See `skills/optimize-hot-path.md`.
+See `skills/internal/optimize-hot-path.md`.
 
 ### Modifying the page format
-See `skills/modify-page-format.md`.
+See `skills/internal/modify-page-format.md`.
