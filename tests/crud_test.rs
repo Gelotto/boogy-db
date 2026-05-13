@@ -240,3 +240,64 @@ fn test_table_not_found() {
     assert!(db.insert("nonexistent", &[]).is_err());
     assert!(db.get("nonexistent", "id").is_err());
 }
+
+#[test]
+fn test_concurrent_reads() {
+    let (db, _dir) = create_db();
+    db.create_table("t", &[ColumnDef::new("v", Type::Integer)])
+        .unwrap();
+
+    let db = std::sync::Arc::new(db);
+    for i in 0..100 {
+        db.insert("t", &[("v", Value::Integer(i))]).unwrap();
+    }
+
+    let mut handles = Vec::new();
+    for _ in 0..4 {
+        let db = db.clone();
+        handles.push(std::thread::spawn(move || {
+            for _ in 0..1000 {
+                let count = db.count("t", &[]).unwrap();
+                assert_eq!(count, 100);
+            }
+        }));
+    }
+    for h in handles {
+        h.join().unwrap();
+    }
+}
+
+#[test]
+fn test_concurrent_different_tables() {
+    let (db, _dir) = create_db();
+    db.create_table("a", &[ColumnDef::new("v", Type::Integer)])
+        .unwrap();
+    db.create_table("b", &[ColumnDef::new("v", Type::Integer)])
+        .unwrap();
+
+    let db = std::sync::Arc::new(db);
+    let mut handles = Vec::new();
+
+    // Thread 1: writes to table "a"
+    let db1 = db.clone();
+    handles.push(std::thread::spawn(move || {
+        for i in 0..200 {
+            db1.insert("a", &[("v", Value::Integer(i))]).unwrap();
+        }
+    }));
+
+    // Thread 2: writes to table "b" concurrently
+    let db2 = db.clone();
+    handles.push(std::thread::spawn(move || {
+        for i in 0..200 {
+            db2.insert("b", &[("v", Value::Integer(i))]).unwrap();
+        }
+    }));
+
+    for h in handles {
+        h.join().unwrap();
+    }
+
+    assert_eq!(db.count("a", &[]).unwrap(), 200);
+    assert_eq!(db.count("b", &[]).unwrap(), 200);
+}
