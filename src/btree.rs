@@ -67,7 +67,10 @@ impl<'a> BTree<'a> {
         let mut results = Vec::new();
         let mut current = first_leaf;
         loop {
-            let page = self.file.read_page(current)?.clone();
+            let page = match self.file.get_cached_page(current) {
+                Some(p) => p,
+                None => self.file.read_page(current)?.clone(),
+            };
             let num_rows = page.num_rows() as usize;
             for i in 0..num_rows {
                 let (start, end) = row_bounds(&page, i, num_rows);
@@ -102,7 +105,10 @@ impl<'a> BTree<'a> {
         let mut current = leaf;
 
         while rid_idx < rowids.len() {
-            let page = self.file.read_page(current)?.clone();
+            let page = match self.file.get_cached_page(current) {
+                Some(p) => p,
+                None => self.file.read_page(current)?.clone(),
+            };
             let num_rows = page.num_rows() as usize;
             for i in 0..num_rows {
                 let (start, end) = row_bounds(&page, i, num_rows);
@@ -168,9 +174,12 @@ impl<'a> BTree<'a> {
 
         loop {
             // Read page data + next pointer, then release borrow immediately
-            let (page_data, num_rows, next) = {
-                let page = self.file.read_page(current)?;
-                (page.data, page.num_rows() as usize, page.next_leaf())
+            let (page_data, num_rows, next) = match self.file.get_cached_page(current) {
+                Some(p) => (p.data, p.num_rows() as usize, p.next_leaf()),
+                None => {
+                    let page = self.file.read_page(current)?;
+                    (page.data, page.num_rows() as usize, page.next_leaf())
+                }
             };
             for i in 0..num_rows {
                 let (start, end) = row_bounds_raw(&page_data, i, num_rows);
@@ -228,9 +237,12 @@ impl<'a> BTree<'a> {
         let mut current = first_leaf;
 
         loop {
-            let (page_data, num_rows, next) = {
-                let page = self.file.read_page(current)?;
-                (page.data, page.num_rows() as usize, page.next_leaf())
+            let (page_data, num_rows, next) = match self.file.get_cached_page(current) {
+                Some(p) => (p.data, p.num_rows() as usize, p.next_leaf()),
+                None => {
+                    let page = self.file.read_page(current)?;
+                    (page.data, page.num_rows() as usize, page.next_leaf())
+                }
             };
             for i in 0..num_rows {
                 let (start, end) = row_bounds_raw(&page_data, i, num_rows);
