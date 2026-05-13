@@ -2,8 +2,6 @@
 
 A fast embedded storage engine for Rust, purpose-built for concurrent API workloads. In-place B+ tree with WAL, per-table concurrency, secondary indexes, and a column-aware page format that avoids encode/decode overhead.
 
-Built for [SpinStack](https://github.com/Gelotto/spinstack) as a drop-in replacement for SQLite in scenarios where many concurrent readers and writers hit the same database.
-
 ## Table of Contents
 
 - [Features](#features)
@@ -13,6 +11,7 @@ Built for [SpinStack](https://github.com/Gelotto/spinstack) as a drop-in replace
   - [Point Operations](#point-operations)
   - [Mixed Workload (Single Thread)](#mixed-workload-single-thread)
   - [Mixed Workload (Concurrent)](#mixed-workload-concurrent)
+  - [Join Simulation (User + Posts)](#join-simulation-user--posts)
 - [Architecture](#architecture)
 - [License](#license)
 
@@ -164,6 +163,22 @@ Same workload as above, distributed across multiple threads hitting the same dat
 | 8 | **112,352** | 50,515 | 2.22x |
 
 boogy-db scales with concurrency because readers operate on a shared page cache (`Arc<Page>` behind an `RwLock`) without blocking each other or writers. Writers acquire a short-lived exclusive guard only for the pages they modify.
+
+### Join Simulation (User + Posts)
+
+Simulates a social media app fetching a user profile and their latest 5 posts. The database has 500 users with 50 posts each (25,000 posts total). Each query picks a random user, fetches their profile row, then fetches their 5 most recent posts.
+
+boogy-db performs this as two separate calls (`get` for the user + `find` with filter/sort/limit for the posts). SQLite performs it as a single `JOIN` query. Both engines have an index on the posts' author column.
+
+| Configuration | boogy-db | SQLite | |
+|---|---|---|---|
+| No index, 1 thread | **2,375 q/s** | 726 q/s | 3.27x |
+| With index, 1 thread | **66,039 q/s** | 43,090 q/s | 1.53x |
+| With index, no sort, 1 thread | **478,814 q/s** | 159,919 q/s | 2.99x |
+| With index, 4 threads | **155,931 q/s** | 123,895 q/s | 1.26x |
+| With index, 8 threads | **252,044 q/s** | 121,191 q/s | 2.08x |
+
+The "no sort" row shows performance when fetching any 5 posts (no ORDER BY), isolating the sort overhead. The sorted case is the realistic one — boogy-db is 1.53x faster despite doing application-side sorting while SQLite uses its native query planner.
 
 ## Architecture
 
