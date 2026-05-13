@@ -98,9 +98,13 @@ pub fn encode_real_prefix(val: f64) -> Vec<u8> {
 }
 
 /// Text prefix (no rowid) for scan_prefix matching.
-/// Does NOT include the null terminator so it matches all keys with this text.
+/// Includes the null terminator so it only matches keys with this exact text value.
 pub fn encode_text_prefix(val: &str) -> Vec<u8> {
-    val.as_bytes().to_vec()
+    let bytes = val.as_bytes();
+    let mut prefix = Vec::with_capacity(bytes.len() + 1);
+    prefix.extend_from_slice(bytes);
+    prefix.push(0x00);
+    prefix
 }
 
 // --- Sortable encoding helpers ---
