@@ -12,6 +12,7 @@ const WAL_MAGIC: u32 = 0xB00D_0A01;
 /// Write-Ahead Log for crash recovery.
 pub struct Wal {
     file: File,
+    #[allow(dead_code)]
     path: PathBuf,
     next_sequence: u64,
     entry_count: u32,
