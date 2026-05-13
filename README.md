@@ -15,6 +15,7 @@ A fast embedded storage engine for Rust, purpose-built for concurrent API worklo
   - [Join Simulation (User + Posts)](#join-simulation-user--posts)
   - [Bulk Operations](#bulk-operations)
 - [Encryption](#encryption)
+- [Async API](#async-api)
 - [Architecture](#architecture)
 - [License](#license)
 
@@ -31,6 +32,7 @@ A fast embedded storage engine for Rust, purpose-built for concurrent API worklo
 - **In-place row patching** — `patch_row` splices raw bytes for single-column updates without full decode/encode
 - **Batch bulk operations** — `delete_matching`/`update_matching` walk the leaf chain once, rebuilding each page in a single pass instead of per-row tree surgery
 - **Per-table encryption** — opt-in AES-256-GCM at the page level. Plaintext in memory, ciphertext on disk. Zero overhead on unencrypted tables
+- **Async API** — optional `tokio` feature provides `AsyncBoogyDb` with zero-overhead async methods
 
 ## Quick Start
 
@@ -289,6 +291,41 @@ let _ = db.get("secrets", 1)?;
 - **Wrong key detection**: `unlock_table` verifies the key by attempting to decrypt the table's root page. If the GCM auth tag doesn't match, it returns `BoogyError::InvalidKey`.
 - **Index encryption**: Secondary indexes on encrypted tables are encrypted with the same key.
 - **Performance impact**: ~1.5µs per page for AES-256-GCM with AES-NI. Only affects cache misses and WAL writes — cached reads have zero overhead.
+
+## Async API
+
+Enable the `tokio` feature for async support:
+
+```toml
+[dependencies]
+boogy-db = { path = ".", features = ["tokio"] }
+```
+
+`AsyncBoogyDb` wraps the synchronous core with zero overhead — methods call the sync implementation directly without `spawn_blocking` or thread dispatch. This works because boogy-db operations are fast (microsecond-scale for cached reads) and rarely block on disk I/O in steady state.
+
+```rust
+use boogy_db::AsyncBoogyDb;
+
+#[tokio::main]
+async fn main() -> boogy_db::Result<()> {
+    let db = AsyncBoogyDb::open("my.boogy").await?;
+
+    db.create_table("users", &[
+        ColumnDef::new("name", Type::Text),
+    ]).await?;
+
+    let id = db.insert("users", &[
+        ("name", Value::Text("Alice".into())),
+    ]).await?;
+
+    let row = db.get("users", id).await?.unwrap();
+    println!("{:?}", row.get("name"));
+
+    Ok(())
+}
+```
+
+`AsyncBoogyDb` is `Clone` (backed by `Arc<BoogyDb>`), so it can be shared across tasks cheaply. All methods from the sync API are available. The full sync `BoogyDb` is also accessible via `db.inner()`.
 
 ## Architecture
 

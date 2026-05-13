@@ -18,6 +18,7 @@ Embedded storage engine for SpinStack. In-place B+ tree with WAL, per-table conc
 | `crypto.rs` | `Cipher` (AES-256-GCM). Page-level encryption at I/O boundaries. `encrypt_page`/`decrypt_page`. |
 | `value.rs` | `Value` enum (Null/Text/Integer/Real/Blob/Boolean), `Type`, `ColumnDef`. |
 | `error.rs` | `BoogyError` enum, `Result<T>` alias. |
+| `async_db.rs` | `AsyncBoogyDb` -- zero-cost async wrapper behind `tokio` feature flag. Delegates to sync `BoogyDb`. |
 
 ## Key Types
 
