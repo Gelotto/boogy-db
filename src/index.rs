@@ -223,6 +223,71 @@ impl<'a> IndexTree<'a> {
         Ok(results)
     }
 
+    /// Count entries whose key starts with `prefix` without collecting them.
+    pub fn count_prefix(&mut self, prefix: &[u8]) -> Result<u64> {
+        let first_leaf = self.find_leftmost_leaf(self.root)?;
+        let mut count = 0u64;
+        let mut current = first_leaf;
+        let mut found_start = false;
+
+        loop {
+            let page = self.file.read_page(current)?.clone();
+            let num_entries = page.num_rows() as usize;
+
+            for i in 0..num_entries {
+                let entry_key = decode_leaf_entry(&page, i, num_entries);
+                if let Some(k) = entry_key {
+                    if k.starts_with(prefix) {
+                        found_start = true;
+                        count += 1;
+                    } else if found_start {
+                        return Ok(count);
+                    }
+                }
+            }
+
+            let next = page.next_leaf();
+            if next == 0 { break; }
+            current = next;
+        }
+
+        Ok(count)
+    }
+
+    /// Same as scan_prefix but stops after collecting `max` keys.
+    pub fn scan_prefix_limit(&mut self, prefix: &[u8], max: usize) -> Result<Vec<Vec<u8>>> {
+        let first_leaf = self.find_leftmost_leaf(self.root)?;
+        let mut results = Vec::with_capacity(max.min(256));
+        let mut current = first_leaf;
+        let mut found_start = false;
+
+        loop {
+            let page = self.file.read_page(current)?.clone();
+            let num_entries = page.num_rows() as usize;
+
+            for i in 0..num_entries {
+                let entry_key = decode_leaf_entry(&page, i, num_entries);
+                if let Some(k) = entry_key {
+                    if k.starts_with(prefix) {
+                        found_start = true;
+                        results.push(k.to_vec());
+                        if results.len() >= max {
+                            return Ok(results);
+                        }
+                    } else if found_start {
+                        return Ok(results);
+                    }
+                }
+            }
+
+            let next = page.next_leaf();
+            if next == 0 { break; }
+            current = next;
+        }
+
+        Ok(results)
+    }
+
     // --- Internal methods ---
 
     fn find_leftmost_leaf(&mut self, page_no: u32) -> Result<u32> {
@@ -1240,5 +1305,78 @@ mod tests {
             let found_rowid = extract_rowid(Type::Real, &results[0]);
             assert_eq!(found_rowid, rowid as u64);
         }
+    }
+
+    // --- count_prefix / scan_prefix_limit tests ---
+
+    fn extract_rowid_integer(key: &[u8]) -> u64 {
+        extract_rowid(Type::Integer, key)
+    }
+
+    #[test]
+    fn test_count_prefix() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let mut pf = PageFile::open(tmp.path()).unwrap();
+        let root = IndexTree::create(&mut pf).unwrap();
+        let mut tree = IndexTree::new(&mut pf, root);
+
+        for rowid in 1..=5u64 {
+            let key = encode_index_key_integer(42, rowid);
+            tree.insert(&key).unwrap();
+        }
+        for rowid in 1..=3u64 {
+            let key = encode_index_key_integer(99, rowid);
+            tree.insert(&key).unwrap();
+        }
+
+        let prefix_42 = encode_integer_prefix(42);
+        assert_eq!(tree.count_prefix(&prefix_42).unwrap(), 5);
+        let prefix_99 = encode_integer_prefix(99);
+        assert_eq!(tree.count_prefix(&prefix_99).unwrap(), 3);
+        let prefix_0 = encode_integer_prefix(0);
+        assert_eq!(tree.count_prefix(&prefix_0).unwrap(), 0);
+    }
+
+    #[test]
+    fn test_count_prefix_text() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let mut pf = PageFile::open(tmp.path()).unwrap();
+        let root = IndexTree::create(&mut pf).unwrap();
+        let mut tree = IndexTree::new(&mut pf, root);
+
+        for rowid in 1..=10u64 {
+            tree.insert(&encode_index_key_text("alice", rowid)).unwrap();
+        }
+        for rowid in 1..=7u64 {
+            tree.insert(&encode_index_key_text("bob", rowid)).unwrap();
+        }
+
+        assert_eq!(tree.count_prefix(&encode_text_prefix("alice")).unwrap(), 10);
+        assert_eq!(tree.count_prefix(&encode_text_prefix("bob")).unwrap(), 7);
+        assert_eq!(tree.count_prefix(&encode_text_prefix("charlie")).unwrap(), 0);
+    }
+
+    #[test]
+    fn test_scan_prefix_limit() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let mut pf = PageFile::open(tmp.path()).unwrap();
+        let root = IndexTree::create(&mut pf).unwrap();
+        let mut tree = IndexTree::new(&mut pf, root);
+
+        for rowid in 1..=100u64 {
+            tree.insert(&encode_index_key_integer(42, rowid)).unwrap();
+        }
+
+        // Limit to 5
+        let prefix = encode_integer_prefix(42);
+        let results = tree.scan_prefix_limit(&prefix, 5).unwrap();
+        assert_eq!(results.len(), 5);
+        // Should be first 5 rowids
+        assert_eq!(extract_rowid_integer(&results[0]), 1);
+        assert_eq!(extract_rowid_integer(&results[4]), 5);
+
+        // Limit higher than available
+        let results = tree.scan_prefix_limit(&prefix, 200).unwrap();
+        assert_eq!(results.len(), 100);
     }
 }
