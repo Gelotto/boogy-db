@@ -1095,7 +1095,7 @@ mod tests {
                 let mut tree = IndexTreeWriter::new(&mut guard, root);
                 root = tree.insert(&key).unwrap();
             }
-            guard.commit(false).unwrap();
+            guard.commit().unwrap();
         }
 
         // Scan prefix for value=42
@@ -1140,7 +1140,7 @@ mod tests {
                 let mut tree = IndexTreeWriter::new(&mut guard, root);
                 assert!(tree.delete(&key).unwrap());
             }
-            guard.commit(false).unwrap();
+            guard.commit().unwrap();
         }
 
         // Verify only 2 remain
@@ -1161,14 +1161,14 @@ mod tests {
         {
             let mut guard = pf.begin_write();
             root = IndexTreeWriter::create(&mut guard).unwrap();
-            guard.commit(false).unwrap();
+            guard.commit().unwrap();
         }
 
         let mut guard = pf.begin_write();
         let key = encode_index_key_integer(42, 1);
         let mut tree = IndexTreeWriter::new(&mut guard, root);
         assert!(!tree.delete(&key).unwrap());
-        guard.commit(false).unwrap();
+        guard.commit().unwrap();
     }
 
     #[test]
@@ -1187,7 +1187,7 @@ mod tests {
                 let mut tree = IndexTreeWriter::new(&mut guard, root);
                 root = tree.insert(&key).unwrap();
             }
-            guard.commit(false).unwrap();
+            guard.commit().unwrap();
         }
 
         // Verify all keys are findable via scan_prefix
@@ -1216,7 +1216,7 @@ mod tests {
                 let mut tree = IndexTreeWriter::new(&mut guard, root);
                 root = tree.insert(&key).unwrap();
             }
-            guard.commit(false).unwrap();
+            guard.commit().unwrap();
         }
 
         // scan_prefix should return all 150
@@ -1247,7 +1247,7 @@ mod tests {
                 let mut tree = IndexTreeWriter::new(&mut guard, root);
                 root = tree.insert(&key).unwrap();
             }
-            guard.commit(false).unwrap();
+            guard.commit().unwrap();
         }
 
         let reader = IndexTreeReader::new(&pf, root);
@@ -1284,7 +1284,7 @@ mod tests {
                 let mut tree = IndexTreeWriter::new(&mut guard, root);
                 root = tree.insert(&key).unwrap();
             }
-            guard.commit(false).unwrap();
+            guard.commit().unwrap();
         }
 
         // Verify each is findable
@@ -1314,7 +1314,7 @@ mod tests {
                 let mut tree = IndexTreeWriter::new(&mut guard, root);
                 root = tree.insert(&key).unwrap();
             }
-            guard.commit(false).unwrap();
+            guard.commit().unwrap();
         }
 
         // Delete every other key
@@ -1325,7 +1325,7 @@ mod tests {
                 let mut tree = IndexTreeWriter::new(&mut guard, root);
                 assert!(tree.delete(&key).unwrap(), "should find key {i}");
             }
-            guard.commit(false).unwrap();
+            guard.commit().unwrap();
         }
 
         // Verify only odd keys remain
@@ -1365,7 +1365,7 @@ mod tests {
                 let mut tree = IndexTreeWriter::new(&mut guard, root);
                 root = tree.insert(&key).unwrap();
             }
-            guard.commit(false).unwrap();
+            guard.commit().unwrap();
         }
 
         // Verify each is findable
@@ -1408,7 +1408,7 @@ mod tests {
                 let key = encode_index_key_integer(99, rowid);
                 tree.insert(&key).unwrap();
             }
-            guard.commit(false).unwrap();
+            guard.commit().unwrap();
         }
 
         let reader = IndexTreeReader::new(&pf, root);
@@ -1437,7 +1437,7 @@ mod tests {
             for rowid in 1..=7u64 {
                 tree.insert(&encode_index_key_text("bob", rowid)).unwrap();
             }
-            guard.commit(false).unwrap();
+            guard.commit().unwrap();
         }
 
         let reader = IndexTreeReader::new(&pf, root);
@@ -1460,7 +1460,7 @@ mod tests {
             for rowid in 1..=100u64 {
                 tree.insert(&encode_index_key_integer(42, rowid)).unwrap();
             }
-            guard.commit(false).unwrap();
+            guard.commit().unwrap();
         }
 
         let reader = IndexTreeReader::new(&pf, root);

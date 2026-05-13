@@ -11,8 +11,6 @@ use crate::page::{Page, PAGE_SIZE};
 /// Mutable write-side state, protected by its own Mutex.
 pub struct WriteState {
     dirty: HashMap<u32, Box<Page>>,
-    before_images: Vec<Option<Box<[u8; PAGE_SIZE]>>>,
-    pub(crate) capture_before_images: bool,
     new_page_count: u32,
 }
 
@@ -59,8 +57,6 @@ impl PageFile {
             pages: RwLock::new(vec![None; n]),
             write_state: Mutex::new(WriteState {
                 dirty: HashMap::new(),
-                before_images: vec![None; n],
-                capture_before_images: true,
                 new_page_count: 0,
             }),
         })
@@ -69,12 +65,6 @@ impl PageFile {
     /// Number of pages currently known to the file.
     pub fn page_count(&self) -> u32 {
         self.num_pages.load(Ordering::Relaxed)
-    }
-
-    /// Toggle before-image capture (disabled for `Durability::None`).
-    pub fn set_capture_before_images(&self, capture: bool) {
-        let mut ws = self.write_state.lock().unwrap();
-        ws.capture_before_images = capture;
     }
 
     /// Read a page from the shared cache, falling back to disk on a miss.
@@ -200,23 +190,11 @@ impl<'a> WriteGuard<'a> {
     }
 
     /// Get a mutable reference to a page. Copies it into the dirty overlay
-    /// on first access and captures a before-image for WAL use.
+    /// on first access.
     pub fn write_page(&mut self, page_no: u32) -> Result<&mut Page> {
         if !self.state.dirty.contains_key(&page_no) {
             // Load the current version of the page.
             let current = self.read_page_inner(page_no)?;
-
-            // Capture before-image of the on-disk page before we mutate.
-            if self.state.capture_before_images {
-                let idx = page_no as usize;
-                while self.state.before_images.len() <= idx {
-                    self.state.before_images.push(None);
-                }
-                if self.state.before_images[idx].is_none() {
-                    self.state.before_images[idx] = Some(Box::new(current.data));
-                }
-            }
-
             self.state.dirty.insert(page_no, Box::new(current));
         }
         Ok(self.state.dirty.get_mut(&page_no).unwrap())
@@ -231,58 +209,23 @@ impl<'a> WriteGuard<'a> {
         Ok(page_no)
     }
 
-    /// Overwrite a page slot. Captures a before-image if the page already
-    /// existed on disk.
+    /// Overwrite a page slot.
     pub fn put_page(&mut self, page_no: u32, page: Page) {
-        let np = self.file.num_pages.load(Ordering::Relaxed);
-
-        // Capture before-image for existing, non-dirty pages.
-        if page_no < np
-            && self.state.capture_before_images
-            && !self.state.dirty.contains_key(&page_no)
-        {
-            let idx = page_no as usize;
-            while self.state.before_images.len() <= idx {
-                self.state.before_images.push(None);
-            }
-            if self.state.before_images[idx].is_none() {
-                // Try to get current data from cache.
-                if let Ok(existing) = self.file.read_page(page_no) {
-                    self.state.before_images[idx] = Some(Box::new(existing.data));
-                }
-            }
-        }
-
         self.state.dirty.insert(page_no, Box::new(page));
     }
 
-    /// Drain all captured before-images. Returns `(page_no, original_data)` pairs.
-    pub fn take_before_images(&mut self) -> Vec<(u32, [u8; PAGE_SIZE])> {
-        let mut result = Vec::new();
-        for (i, bi) in self.state.before_images.iter_mut().enumerate() {
-            if let Some(data) = bi.take() {
-                result.push((i as u32, *data));
-            }
-        }
-        result
-    }
-
-    /// Publish dirty pages to the shared cache and optionally flush to disk.
+    /// Publish dirty pages to the shared cache.
     ///
-    /// Returns before-images so the caller can write them to the WAL.
+    /// Returns after-images so the caller can write them to the WAL.
     /// This keeps `file.rs` independent of the WAL module.
-    pub fn commit(mut self, flush_to_disk: bool) -> Result<Vec<(u32, [u8; PAGE_SIZE])>> {
-        // Collect before-images before we drain dirty.
-        let before_images = self.take_before_images_inner();
-
-        if flush_to_disk {
-            let mut disk = self.file.disk.lock().unwrap();
-            for (&page_no, page) in &self.state.dirty {
-                let offset = page_no as u64 * PAGE_SIZE as u64;
-                disk.seek(SeekFrom::Start(offset))?;
-                disk.write_all(&page.data)?;
-            }
-        }
+    pub fn commit(mut self) -> Result<Vec<(u32, [u8; PAGE_SIZE])>> {
+        // Collect after-images from dirty pages.
+        let after_images: Vec<(u32, [u8; PAGE_SIZE])> = self
+            .state
+            .dirty
+            .iter()
+            .map(|(&page_no, page)| (page_no, page.data))
+            .collect();
 
         // Publish to shared cache.
         let new_page_count = self.state.new_page_count;
@@ -307,16 +250,14 @@ impl<'a> WriteGuard<'a> {
 
         // Clear write state for next transaction.
         self.state.dirty.clear();
-        self.state.before_images.iter_mut().for_each(|bi| *bi = None);
         self.state.new_page_count = 0;
 
-        Ok(before_images)
+        Ok(after_images)
     }
 
     /// Discard all dirty pages without publishing. Rollback.
     pub fn discard(mut self) {
         self.state.dirty.clear();
-        self.state.before_images.iter_mut().for_each(|bi| *bi = None);
         self.state.new_page_count = 0;
     }
 
@@ -330,17 +271,6 @@ impl<'a> WriteGuard<'a> {
         }
         let arc = self.file.read_page(page_no)?;
         Ok((*arc).clone())
-    }
-
-    /// Drain before-images (private, for commit).
-    fn take_before_images_inner(&mut self) -> Vec<(u32, [u8; PAGE_SIZE])> {
-        let mut result = Vec::new();
-        for (i, bi) in self.state.before_images.iter_mut().enumerate() {
-            if let Some(data) = bi.take() {
-                result.push((i as u32, *data));
-            }
-        }
-        result
     }
 }
 
@@ -362,7 +292,7 @@ mod tests {
             *page = Page::new_leaf();
             page.set_num_rows(5);
             page.update_checksum();
-            guard.commit(false).unwrap(); // don't flush to disk
+            guard.commit().unwrap();
         }
 
         let page = pf.read_page(0).unwrap();
@@ -383,7 +313,7 @@ mod tests {
             *page = Page::new_leaf();
             page.set_num_rows(42);
             page.update_checksum();
-            guard.commit(true).unwrap(); // flush to disk
+            guard.commit().unwrap();
             pf.sync_all().unwrap();
         }
 
@@ -422,7 +352,7 @@ mod tests {
             *page = Page::new_leaf();
             page.set_num_rows(7);
             page.update_checksum();
-            guard.commit(false).unwrap();
+            guard.commit().unwrap();
         }
 
         // Read concurrently from multiple threads

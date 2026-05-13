@@ -1080,7 +1080,7 @@ mod tests {
             let mut tree = BTreeWriter::new(&mut guard, root);
             let row = make_row(1, "alice");
             tree.insert(1, &row).unwrap();
-            guard.commit(false).unwrap();
+            guard.commit().unwrap();
         }
 
         let reader = BTreeReader::new(&pf, root);
@@ -1100,7 +1100,7 @@ mod tests {
         {
             let mut guard = pf.begin_write();
             root = BTreeWriter::create(&mut guard).unwrap();
-            guard.commit(false).unwrap();
+            guard.commit().unwrap();
         }
 
         let reader = BTreeReader::new(&pf, root);
@@ -1119,7 +1119,7 @@ mod tests {
         let row = make_row(1, "alice");
         tree.insert(1, &row).unwrap();
         assert!(tree.insert(1, &row).is_err());
-        guard.commit(false).unwrap();
+        guard.commit().unwrap();
     }
 
     #[test]
@@ -1137,7 +1137,7 @@ mod tests {
                 let mut tree = BTreeWriter::new(&mut guard, root);
                 root = tree.insert(i, &row).unwrap();
             }
-            guard.commit(false).unwrap();
+            guard.commit().unwrap();
         }
 
         // Verify all rows are findable
@@ -1161,7 +1161,7 @@ mod tests {
             let row = make_row(1, "alice");
             tree.insert(1, &row).unwrap();
             assert!(tree.delete(1).unwrap());
-            guard.commit(false).unwrap();
+            guard.commit().unwrap();
         }
 
         let reader = BTreeReader::new(&pf, root);
@@ -1172,7 +1172,7 @@ mod tests {
             let mut guard = pf.begin_write();
             let mut tree = BTreeWriter::new(&mut guard, root);
             assert!(!tree.delete(1).unwrap());
-            guard.commit(false).unwrap();
+            guard.commit().unwrap();
         }
     }
 
@@ -1191,7 +1191,7 @@ mod tests {
                 let mut tree = BTreeWriter::new(&mut guard, root);
                 root = tree.insert(i, &row).unwrap();
             }
-            guard.commit(false).unwrap();
+            guard.commit().unwrap();
         }
 
         let reader = BTreeReader::new(&pf, root);
@@ -1216,7 +1216,7 @@ mod tests {
                 let mut tree = BTreeWriter::new(&mut guard, root);
                 root = tree.insert(i, &row).unwrap();
             }
-            guard.commit(false).unwrap();
+            guard.commit().unwrap();
         }
 
         // Delete all rows with value == 5.
@@ -1233,7 +1233,7 @@ mod tests {
             .unwrap();
             assert_eq!(deleted.len(), 10);
             root = tree.root_page();
-            guard.commit(false).unwrap();
+            guard.commit().unwrap();
         }
 
         // Verify 90 remain and none have value 5.
@@ -1263,7 +1263,7 @@ mod tests {
                 let mut tree = BTreeWriter::new(&mut guard, root);
                 root = tree.insert(i, &row).unwrap();
             }
-            guard.commit(false).unwrap();
+            guard.commit().unwrap();
         }
 
         // Update all "active" rows to "archived".
@@ -1288,7 +1288,7 @@ mod tests {
             assert_eq!(updated.len(), 50);
             assert_eq!(overflow.len(), 0);
             root = tree.root_page();
-            guard.commit(false).unwrap();
+            guard.commit().unwrap();
         }
 
         // Verify: 50 archived, 50 idle, 0 active.
@@ -1328,7 +1328,7 @@ mod tests {
                 let mut tree = BTreeWriter::new(&mut guard, root);
                 root = tree.insert(i, &row).unwrap();
             }
-            guard.commit(false).unwrap();
+            guard.commit().unwrap();
         }
 
         // Verify all rows are findable
