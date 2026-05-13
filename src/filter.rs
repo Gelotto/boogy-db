@@ -114,6 +114,15 @@ pub struct FindOptions {
     pub sort: Vec<Sort>,
     pub limit: Option<u32>,
     pub offset: Option<u32>,
+    pub include_total: bool,
+}
+
+/// Result of a find() query.
+#[derive(Debug, Clone)]
+pub struct FindResult {
+    pub rows: Vec<crate::db::Row>,
+    /// Only populated when FindOptions.include_total is true.
+    pub total: Option<u64>,
 }
 
 #[cfg(test)]
