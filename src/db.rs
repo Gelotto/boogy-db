@@ -946,18 +946,24 @@ impl BoogyDb {
                 tree.scan_prefix(&prefix)?
             };
 
-            let matching_rowids: Vec<u64> = keys
+            let mut matching_rowids: Vec<u64> = keys
                 .iter()
                 .map(|k| index::extract_rowid(col_type, k))
                 .collect();
+            matching_rowids.sort_unstable();
 
-            let mut rows = Vec::with_capacity(matching_rowids.len());
-            for rowid in &matching_rowids {
-                let mut tree = BTree::new(&mut file, state.meta.root_page);
-                if let Some(bytes) = tree.search(*rowid)? {
-                    let decoded = row::decode_row(&bytes)?;
-                    let row = decoded_to_row(&decoded, &state.meta);
-                    // Apply remaining filters (non-index filters).
+            // Batch-fetch rows via leaf-chain walk (much faster than N individual searches)
+            let mut tree = BTree::new(&mut file, state.meta.root_page);
+            let raw_rows = tree.multi_get_sorted(&matching_rowids)?;
+
+            // Check if we need to apply additional filters beyond the indexed one
+            let has_extra_filters = opts.filters.len() > 1;
+
+            let mut rows = Vec::with_capacity(raw_rows.len());
+            for bytes in &raw_rows {
+                let decoded = row::decode_row(bytes)?;
+                let row = decoded_to_row(&decoded, &state.meta);
+                if has_extra_filters {
                     let passes = opts.filters.iter().all(|f| {
                         let col_val = row
                             .columns
@@ -969,9 +975,9 @@ impl BoogyDb {
                             None => f.matches(&Value::Null),
                         }
                     });
-                    if passes {
-                        rows.push(row);
-                    }
+                    if passes { rows.push(row); }
+                } else {
+                    rows.push(row);
                 }
             }
 

@@ -87,6 +87,66 @@ impl<'a> BTree<'a> {
         Ok(results)
     }
 
+    /// Batch-fetch rows by sorted rowids. Finds the first rowid's leaf via
+    /// tree traversal, then walks the leaf chain collecting matches.
+    /// Much faster than N individual searches for clustered rowids.
+    /// `rowids` MUST be sorted ascending.
+    pub fn multi_get_sorted(&mut self, rowids: &[u64]) -> Result<Vec<Vec<u8>>> {
+        if rowids.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Find the leaf containing the smallest rowid
+        let leaf = self.find_leaf_for_rowid(self.root, rowids[0])?;
+        let mut results = Vec::with_capacity(rowids.len());
+        let mut rid_idx = 0;
+        let mut current = leaf;
+
+        while rid_idx < rowids.len() {
+            let page = self.file.read_page(current)?.clone();
+            let num_rows = page.num_rows() as usize;
+            for i in 0..num_rows {
+                let (start, end) = row_bounds(&page, i, num_rows);
+                if start >= end || end > PAGE_SIZE {
+                    continue;
+                }
+                let data = &page.data[start..end];
+                if let Ok(row_id) = row::extract_id(data) {
+                    // Skip past rowids smaller than current target
+                    while rid_idx < rowids.len() && rowids[rid_idx] < row_id {
+                        rid_idx += 1;
+                    }
+                    if rid_idx >= rowids.len() {
+                        return Ok(results);
+                    }
+                    if rowids[rid_idx] == row_id {
+                        results.push(data.to_vec());
+                        rid_idx += 1;
+                    }
+                }
+            }
+            if rid_idx >= rowids.len() {
+                break;
+            }
+            let next = page.next_leaf();
+            if next == 0 {
+                break;
+            }
+            current = next;
+        }
+        Ok(results)
+    }
+
+    /// Find the leaf page containing (or that would contain) the given rowid.
+    fn find_leaf_for_rowid(&mut self, page_no: u32, rowid: u64) -> Result<u32> {
+        let page = self.file.read_page(page_no)?.clone();
+        if page.is_leaf() {
+            Ok(page_no)
+        } else {
+            let (_, child) = find_child(&page, rowid);
+            self.find_leaf_for_rowid(child, rowid)
+        }
+    }
+
     /// Scan rows, evaluating a filter on raw page bytes using extract_column.
     /// Only decodes and collects rows that pass the filter.
     /// Returns (matching rows as raw bytes, total matching count).
