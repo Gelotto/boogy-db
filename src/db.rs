@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use crate::btree::BTree;
 use crate::error::{BoogyError, Result};
 use crate::file::PageFile;
-use crate::filter::{Filter, FilterOp, FindOptions, SortDir};
+use crate::filter::{Filter, FilterOp, FindOptions, FindResult, SortDir};
 use crate::index::{self, IndexTree};
 use crate::page::{Page, PAGE_SYSTEM};
 use crate::row;
@@ -501,25 +501,6 @@ impl BoogyDb {
         Ok(())
     }
 
-    /// Look up rowids matching an Eq filter using an index.
-    fn index_lookup_eq(
-        file: &mut PageFile,
-        idx_meta: &IndexMeta,
-        col_type: Type,
-        filter_val: &Value,
-    ) -> Result<Vec<u64>> {
-        let prefix = match index::encode_value_prefix(col_type, filter_val) {
-            Some(p) => p,
-            None => return Ok(Vec::new()),
-        };
-        let mut tree = IndexTree::new(file, idx_meta.root_page);
-        let keys = tree.scan_prefix(&prefix)?;
-        Ok(keys
-            .iter()
-            .map(|k| index::extract_rowid(col_type, k))
-            .collect())
-    }
-
     /// Enforce type constraints on indexed columns before insert/update.
     fn enforce_index_types(
         meta: &TableMeta,
@@ -906,8 +887,7 @@ impl BoogyDb {
     }
 
     /// Find rows matching filters, with sort and pagination.
-    /// Returns (matching_rows, total_count).
-    pub fn find(&self, table: &str, opts: FindOptions) -> Result<(Vec<Row>, u64)> {
+    pub fn find(&self, table: &str, opts: FindOptions) -> Result<FindResult> {
         // 1. Read-lock registry, clone Arc.
         let table_state = {
             let tables = self.tables.read().unwrap();
@@ -920,11 +900,18 @@ impl BoogyDb {
         // 2. Read-lock the specific table.
         let state = table_state.read().unwrap();
 
+        // Can we short-circuit (stop early without scanning everything)?
+        // Only when: no sort (ordering requires full collection) and not requesting total.
+        let can_short_circuit = opts.sort.is_empty() && !opts.include_total;
+
         // 3. Check for index-accelerated path (Eq filter on an indexed column).
         let index_candidate = opts.filters.iter().find(|f| {
             f.op == FilterOp::Eq
                 && state.meta.find_index_for_column(&f.column).is_some()
         });
+
+        // Track whether the scan path already applied pagination (so we don't double-paginate).
+        let mut pagination_applied = false;
 
         let (matching, total) = if let Some(idx_filter) = index_candidate {
             let idx_meta = state.meta.find_index_for_column(&idx_filter.column).unwrap().clone();
@@ -935,9 +922,35 @@ impl BoogyDb {
                 .find(|c| c.name == idx_filter.column)
                 .map(|c| c.col_type)
                 .unwrap();
+
+            let prefix = match index::encode_value_prefix(col_type, &idx_filter.value) {
+                Some(p) => p,
+                None => return Ok(FindResult { rows: Vec::new(), total: if opts.include_total { Some(0) } else { None } }),
+            };
+
+            // Compute how many index entries we need.
+            let need = if can_short_circuit {
+                let off = opts.offset.unwrap_or(0) as usize;
+                let lim = opts.limit.unwrap_or(u32::MAX) as usize;
+                Some(off.saturating_add(lim))
+            } else {
+                None // need all of them
+            };
+
             let mut file = self.file.lock().unwrap();
-            let matching_rowids =
-                Self::index_lookup_eq(&mut file, &idx_meta, col_type, &idx_filter.value)?;
+            let keys = if let Some(n) = need {
+                let mut tree = IndexTree::new(&mut file, idx_meta.root_page);
+                tree.scan_prefix_limit(&prefix, n)?
+            } else {
+                let mut tree = IndexTree::new(&mut file, idx_meta.root_page);
+                tree.scan_prefix(&prefix)?
+            };
+
+            let matching_rowids: Vec<u64> = keys
+                .iter()
+                .map(|k| index::extract_rowid(col_type, k))
+                .collect();
+
             let mut rows = Vec::with_capacity(matching_rowids.len());
             for rowid in &matching_rowids {
                 let mut tree = BTree::new(&mut file, state.meta.root_page);
@@ -961,7 +974,28 @@ impl BoogyDb {
                     }
                 }
             }
-            let total = rows.len() as u64;
+
+            // Determine total if requested.
+            let total: Option<u64> = if opts.include_total {
+                if need.is_some() {
+                    // We limited the scan, so get the real count from the index.
+                    let mut tree = IndexTree::new(&mut file, idx_meta.root_page);
+                    Some(tree.count_prefix(&prefix)?)
+                } else {
+                    Some(rows.len() as u64)
+                }
+            } else {
+                None
+            };
+
+            // Index path: paginate here when sort is empty (rows are in index order).
+            if opts.sort.is_empty() {
+                let skip = opts.offset.unwrap_or(0) as usize;
+                let take = opts.limit.unwrap_or(u32::MAX) as usize;
+                rows = rows.into_iter().skip(skip).take(take).collect();
+                pagination_applied = true;
+            }
+
             (rows, total)
         } else if opts.filters.len() == 1 {
             // Single filter: use scan_filtered (extract_column on raw bytes, no full decode)
@@ -975,7 +1009,19 @@ impl BoogyDb {
                 } else {
                     (None, None)
                 };
-                let (raw_rows, total) = tree.scan_filtered(col_id, f.op, &f.value, lim, off)?;
+                // Compute stop_after for short-circuit
+                let stop = if can_short_circuit {
+                    match (opts.offset, opts.limit) {
+                        (_, Some(l)) => {
+                            let off = opts.offset.unwrap_or(0) as u64;
+                            Some(off + l as u64)
+                        }
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+                let (raw_rows, count) = tree.scan_filtered(col_id, f.op, &f.value, lim, off, stop)?;
                 drop(file);
                 let matching: Vec<Row> = raw_rows.iter()
                     .map(|(_, bytes)| {
@@ -983,10 +1029,16 @@ impl BoogyDb {
                         decoded_to_row(&decoded, &state.meta)
                     })
                     .collect();
+                let total = if opts.include_total { Some(count) } else { None };
+                // scan_filtered already handled limit/offset when sort is empty.
+                if opts.sort.is_empty() {
+                    pagination_applied = true;
+                }
                 (matching, total)
             } else {
                 // Column not found -- no matches
-                (Vec::new(), 0)
+                let total = if opts.include_total { Some(0) } else { None };
+                (Vec::new(), total)
             }
         } else if opts.filters.is_empty() {
             // No filters: full scan but skip decode, just collect raw
@@ -994,7 +1046,7 @@ impl BoogyDb {
             let mut tree = BTree::new(&mut file, state.meta.root_page);
             let all = tree.scan_all()?;
             drop(file);
-            let total = all.len() as u64;
+            let total = if opts.include_total { Some(all.len() as u64) } else { None };
             let matching: Vec<Row> = all.iter()
                 .map(|(_, bytes)| {
                     let decoded = row::decode_row(bytes).unwrap();
@@ -1021,7 +1073,7 @@ impl BoogyDb {
                 });
                 if passes { matching.push(row); }
             }
-            let total = matching.len() as u64;
+            let total = if opts.include_total { Some(matching.len() as u64) } else { None };
             (matching, total)
         };
 
@@ -1053,11 +1105,22 @@ impl BoogyDb {
         }
 
         // Pagination.
-        let skip = opts.offset.unwrap_or(0) as usize;
-        let take = opts.limit.unwrap_or(u32::MAX) as usize;
-        let page: Vec<Row> = matching.into_iter().skip(skip).take(take).collect();
+        let rows = if !opts.sort.is_empty() {
+            // Sort was applied -- always need post-sort pagination.
+            let skip = opts.offset.unwrap_or(0) as usize;
+            let take = opts.limit.unwrap_or(u32::MAX) as usize;
+            matching.into_iter().skip(skip).take(take).collect()
+        } else if pagination_applied {
+            // Scan path already handled limit/offset.
+            matching
+        } else {
+            // No-filter or multi-filter: apply pagination here.
+            let skip = opts.offset.unwrap_or(0) as usize;
+            let take = opts.limit.unwrap_or(u32::MAX) as usize;
+            matching.into_iter().skip(skip).take(take).collect()
+        };
 
-        Ok((page, total))
+        Ok(FindResult { rows, total })
     }
 
     /// Count rows matching filters.
@@ -1077,6 +1140,22 @@ impl BoogyDb {
         // Fast path: no filters, just return the cached count.
         if filters.is_empty() {
             return Ok(state.meta.row_count);
+        }
+
+        // Index path: Eq filter on indexed column
+        if filters.len() == 1 && filters[0].op == FilterOp::Eq {
+            if let Some(idx_meta) = state.meta.find_index_for_column(&filters[0].column) {
+                let col_type = state.meta.columns.iter()
+                    .find(|c| c.name == filters[0].column)
+                    .map(|c| c.col_type);
+                if let Some(ct) = col_type {
+                    if let Some(prefix) = index::encode_value_prefix(ct, &filters[0].value) {
+                        let mut file = self.file.lock().unwrap();
+                        let mut tree = IndexTree::new(&mut file, idx_meta.root_page);
+                        return tree.count_prefix(&prefix);
+                    }
+                }
+            }
         }
 
         // Single filter: use count_filtered (extract_column on raw bytes)
@@ -1625,11 +1704,12 @@ mod tests {
         db.insert("t", &[("v", Value::Integer(3))]).unwrap();
         let opts = FindOptions {
             filters: vec![crate::filter::Filter::gt("v", 1i64)],
+            include_total: true,
             ..Default::default()
         };
-        let (rows, total) = db.find("t", opts).unwrap();
-        assert_eq!(total, 2);
-        assert_eq!(rows.len(), 2);
+        let result = db.find("t", opts).unwrap();
+        assert_eq!(result.total, Some(2));
+        assert_eq!(result.rows.len(), 2);
     }
 
     #[test]
@@ -1645,12 +1725,13 @@ mod tests {
             sort: vec![crate::filter::Sort::desc("v")],
             limit: Some(3),
             offset: Some(0),
+            include_total: true,
             ..Default::default()
         };
-        let (rows, total) = db.find("t", opts).unwrap();
-        assert_eq!(total, 10);
-        assert_eq!(rows.len(), 3);
-        assert_eq!(rows[0].columns[0].1, Value::Integer(9));
+        let result = db.find("t", opts).unwrap();
+        assert_eq!(result.total, Some(10));
+        assert_eq!(result.rows.len(), 3);
+        assert_eq!(result.rows[0].columns[0].1, Value::Integer(9));
     }
 
     #[test]
@@ -1788,10 +1869,10 @@ mod tests {
                 filters: vec![crate::filter::Filter::eq("title", "world")],
                 ..Default::default()
             };
-            let (rows, _) = db.find("posts", opts).unwrap();
-            assert_eq!(rows.len(), 1);
+            let result = db.find("posts", opts).unwrap();
+            assert_eq!(result.rows.len(), 1);
             assert_eq!(
-                rows[0].columns.iter().find(|(n, _)| n == "likes").unwrap().1,
+                result.rows[0].columns.iter().find(|(n, _)| n == "likes").unwrap().1,
                 Value::Integer(10)
             );
         }
@@ -1920,11 +2001,12 @@ mod tests {
         let _id = db.insert("t", &[("v", Value::Text("hello".into()))]).unwrap();
         let opts = crate::filter::FindOptions {
             filters: vec![crate::filter::Filter::eq("v", "hello")],
+            include_total: true,
             ..Default::default()
         };
-        let (rows, total) = db.find("t", opts).unwrap();
-        assert_eq!(total, 1);
-        assert_eq!(rows.len(), 1);
+        let result = db.find("t", opts).unwrap();
+        assert_eq!(result.total, Some(1));
+        assert_eq!(result.rows.len(), 1);
     }
 
     #[test]
@@ -1941,12 +2023,13 @@ mod tests {
         db.create_index("t", "idx_v", "v").unwrap();
         let opts = crate::filter::FindOptions {
             filters: vec![crate::filter::Filter::eq("v", 20i64)],
+            include_total: true,
             ..Default::default()
         };
-        let (rows, total) = db.find("t", opts).unwrap();
-        assert_eq!(total, 1);
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].columns[0].1, Value::Integer(20));
+        let result = db.find("t", opts).unwrap();
+        assert_eq!(result.total, Some(1));
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(result.rows[0].columns[0].1, Value::Integer(20));
     }
 
     #[test]
@@ -1963,8 +2046,8 @@ mod tests {
             filters: vec![crate::filter::Filter::eq("v", "a")],
             ..Default::default()
         };
-        let (rows, _) = db.find("t", opts).unwrap();
-        assert_eq!(rows.len(), 0);
+        let result = db.find("t", opts).unwrap();
+        assert_eq!(result.rows.len(), 0);
     }
 
     #[test]
@@ -1981,15 +2064,15 @@ mod tests {
             filters: vec![crate::filter::Filter::eq("v", "old")],
             ..Default::default()
         };
-        let (rows, _) = db.find("t", opts_old).unwrap();
-        assert_eq!(rows.len(), 0);
+        let result = db.find("t", opts_old).unwrap();
+        assert_eq!(result.rows.len(), 0);
         // New value should be found.
         let opts_new = crate::filter::FindOptions {
             filters: vec![crate::filter::Filter::eq("v", "new")],
             ..Default::default()
         };
-        let (rows, _) = db.find("t", opts_new).unwrap();
-        assert_eq!(rows.len(), 1);
+        let result = db.find("t", opts_new).unwrap();
+        assert_eq!(result.rows.len(), 1);
     }
 
     #[test]
@@ -2005,5 +2088,50 @@ mod tests {
         // Null should be fine (not indexed).
         let result = db.insert("t", &[("v", Value::Null)]);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_find_short_circuits_at_limit() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.boogy");
+        let db = BoogyDb::open(&path).unwrap();
+        db.set_durability(Durability::None);
+        db.create_table("t", &[ColumnDef::new("v", Type::Integer)]).unwrap();
+        for i in 0..1000 {
+            db.insert("t", &[("v", Value::Integer(i % 10))]).unwrap();
+        }
+
+        // Without include_total
+        let result = db.find("t", FindOptions {
+            filters: vec![crate::filter::Filter::eq("v", 5i64)],
+            limit: Some(5),
+            ..Default::default()
+        }).unwrap();
+        assert_eq!(result.rows.len(), 5);
+        assert_eq!(result.total, None);
+
+        // With include_total
+        let result = db.find("t", FindOptions {
+            filters: vec![crate::filter::Filter::eq("v", 5i64)],
+            limit: Some(5),
+            include_total: true,
+            ..Default::default()
+        }).unwrap();
+        assert_eq!(result.rows.len(), 5);
+        assert_eq!(result.total, Some(100));
+    }
+
+    #[test]
+    fn test_count_uses_index() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.boogy");
+        let db = BoogyDb::open(&path).unwrap();
+        db.set_durability(Durability::None);
+        db.create_table("t", &[ColumnDef::new("v", Type::Text)]).unwrap();
+        db.create_index("t", "idx_v", "v").unwrap();
+        for i in 0..100 {
+            db.insert("t", &[("v", Value::Text(format!("val_{}", i % 5)))]).unwrap();
+        }
+        assert_eq!(db.count("t", &[Filter::eq("v", "val_2")]).unwrap(), 20);
     }
 }

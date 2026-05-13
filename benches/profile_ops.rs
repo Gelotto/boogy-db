@@ -56,6 +56,7 @@ fn main() {
                 sort: vec![],
                 limit: Some(20),
                 offset: None,
+                include_total: false,
             }).unwrap();
         }
         let find_us = t.elapsed().as_micros() as f64 / n as f64;
@@ -200,6 +201,7 @@ fn main() {
                 sort: vec![],
                 limit: Some(20),
                 offset: None,
+                include_total: false,
             }).unwrap();
         }
         let find_us = t.elapsed().as_micros() as f64 / n as f64;

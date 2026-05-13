@@ -115,6 +115,7 @@ fn run_boogy(db: &BoogyDb, ids: &mut Vec<u64>, duration: Duration) -> Results {
                     sort: vec![],
                     limit: Some(20),
                     offset: None,
+                    include_total: false,
                 }).unwrap();
                 find_count += 1;
             }

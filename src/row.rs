@@ -126,6 +126,51 @@ pub fn extract_id(data: &[u8]) -> Result<u64> {
     Ok(u64::from_le_bytes(data[0..8].try_into().unwrap()))
 }
 
+/// Extract the raw bytes (type_tag + value_bytes) of a column without decoding.
+/// Returns a slice into `data` — zero allocation.
+pub fn extract_column_raw(data: &[u8], target_col_id: u16) -> Result<Option<&[u8]>> {
+    let mut offset = 0;
+    ensure_bytes(data, offset, 8)?;
+    offset += 8; // skip rowid
+
+    ensure_bytes(data, offset, 2)?;
+    let num_cols = u16::from_le_bytes(data[offset..offset + 2].try_into().unwrap()) as usize;
+    offset += 2;
+
+    if num_cols == 0 {
+        return Ok(None);
+    }
+
+    let dir_start = offset;
+    let col_data_start = dir_start + num_cols * 4;
+
+    let mut lo = 0usize;
+    let mut hi = num_cols;
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        let entry = dir_start + mid * 4;
+        ensure_bytes(data, entry, 4)?;
+        let col_id = u16::from_le_bytes(data[entry..entry + 2].try_into().unwrap());
+        match col_id.cmp(&target_col_id) {
+            std::cmp::Ordering::Less => lo = mid + 1,
+            std::cmp::Ordering::Greater => hi = mid,
+            std::cmp::Ordering::Equal => {
+                let data_offset = u16::from_le_bytes(data[entry + 2..entry + 4].try_into().unwrap()) as usize;
+                let abs_offset = col_data_start + data_offset;
+                // Find the end of this value
+                let next_offset = if mid + 1 < num_cols {
+                    let next_entry = dir_start + (mid + 1) * 4;
+                    col_data_start + u16::from_le_bytes(data[next_entry + 2..next_entry + 4].try_into().unwrap()) as usize
+                } else {
+                    data.len()
+                };
+                return Ok(Some(&data[abs_offset..next_offset]));
+            }
+        }
+    }
+    Ok(None)
+}
+
 /// Extract a single column value by column ID in O(1) via binary search on the offset directory.
 pub fn extract_column(data: &[u8], target_col_id: u16) -> Result<Option<Value>> {
     let mut offset = 0;

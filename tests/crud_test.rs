@@ -111,7 +111,7 @@ fn test_find_with_filter() {
         .unwrap();
     }
 
-    let (rows, total) = db
+    let result = db
         .find(
             "posts",
             FindOptions {
@@ -119,12 +119,13 @@ fn test_find_with_filter() {
                 sort: vec![],
                 limit: Some(5),
                 offset: None,
+                include_total: true,
             },
         )
         .unwrap();
 
-    assert_eq!(total, 10); // 10 by alice
-    assert_eq!(rows.len(), 5); // limited to 5
+    assert_eq!(result.total.unwrap(), 10); // 10 by alice
+    assert_eq!(result.rows.len(), 5); // limited to 5
 }
 
 #[test]
@@ -137,7 +138,7 @@ fn test_find_with_sort_and_pagination() {
         db.insert("items", &[("value", Value::Integer(i))]).unwrap();
     }
 
-    let (rows, total) = db
+    let result = db
         .find(
             "items",
             FindOptions {
@@ -145,14 +146,15 @@ fn test_find_with_sort_and_pagination() {
                 sort: vec![Sort::desc("value")],
                 limit: Some(3),
                 offset: Some(2),
+                include_total: true,
             },
         )
         .unwrap();
 
-    assert_eq!(total, 10);
-    assert_eq!(rows.len(), 3);
+    assert_eq!(result.total.unwrap(), 10);
+    assert_eq!(result.rows.len(), 3);
     // Descending: 9,8,7,6,5,4,3,2,1,0 -> skip 2 -> 7,6,5
-    let values: Vec<i64> = rows
+    let values: Vec<i64> = result.rows
         .iter()
         .filter_map(|r| {
             r.columns
@@ -329,18 +331,19 @@ fn test_index_speeds_up_find() {
 
     db.create_index("posts", "idx_author", "author").unwrap();
 
-    let (rows, total) = db
+    let result = db
         .find(
             "posts",
             FindOptions {
                 filters: vec![Filter::eq("author", "user_5")],
+                include_total: true,
                 ..Default::default()
             },
         )
         .unwrap();
 
-    assert_eq!(total, 100);
-    assert_eq!(rows.len(), 100);
+    assert_eq!(result.total.unwrap(), 100);
+    assert_eq!(result.rows.len(), 100);
 }
 
 #[test]
@@ -358,18 +361,19 @@ fn test_index_maintained_on_insert() {
         db.insert("t", &[("v", Value::Text(format!("val_{}", i % 5)))]).unwrap();
     }
 
-    let (rows, total) = db
+    let result = db
         .find(
             "t",
             FindOptions {
                 filters: vec![Filter::eq("v", "val_0")],
+                include_total: true,
                 ..Default::default()
             },
         )
         .unwrap();
 
-    assert_eq!(total, 10);
-    assert_eq!(rows.len(), 10);
+    assert_eq!(result.total.unwrap(), 10);
+    assert_eq!(result.rows.len(), 10);
 }
 
 #[test]
