@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::value::ColumnDef;
 
@@ -21,6 +22,8 @@ pub struct TableMeta {
     pub columns: Vec<ColumnDef>,
     /// Column name -> column ID mapping.
     pub col_name_to_id: HashMap<String, u16>,
+    /// Shared column names for lazy Row decoding.
+    pub col_names: Arc<Vec<String>>,
     /// B+ tree root page number.
     pub root_page: u32,
     /// Number of rows (maintained by insert/delete).
@@ -38,11 +41,13 @@ impl TableMeta {
             .enumerate()
             .map(|(i, c)| (c.name.clone(), i as u16))
             .collect();
+        let col_names = Arc::new(columns.iter().map(|c| c.name.clone()).collect());
         Self {
             name,
             table_id,
             columns,
             col_name_to_id,
+            col_names,
             root_page,
             row_count: 0,
             next_rowid: 1,
