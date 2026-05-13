@@ -6,6 +6,7 @@ use crate::btree::BTree;
 use crate::error::{BoogyError, Result};
 use crate::file::PageFile;
 use crate::filter::{Filter, FilterOp, FindOptions, SortDir};
+use crate::index::{self, IndexTree};
 use crate::page::{Page, PAGE_SYSTEM};
 use crate::row;
 use crate::table::{IndexMeta, TableMeta};
@@ -15,7 +16,7 @@ use crate::wal::Wal;
 /// A row returned from queries.
 #[derive(Debug, Clone)]
 pub struct Row {
-    pub id: String,
+    pub id: u64,
     pub columns: Vec<(String, Value)>,
 }
 
@@ -54,7 +55,7 @@ pub struct BoogyDb {
 // [next_table_id: u32]
 // [num_tables: u16]
 // for each table:
-//   [table_id: u32][root_page: u32][row_count: u64]
+//   [table_id: u32][root_page: u32][row_count: u64][next_rowid: u64]
 //   [name_len: u16][name_bytes]
 //   [num_columns: u16]
 //   for each column:
@@ -123,6 +124,10 @@ fn serialize_system_page(
 
         // row_count
         data[offset..offset + 8].copy_from_slice(&meta.row_count.to_le_bytes());
+        offset += 8;
+
+        // next_rowid
+        data[offset..offset + 8].copy_from_slice(&meta.next_rowid.to_le_bytes());
         offset += 8;
 
         // name
@@ -214,6 +219,9 @@ fn deserialize_system_page(
         let row_count = u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap());
         offset += 8;
 
+        let next_rowid = u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap());
+        offset += 8;
+
         let name_len = u16::from_le_bytes(data[offset..offset + 2].try_into().unwrap()) as usize;
         offset += 2;
         let name = String::from_utf8(data[offset..offset + name_len].to_vec())
@@ -251,6 +259,7 @@ fn deserialize_system_page(
 
         let mut meta = TableMeta::new(name, table_id, columns, root_page);
         meta.row_count = row_count;
+        meta.next_rowid = next_rowid;
 
         // Indexes
         let num_indexes = u16::from_le_bytes(data[offset..offset + 2].try_into().unwrap()) as usize;
@@ -459,184 +468,102 @@ impl BoogyDb {
         Ok(())
     }
 
-    // --- Index key helpers ---
-
-    /// Convert a Value into a deterministic string key for the index B+ tree.
-    ///
-    /// Type prefixes ensure no cross-type collisions:
-    ///   - Null    → "\x00null"
-    ///   - Text    → raw text (no prefix; most common case, avoids extra byte)
-    ///   - Integer → "\x01" + zero-padded 20-digit decimal (sortable)
-    ///   - Real    → "\x02" + decimal representation
-    ///   - Boolean → "\x03" + "0"/"1"
-    ///   - Blob    → "\x04" + hex encoding
-    ///
-    /// The key is used as the B+ tree _id, so it must fit in a row header.
-    /// Branch nodes only store up to 36 bytes of a key for routing, but full
-    /// keys live in leaf pages, so exact-match lookup is always correct.
-    fn value_to_key_string(val: &Value) -> String {
-        match val {
-            Value::Null => "\x00null".to_string(),
-            Value::Text(s) => s.clone(),
-            Value::Integer(i) => {
-                // Bias by i64::MIN magnitude so negatives sort before positives.
-                let sortable = (*i as u64) ^ (1u64 << 63);
-                format!("\x01{sortable:020}")
-            }
-            Value::Real(f) => format!("\x02{f}"),
-            Value::Boolean(b) => format!("\x03{}", if *b { "1" } else { "0" }),
-            Value::Blob(b) => {
-                let hex: String = b.iter().map(|byte| format!("{byte:02x}")).collect();
-                format!("\x04{hex}")
-            }
-        }
-    }
-
-    /// Maximum IDs stored per B+ tree entry (one chunk).
-    ///
-    /// Each UUID is 36 bytes + 1 byte separator = 37 bytes per ID.
-    /// A page is 4096 bytes; row overhead (key + col header) is ~50 bytes.
-    /// We cap at 80 IDs/chunk (~2960 bytes payload), leaving ample room
-    /// for the key and encoding overhead, staying well under a page.
-    const INDEX_IDS_PER_CHUNK: usize = 80;
-
-    /// Return the B+ tree key for overflow chunk `chunk` of a value key.
-    /// Chunk 0 uses the bare value key; subsequent chunks append "\xff\xff{chunk:06}".
-    fn chunk_key(base_key: &str, chunk: usize) -> String {
-        if chunk == 0 {
-            base_key.to_string()
-        } else {
-            format!("{base_key}\u{ff}\u{ff}{chunk:06}")
-        }
-    }
-
-    /// Encode an ID list as a row suitable for storage in the index B+ tree.
-    /// The list is stored as a single Text column (col_id=0) with IDs joined by "\n".
-    fn encode_id_list_as_entry(key: &str, ids: &[String]) -> Vec<u8> {
-        let joined = ids.join("\n");
-        row::encode_row(key, &[(0u16, &Value::Text(joined))])
-    }
-
-    /// Decode an ID list from a raw index entry (as returned by BTree::search).
-    fn decode_id_list(bytes: &[u8]) -> Result<Vec<String>> {
-        let decoded = row::decode_row(bytes)?;
-        match decoded.columns.first() {
-            Some((_, Value::Text(joined))) if !joined.is_empty() => {
-                Ok(joined.split('\n').map(|s| s.to_string()).collect())
-            }
-            _ => Ok(Vec::new()),
-        }
-    }
-
-    /// Read all IDs stored for `base_key` across all chunks.
-    fn read_all_chunks(file: &mut PageFile, idx_root: u32, base_key: &str) -> Result<Vec<String>> {
-        let mut all_ids = Vec::new();
-        let mut chunk = 0usize;
-        loop {
-            let k = Self::chunk_key(base_key, chunk);
-            let mut tree = BTree::new(file, idx_root);
-            match tree.search(&k)? {
-                Some(bytes) => {
-                    let chunk_ids = Self::decode_id_list(&bytes)?;
-                    all_ids.extend(chunk_ids);
-                    chunk += 1;
+    /// Update all indexes for a row using encoded row bytes.
+    /// remove=true deletes from indexes, remove=false inserts.
+    fn index_update_row(
+        file: &mut PageFile,
+        meta: &mut TableMeta,
+        rowid: u64,
+        row_bytes: &[u8],
+        remove: bool,
+    ) -> Result<()> {
+        for idx in &mut meta.indexes {
+            let col_id = meta.col_name_to_id.get(&idx.column).copied();
+            let col_type = meta
+                .columns
+                .iter()
+                .find(|c| c.name == idx.column)
+                .map(|c| c.col_type);
+            if let (Some(cid), Some(ct)) = (col_id, col_type) {
+                let val = crate::row::extract_column(row_bytes, cid)?
+                    .unwrap_or(Value::Null);
+                if let Some(key) = index::encode_index_key(ct, &val, rowid) {
+                    let mut tree = IndexTree::new(file, idx.root_page);
+                    if remove {
+                        tree.delete(&key)?;
+                    } else {
+                        tree.insert(&key)?;
+                    }
+                    idx.root_page = tree.root_page();
                 }
-                None => break,
             }
         }
-        Ok(all_ids)
+        Ok(())
     }
 
-    /// Delete all chunk entries for `base_key`. Returns updated root.
-    fn delete_all_chunks(file: &mut PageFile, idx_root: u32, base_key: &str) -> Result<u32> {
-        let mut root = idx_root;
-        let mut chunk = 0usize;
-        loop {
-            let k = Self::chunk_key(base_key, chunk);
-            let mut tree = BTree::new(file, root);
-            if tree.delete(&k)? {
-                root = tree.root_page();
-                chunk += 1;
-            } else {
-                break;
+    /// Look up rowids matching an Eq filter using an index.
+    fn index_lookup_eq(
+        file: &mut PageFile,
+        idx_meta: &IndexMeta,
+        col_type: Type,
+        filter_val: &Value,
+    ) -> Result<Vec<u64>> {
+        let prefix = match index::encode_value_prefix(col_type, filter_val) {
+            Some(p) => p,
+            None => return Ok(Vec::new()),
+        };
+        let mut tree = IndexTree::new(file, idx_meta.root_page);
+        let keys = tree.scan_prefix(&prefix)?;
+        Ok(keys
+            .iter()
+            .map(|k| index::extract_rowid(col_type, k))
+            .collect())
+    }
+
+    /// Enforce type constraints on indexed columns before insert/update.
+    fn enforce_index_types(
+        meta: &TableMeta,
+        data: &[(&str, Value)],
+    ) -> Result<()> {
+        for idx in &meta.indexes {
+            if let Some((_, val)) = data.iter().find(|(name, _)| *name == idx.column) {
+                if val.is_null() {
+                    continue;
+                }
+                let col_type = meta
+                    .columns
+                    .iter()
+                    .find(|c| c.name == idx.column)
+                    .map(|c| c.col_type);
+                if let Some(ct) = col_type {
+                    if val.value_type() != Some(ct) {
+                        return Err(BoogyError::TypeMismatch(format!(
+                            "column '{}' expects {:?}, got {:?}",
+                            idx.column,
+                            ct,
+                            val.value_type()
+                        )));
+                    }
+                    if let Value::Real(f) = val {
+                        if f.is_nan() {
+                            return Err(BoogyError::TypeMismatch(format!(
+                                "column '{}': NaN not allowed in indexed columns",
+                                idx.column
+                            )));
+                        }
+                    }
+                    if let Value::Text(s) = val {
+                        if s.as_bytes().contains(&0x00) {
+                            return Err(BoogyError::TypeMismatch(format!(
+                                "column '{}': null bytes not allowed in indexed text columns",
+                                idx.column
+                            )));
+                        }
+                    }
+                }
             }
         }
-        Ok(root)
-    }
-
-    /// Write `ids` into chunked entries under `base_key`. Returns updated root.
-    fn write_chunked_ids(
-        file: &mut PageFile,
-        idx_root: u32,
-        base_key: &str,
-        ids: &[String],
-    ) -> Result<u32> {
-        let mut root = idx_root;
-        for (chunk, id_slice) in ids.chunks(Self::INDEX_IDS_PER_CHUNK).enumerate() {
-            let k = Self::chunk_key(base_key, chunk);
-            let entry = Self::encode_id_list_as_entry(&k, id_slice);
-            let mut tree = BTree::new(file, root);
-            root = tree.insert(&k, &entry)?;
-        }
-        Ok(root)
-    }
-
-    /// Add a row_id to an index for a given column value.
-    /// Uses chunked storage: up to INDEX_IDS_PER_CHUNK IDs per B+ tree entry.
-    fn index_add(
-        file: &mut PageFile,
-        idx_root: u32,
-        col_val: &Value,
-        row_id: &str,
-    ) -> Result<u32> {
-        let key = Self::value_to_key_string(col_val);
-
-        // Read all existing IDs across all chunks, append new ID.
-        let mut ids = Self::read_all_chunks(file, idx_root, &key)?;
-        ids.push(row_id.to_string());
-
-        // Delete all old chunks, then re-write with new chunked layout.
-        let root = Self::delete_all_chunks(file, idx_root, &key)?;
-        Self::write_chunked_ids(file, root, &key, &ids)
-    }
-
-    /// Remove a row_id from the index for a given column value.
-    fn index_remove(
-        file: &mut PageFile,
-        idx_root: u32,
-        col_val: &Value,
-        row_id: &str,
-    ) -> Result<u32> {
-        let key = Self::value_to_key_string(col_val);
-
-        // Read all IDs, remove the one we're deleting.
-        let mut ids = Self::read_all_chunks(file, idx_root, &key)?;
-        let before_len = ids.len();
-        ids.retain(|id| id != row_id);
-
-        if ids.len() == before_len {
-            // Nothing to remove (row_id wasn't in the index).
-            return Ok(idx_root);
-        }
-
-        // Delete all old chunks, then re-write remaining IDs.
-        let root = Self::delete_all_chunks(file, idx_root, &key)?;
-        if ids.is_empty() {
-            Ok(root)
-        } else {
-            Self::write_chunked_ids(file, root, &key, &ids)
-        }
-    }
-
-    /// Look up all row_ids for a given column value in the index.
-    /// Reads all chunks: O(k * log n) where k = ceil(matching_rows / IDS_PER_CHUNK).
-    fn index_lookup(
-        file: &mut PageFile,
-        idx_root: u32,
-        col_val: &Value,
-    ) -> Result<Vec<String>> {
-        let key = Self::value_to_key_string(col_val);
-        Self::read_all_chunks(file, idx_root, &key)
+        Ok(())
     }
 
     /// Create a new table.
@@ -719,8 +646,8 @@ impl BoogyDb {
         Ok(())
     }
 
-    /// Insert a row. Returns the auto-generated _id.
-    pub fn insert(&self, table: &str, data: &[(&str, Value)]) -> Result<String> {
+    /// Insert a row with auto-increment rowid. Returns the assigned rowid.
+    pub fn insert(&self, table: &str, data: &[(&str, Value)]) -> Result<u64> {
         // 1. Read-lock registry, clone Arc.
         let table_state = {
             let tables = self.tables.read().unwrap();
@@ -733,32 +660,30 @@ impl BoogyDb {
         // 2. Write-lock the specific table.
         let mut state = table_state.write().unwrap();
 
-        // 3. Encode row (no file lock needed).
-        let id = uuid::Uuid::new_v4().to_string();
+        // 3. Type enforcement for indexed columns.
+        Self::enforce_index_types(&state.meta, data)?;
+
+        // 4. Auto-assign rowid.
+        let rowid = state.meta.next_rowid;
+        state.meta.next_rowid += 1;
+
+        // 5. Encode row (no file lock needed).
         let col_values: Vec<(u16, &Value)> = data
             .iter()
             .filter_map(|(name, val)| state.meta.col_id(name).map(|cid| (cid, val)))
             .collect();
-        let row_bytes = row::encode_row(&id, &col_values);
+        let row_bytes = row::encode_row(rowid, &col_values);
 
-        // 4. Brief file lock for B-tree insert + index maintenance.
+        // 6. Brief file lock for B-tree insert + index maintenance.
         let durability = self.durability();
         let new_root = {
             let mut file = self.file.lock().unwrap();
             let mut tree = BTree::new(&mut file, state.meta.root_page);
-            let new_root = tree.insert(&id, &row_bytes)?;
+            let new_root = tree.insert(rowid, &row_bytes)?;
+            state.meta.root_page = new_root;
 
-            // Update indexes
-            for i in 0..state.meta.indexes.len() {
-                let col_name = state.meta.indexes[i].column.clone();
-                let col_val = data
-                    .iter()
-                    .find(|(name, _)| *name == col_name)
-                    .map(|(_, v)| v.clone())
-                    .unwrap_or(Value::Null);
-                let root = state.meta.indexes[i].root_page;
-                state.meta.indexes[i].root_page =
-                    Self::index_add(&mut file, root, &col_val, &id)?;
+            if !state.meta.indexes.is_empty() {
+                Self::index_update_row(&mut file, &mut state.meta, rowid, &row_bytes, false)?;
             }
 
             if matches!(durability, Durability::None) {
@@ -767,20 +692,73 @@ impl BoogyDb {
                 let mut wal = self.wal.lock().unwrap();
                 Self::commit_with_wal(&mut file, &mut wal, durability, state.meta.table_id)?;
             }
-            new_root
+            state.meta.root_page
         };
 
-        // 5. Update table state.
-        if new_root != state.meta.root_page {
-            state.meta.root_page = new_root;
-        }
+        // 7. Update table state.
+        state.meta.root_page = new_root;
         state.meta.row_count += 1;
 
-        Ok(id)
+        Ok(rowid)
     }
 
-    /// Get a row by _id.
-    pub fn get(&self, table: &str, id: &str) -> Result<Option<Row>> {
+    /// Insert a row with a caller-supplied rowid.
+    pub fn insert_with_id(&self, table: &str, rowid: u64, data: &[(&str, Value)]) -> Result<()> {
+        // 1. Read-lock registry, clone Arc.
+        let table_state = {
+            let tables = self.tables.read().unwrap();
+            tables
+                .get(table)
+                .ok_or_else(|| BoogyError::TableNotFound(table.to_string()))?
+                .clone()
+        };
+
+        // 2. Write-lock the specific table.
+        let mut state = table_state.write().unwrap();
+
+        // 3. Type enforcement for indexed columns.
+        Self::enforce_index_types(&state.meta, data)?;
+
+        // 4. Advance next_rowid if necessary.
+        if rowid >= state.meta.next_rowid {
+            state.meta.next_rowid = rowid + 1;
+        }
+
+        // 5. Encode row.
+        let col_values: Vec<(u16, &Value)> = data
+            .iter()
+            .filter_map(|(name, val)| state.meta.col_id(name).map(|cid| (cid, val)))
+            .collect();
+        let row_bytes = row::encode_row(rowid, &col_values);
+
+        // 6. Brief file lock for B-tree insert + index maintenance.
+        let durability = self.durability();
+        {
+            let mut file = self.file.lock().unwrap();
+            let mut tree = BTree::new(&mut file, state.meta.root_page);
+            let new_root = tree.insert(rowid, &row_bytes)?;
+            state.meta.root_page = new_root;
+
+            if !state.meta.indexes.is_empty() {
+                Self::index_update_row(&mut file, &mut state.meta, rowid, &row_bytes, false)?;
+            }
+
+            if matches!(durability, Durability::None) {
+                file.take_before_images();
+            } else {
+                let mut wal = self.wal.lock().unwrap();
+                Self::commit_with_wal(&mut file, &mut wal, durability, state.meta.table_id)?;
+            }
+        };
+
+        // 7. Update table state.
+        state.meta.row_count += 1;
+
+        Ok(())
+    }
+
+    /// Get a row by rowid.
+    pub fn get(&self, table: &str, id: u64) -> Result<Option<Row>> {
         // 1. Read-lock registry, clone Arc.
         let table_state = {
             let tables = self.tables.read().unwrap();
@@ -810,8 +788,8 @@ impl BoogyDb {
         }
     }
 
-    /// Update a row by _id. Replaces specified columns.
-    pub fn update(&self, table: &str, id: &str, fields: &[(&str, Value)]) -> Result<bool> {
+    /// Update a row by rowid. Replaces specified columns.
+    pub fn update(&self, table: &str, id: u64, fields: &[(&str, Value)]) -> Result<bool> {
         // 1. Read-lock registry, clone Arc.
         let table_state = {
             let tables = self.tables.read().unwrap();
@@ -824,24 +802,27 @@ impl BoogyDb {
         // 2. Write-lock the specific table.
         let mut state = table_state.write().unwrap();
 
-        // 3. Read existing row, merge, write back (file lock + WAL lock).
-        let new_root = {
+        // 3. Type enforcement for indexed columns.
+        Self::enforce_index_types(&state.meta, fields)?;
+
+        // 4. Read existing row, merge, write back (file lock + WAL lock).
+        {
             let mut file = self.file.lock().unwrap();
             let mut wal = self.wal.lock().unwrap();
             let durability = self.durability();
-            let mut tree = BTree::new(&mut file, state.meta.root_page);
 
-            let existing_bytes = match tree.search(id)? {
-                Some(bytes) => bytes,
-                None => return Ok(false),
+            // Read existing row.
+            let existing_bytes = {
+                let mut tree = BTree::new(&mut file, state.meta.root_page);
+                match tree.search(id)? {
+                    Some(bytes) => bytes,
+                    None => return Ok(false),
+                }
             };
             let existing = row::decode_row(&existing_bytes)?;
 
-            // Build old column map for index maintenance
-            let old_col_map: HashMap<u16, Value> = existing.columns.into_iter().collect();
-
             // Merge updates.
-            let mut col_map = old_col_map.clone();
+            let mut col_map: HashMap<u16, Value> = existing.columns.into_iter().collect();
             for (name, val) in fields {
                 if let Some(col_id) = state.meta.col_id(name) {
                     col_map.insert(col_id, val.clone());
@@ -851,41 +832,32 @@ impl BoogyDb {
             let col_values: Vec<(u16, &Value)> = col_map.iter().map(|(k, v)| (*k, v)).collect();
             let new_row = row::encode_row(id, &col_values);
 
-            // Delete + re-insert.
-            tree.delete(id)?;
-            let new_root = tree.insert(id, &new_row)?;
+            // Remove old index entries.
+            if !state.meta.indexes.is_empty() {
+                Self::index_update_row(&mut file, &mut state.meta, id, &existing_bytes, true)?;
+            }
 
-            // Update indexes: if indexed column changed, remove old + add new
-            for i in 0..state.meta.indexes.len() {
-                let col_id = state.meta.col_name_to_id
-                    .get(&state.meta.indexes[i].column)
-                    .copied();
-                if let Some(col_id) = col_id {
-                    let old_val = old_col_map.get(&col_id).cloned().unwrap_or(Value::Null);
-                    let new_val = col_map.get(&col_id).cloned().unwrap_or(Value::Null);
-                    if old_val != new_val {
-                        let root = state.meta.indexes[i].root_page;
-                        let root = Self::index_remove(&mut file, root, &old_val, id)?;
-                        let root = Self::index_add(&mut file, root, &new_val, id)?;
-                        state.meta.indexes[i].root_page = root;
-                    }
-                }
+            // Delete + re-insert.
+            {
+                let mut tree = BTree::new(&mut file, state.meta.root_page);
+                tree.delete(id)?;
+                let new_root = tree.insert(id, &new_row)?;
+                state.meta.root_page = new_root;
+            }
+
+            // Insert new index entries.
+            if !state.meta.indexes.is_empty() {
+                Self::index_update_row(&mut file, &mut state.meta, id, &new_row, false)?;
             }
 
             Self::commit_with_wal(&mut file, &mut wal, durability, state.meta.table_id)?;
-            new_root
         };
-
-        // 4. Update table state.
-        if new_root != state.meta.root_page {
-            state.meta.root_page = new_root;
-        }
 
         Ok(true)
     }
 
-    /// Delete a row by _id.
-    pub fn delete(&self, table: &str, id: &str) -> Result<bool> {
+    /// Delete a row by rowid.
+    pub fn delete(&self, table: &str, id: u64) -> Result<bool> {
         // 1. Read-lock registry, clone Arc.
         let table_state = {
             let tables = self.tables.read().unwrap();
@@ -904,8 +876,8 @@ impl BoogyDb {
             let mut wal = self.wal.lock().unwrap();
             let durability = self.durability();
 
-            // Read the row first (for index maintenance)
-            let row_bytes = if !state.meta.indexes.is_empty() {
+            // Read the row before deletion for index maintenance.
+            let row_bytes_for_index = if !state.meta.indexes.is_empty() {
                 let mut tree = BTree::new(&mut file, state.meta.root_page);
                 tree.search(id)?
             } else {
@@ -914,23 +886,11 @@ impl BoogyDb {
 
             let mut tree = BTree::new(&mut file, state.meta.root_page);
             let deleted = tree.delete(id)?;
+            state.meta.root_page = tree.root_page();
 
-            // Update indexes if we actually deleted and have row data
             if deleted {
-                if let Some(bytes) = row_bytes {
-                    let decoded = row::decode_row(&bytes)?;
-                    let col_map: HashMap<u16, Value> = decoded.columns.into_iter().collect();
-                    for i in 0..state.meta.indexes.len() {
-                        let col_id = state.meta.col_name_to_id
-                            .get(&state.meta.indexes[i].column)
-                            .copied();
-                        if let Some(col_id) = col_id {
-                            let val = col_map.get(&col_id).cloned().unwrap_or(Value::Null);
-                            let root = state.meta.indexes[i].root_page;
-                            state.meta.indexes[i].root_page =
-                                Self::index_remove(&mut file, root, &val, id)?;
-                        }
-                    }
+                if let Some(ref bytes) = row_bytes_for_index {
+                    Self::index_update_row(&mut file, &mut state.meta, id, bytes, true)?;
                 }
             }
 
@@ -960,26 +920,45 @@ impl BoogyDb {
         // 2. Read-lock the specific table.
         let state = table_state.read().unwrap();
 
-        // 3. Check if any Eq filter can use an index.
+        // 3. Check for index-accelerated path (Eq filter on an indexed column).
         let index_candidate = opts.filters.iter().find(|f| {
             f.op == FilterOp::Eq
                 && state.meta.find_index_for_column(&f.column).is_some()
         });
 
-        // 4. Get matching rows.
         let (matching, total) = if let Some(idx_filter) = index_candidate {
-            // Index path: O(log n) lookup
-            let idx_meta = state.meta.find_index_for_column(&idx_filter.column).unwrap();
+            let idx_meta = state.meta.find_index_for_column(&idx_filter.column).unwrap().clone();
+            let col_type = state
+                .meta
+                .columns
+                .iter()
+                .find(|c| c.name == idx_filter.column)
+                .map(|c| c.col_type)
+                .unwrap();
             let mut file = self.file.lock().unwrap();
-            let matching_ids =
-                Self::index_lookup(&mut file, idx_meta.root_page, &idx_filter.value)?;
-
-            let mut rows = Vec::with_capacity(matching_ids.len());
-            for id in &matching_ids {
+            let matching_rowids =
+                Self::index_lookup_eq(&mut file, &idx_meta, col_type, &idx_filter.value)?;
+            let mut rows = Vec::with_capacity(matching_rowids.len());
+            for rowid in &matching_rowids {
                 let mut tree = BTree::new(&mut file, state.meta.root_page);
-                if let Some(bytes) = tree.search(id)? {
+                if let Some(bytes) = tree.search(*rowid)? {
                     let decoded = row::decode_row(&bytes)?;
-                    rows.push(decoded_to_row(&decoded, &state.meta));
+                    let row = decoded_to_row(&decoded, &state.meta);
+                    // Apply remaining filters (non-index filters).
+                    let passes = opts.filters.iter().all(|f| {
+                        let col_val = row
+                            .columns
+                            .iter()
+                            .find(|(name, _)| name == &f.column)
+                            .map(|(_, v)| v);
+                        match col_val {
+                            Some(v) => f.matches(v),
+                            None => f.matches(&Value::Null),
+                        }
+                    });
+                    if passes {
+                        rows.push(row);
+                    }
                 }
             }
             let total = rows.len() as u64;
@@ -1006,7 +985,7 @@ impl BoogyDb {
                     .collect();
                 (matching, total)
             } else {
-                // Column not found — no matches
+                // Column not found -- no matches
                 (Vec::new(), 0)
             }
         } else if opts.filters.is_empty() {
@@ -1154,33 +1133,42 @@ impl BoogyDb {
         }
 
         // Check column exists.
-        if state.meta.col_id(column).is_none() {
-            return Err(BoogyError::SchemaMismatch(format!(
+        let col_id = state.meta.col_id(column).ok_or_else(|| {
+            BoogyError::SchemaMismatch(format!(
                 "column '{column}' not found in table '{table}'"
-            )));
-        }
+            ))
+        })?;
 
-        // 3. Create the index B+ tree and populate it from existing rows.
+        let col_type = state
+            .meta
+            .columns
+            .iter()
+            .find(|c| c.name == column)
+            .map(|c| c.col_type)
+            .unwrap();
+
+        // 3. Create the index B+ tree and populate from existing rows.
         let idx_root = {
             let mut file = self.file.lock().unwrap();
             let mut wal = self.wal.lock().unwrap();
             let durability = self.durability();
 
-            let idx_root = BTree::create(&mut file)?;
+            let idx_root = IndexTree::create(&mut file)?;
 
-            // Scan all existing rows and populate the index.
+            // Scan all existing rows and insert into the index.
             let all = {
                 let mut tree = BTree::new(&mut file, state.meta.root_page);
                 tree.scan_all()?
             };
 
-            let col_id = state.meta.col_id(column).unwrap();
             let mut current_root = idx_root;
-            for (row_id, bytes) in &all {
+            for (rowid, bytes) in &all {
                 let col_val = row::extract_column(bytes, col_id)?
                     .unwrap_or(Value::Null);
-                current_root =
-                    Self::index_add(&mut file, current_root, &col_val, row_id)?;
+                if let Some(key) = index::encode_index_key(col_type, &col_val, *rowid) {
+                    let mut tree = IndexTree::new(&mut file, current_root);
+                    current_root = tree.insert(&key)?;
+                }
             }
 
             Self::commit_with_wal(&mut file, &mut wal, durability, state.meta.table_id)?;
@@ -1262,38 +1250,23 @@ impl BoogyDb {
         // 2. Write-lock the specific table.
         let mut state = table_state.write().unwrap();
 
-        // 3. Scan/index-lookup to find matching IDs, then apply updates.
+        // 3. Type enforcement for indexed columns.
+        Self::enforce_index_types(&state.meta, fields)?;
+
+        // 4. Scan to find matching IDs, then apply updates.
         let updated = {
             let mut file = self.file.lock().unwrap();
             let mut wal = self.wal.lock().unwrap();
             let durability = self.durability();
 
-            // Determine candidates
-            let index_candidate = filters.iter().find(|f| {
-                f.op == FilterOp::Eq
-                    && state.meta.find_index_for_column(&f.column).is_some()
-            });
-
-            let candidates: Vec<(String, Vec<u8>)> = if let Some(idx_filter) = index_candidate {
-                let idx_meta =
-                    state.meta.find_index_for_column(&idx_filter.column).unwrap();
-                let matching_ids =
-                    Self::index_lookup(&mut file, idx_meta.root_page, &idx_filter.value)?;
-                let mut rows = Vec::with_capacity(matching_ids.len());
-                for id in &matching_ids {
-                    let mut tree = BTree::new(&mut file, state.meta.root_page);
-                    if let Some(bytes) = tree.search(id)? {
-                        rows.push((id.clone(), bytes));
-                    }
-                }
-                rows
-            } else {
+            // Full scan to find candidates
+            let candidates: Vec<(u64, Vec<u8>)> = {
                 let mut tree = BTree::new(&mut file, state.meta.root_page);
                 tree.scan_all()?
             };
 
-            // Filter and collect matching row IDs + old data
-            let mut to_update: Vec<(String, HashMap<u16, Value>)> = Vec::new();
+            // Filter and collect matching row IDs + old data + old bytes for index
+            let mut to_update: Vec<(u64, HashMap<u16, Value>, Vec<u8>)> = Vec::new();
             for (_, bytes) in &candidates {
                 let decoded = row::decode_row(bytes)?;
                 let row = decoded_to_row(&decoded, &state.meta);
@@ -1312,14 +1285,14 @@ impl BoogyDb {
 
                 if passes {
                     let old_col_map: HashMap<u16, Value> = decoded.columns.into_iter().collect();
-                    to_update.push((decoded.id.clone(), old_col_map));
+                    to_update.push((decoded.id, old_col_map, bytes.clone()));
                 }
             }
 
             let count = to_update.len() as u64;
 
             // Apply updates
-            for (id, old_col_map) in &to_update {
+            for (id, old_col_map, old_bytes) in &to_update {
                 let mut col_map = old_col_map.clone();
                 for (name, val) in fields {
                     if let Some(col_id) = state.meta.col_id(name) {
@@ -1329,33 +1302,21 @@ impl BoogyDb {
 
                 let col_values: Vec<(u16, &Value)> =
                     col_map.iter().map(|(k, v)| (*k, v)).collect();
-                let new_row = row::encode_row(id, &col_values);
+                let new_row = row::encode_row(*id, &col_values);
+
+                // Remove old index entries.
+                if !state.meta.indexes.is_empty() {
+                    Self::index_update_row(&mut file, &mut state.meta, *id, old_bytes, true)?;
+                }
 
                 let mut tree = BTree::new(&mut file, state.meta.root_page);
-                tree.delete(id)?;
-                let new_root = tree.insert(id, &new_row)?;
+                tree.delete(*id)?;
+                let new_root = tree.insert(*id, &new_row)?;
                 state.meta.root_page = new_root;
 
-                // Update indexes
-                for i in 0..state.meta.indexes.len() {
-                    let col_id = state.meta.col_name_to_id
-                        .get(&state.meta.indexes[i].column)
-                        .copied();
-                    if let Some(col_id) = col_id {
-                        let old_val =
-                            old_col_map.get(&col_id).cloned().unwrap_or(Value::Null);
-                        let new_val = col_map.get(&col_id).cloned().unwrap_or(Value::Null);
-                        if old_val != new_val {
-                            let root = state.meta.indexes[i].root_page;
-                            let root = Self::index_remove(
-                                &mut file, root, &old_val, id,
-                            )?;
-                            let root = Self::index_add(
-                                &mut file, root, &new_val, id,
-                            )?;
-                            state.meta.indexes[i].root_page = root;
-                        }
-                    }
+                // Insert new index entries.
+                if !state.meta.indexes.is_empty() {
+                    Self::index_update_row(&mut file, &mut state.meta, *id, &new_row, false)?;
                 }
             }
 
@@ -1380,38 +1341,20 @@ impl BoogyDb {
         // 2. Write-lock the specific table.
         let mut state = table_state.write().unwrap();
 
-        // 3. Scan/index-lookup to find matching IDs, then delete.
+        // 3. Scan to find matching IDs, then delete.
         let deleted = {
             let mut file = self.file.lock().unwrap();
             let mut wal = self.wal.lock().unwrap();
             let durability = self.durability();
 
-            // Determine candidates
-            let index_candidate = filters.iter().find(|f| {
-                f.op == FilterOp::Eq
-                    && state.meta.find_index_for_column(&f.column).is_some()
-            });
-
-            let candidates: Vec<(String, Vec<u8>)> = if let Some(idx_filter) = index_candidate {
-                let idx_meta =
-                    state.meta.find_index_for_column(&idx_filter.column).unwrap();
-                let matching_ids =
-                    Self::index_lookup(&mut file, idx_meta.root_page, &idx_filter.value)?;
-                let mut rows = Vec::with_capacity(matching_ids.len());
-                for id in &matching_ids {
-                    let mut tree = BTree::new(&mut file, state.meta.root_page);
-                    if let Some(bytes) = tree.search(id)? {
-                        rows.push((id.clone(), bytes));
-                    }
-                }
-                rows
-            } else {
+            // Full scan to find candidates
+            let candidates: Vec<(u64, Vec<u8>)> = {
                 let mut tree = BTree::new(&mut file, state.meta.root_page);
                 tree.scan_all()?
             };
 
-            // Filter and collect matching row IDs + column data for index removal
-            let mut to_delete: Vec<(String, HashMap<u16, Value>)> = Vec::new();
+            // Filter and collect matching row IDs + bytes for index removal
+            let mut to_delete: Vec<(u64, Vec<u8>)> = Vec::new();
             for (_, bytes) in &candidates {
                 let decoded = row::decode_row(bytes)?;
                 let row = decoded_to_row(&decoded, &state.meta);
@@ -1429,31 +1372,20 @@ impl BoogyDb {
                 });
 
                 if passes {
-                    let col_map: HashMap<u16, Value> = decoded.columns.into_iter().collect();
-                    to_delete.push((decoded.id.clone(), col_map));
+                    to_delete.push((decoded.id, bytes.clone()));
                 }
             }
 
             let count = to_delete.len() as u64;
 
-            // Delete rows
-            for (id, col_map) in &to_delete {
-                let mut tree = BTree::new(&mut file, state.meta.root_page);
-                tree.delete(id)?;
-                state.meta.root_page = tree.root_page();
-
-                // Update indexes
-                for i in 0..state.meta.indexes.len() {
-                    let col_id = state.meta.col_name_to_id
-                        .get(&state.meta.indexes[i].column)
-                        .copied();
-                    if let Some(col_id) = col_id {
-                        let val = col_map.get(&col_id).cloned().unwrap_or(Value::Null);
-                        let root = state.meta.indexes[i].root_page;
-                        state.meta.indexes[i].root_page =
-                            Self::index_remove(&mut file, root, &val, id)?;
-                    }
+            // Delete rows + remove index entries
+            for (id, old_bytes) in &to_delete {
+                if !state.meta.indexes.is_empty() {
+                    Self::index_update_row(&mut file, &mut state.meta, *id, old_bytes, true)?;
                 }
+                let mut tree = BTree::new(&mut file, state.meta.root_page);
+                tree.delete(*id)?;
+                state.meta.root_page = tree.root_page();
             }
 
             state.meta.row_count -= count;
@@ -1464,8 +1396,8 @@ impl BoogyDb {
         Ok(deleted)
     }
 
-    /// Insert multiple rows in a single transaction. Returns list of _ids.
-    pub fn insert_many(&self, table: &str, rows: &[Vec<(&str, Value)>]) -> Result<Vec<String>> {
+    /// Insert multiple rows in a single transaction. Returns list of assigned rowids.
+    pub fn insert_many(&self, table: &str, rows: &[Vec<(&str, Value)>]) -> Result<Vec<u64>> {
         // 1. Read-lock registry, clone Arc.
         let table_state = {
             let tables = self.tables.read().unwrap();
@@ -1478,7 +1410,12 @@ impl BoogyDb {
         // 2. Write-lock the specific table.
         let mut state = table_state.write().unwrap();
 
-        // 3. Insert all rows under a single file lock session.
+        // 3. Type enforcement for all rows.
+        for row_data in rows {
+            Self::enforce_index_types(&state.meta, row_data)?;
+        }
+
+        // 4. Insert all rows under a single file lock session.
         let ids = {
             let mut file = self.file.lock().unwrap();
             let mut wal = self.wal.lock().unwrap();
@@ -1486,32 +1423,25 @@ impl BoogyDb {
             let mut ids = Vec::with_capacity(rows.len());
 
             for row_data in rows {
-                let id = uuid::Uuid::new_v4().to_string();
+                let rowid = state.meta.next_rowid;
+                state.meta.next_rowid += 1;
+
                 let col_values: Vec<(u16, &Value)> = row_data
                     .iter()
                     .filter_map(|(name, val)| state.meta.col_id(name).map(|cid| (cid, val)))
                     .collect();
-                let row_bytes = row::encode_row(&id, &col_values);
+                let row_bytes = row::encode_row(rowid, &col_values);
 
                 let mut tree = BTree::new(&mut file, state.meta.root_page);
-                let new_root = tree.insert(&id, &row_bytes)?;
+                let new_root = tree.insert(rowid, &row_bytes)?;
                 state.meta.root_page = new_root;
 
-                // Update indexes
-                for i in 0..state.meta.indexes.len() {
-                    let col_name = state.meta.indexes[i].column.clone();
-                    let col_val = row_data
-                        .iter()
-                        .find(|(name, _)| *name == col_name)
-                        .map(|(_, v)| v.clone())
-                        .unwrap_or(Value::Null);
-                    let root = state.meta.indexes[i].root_page;
-                    state.meta.indexes[i].root_page =
-                        Self::index_add(&mut file, root, &col_val, &id)?;
+                if !state.meta.indexes.is_empty() {
+                    Self::index_update_row(&mut file, &mut state.meta, rowid, &row_bytes, false)?;
                 }
 
                 state.meta.row_count += 1;
-                ids.push(id);
+                ids.push(rowid);
             }
 
             Self::commit_with_wal(&mut file, &mut wal, durability, state.meta.table_id)?;
@@ -1555,19 +1485,19 @@ pub struct TransactionCtx<'a> {
 }
 
 impl<'a> TransactionCtx<'a> {
-    pub fn insert(&self, table: &str, data: &[(&str, Value)]) -> Result<String> {
+    pub fn insert(&self, table: &str, data: &[(&str, Value)]) -> Result<u64> {
         self.db.insert(table, data)
     }
 
-    pub fn get(&self, table: &str, id: &str) -> Result<Option<Row>> {
+    pub fn get(&self, table: &str, id: u64) -> Result<Option<Row>> {
         self.db.get(table, id)
     }
 
-    pub fn update(&self, table: &str, id: &str, fields: &[(&str, Value)]) -> Result<bool> {
+    pub fn update(&self, table: &str, id: u64, fields: &[(&str, Value)]) -> Result<bool> {
         self.db.update(table, id, fields)
     }
 
-    pub fn delete(&self, table: &str, id: &str) -> Result<bool> {
+    pub fn delete(&self, table: &str, id: u64) -> Result<bool> {
         self.db.delete(table, id)
     }
 }
@@ -1583,7 +1513,7 @@ fn decoded_to_row(decoded: &row::DecodedRow, meta: &TableMeta) -> Row {
         })
         .collect();
     Row {
-        id: decoded.id.clone(),
+        id: decoded.id,
         columns,
     }
 }
@@ -1600,8 +1530,37 @@ mod tests {
         let db = BoogyDb::open(&path).unwrap();
         db.create_table("users", &[ColumnDef::new("name", Type::Text)]).unwrap();
         let id = db.insert("users", &[("name", Value::Text("alice".into()))]).unwrap();
-        let row = db.get("users", &id).unwrap().unwrap();
+        let row = db.get("users", id).unwrap().unwrap();
         assert_eq!(row.columns[0].1, Value::Text("alice".into()));
+    }
+
+    #[test]
+    fn test_insert_returns_sequential_ids() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.boogy");
+        let db = BoogyDb::open(&path).unwrap();
+        db.create_table("t", &[ColumnDef::new("v", Type::Integer)]).unwrap();
+        let id1 = db.insert("t", &[("v", Value::Integer(1))]).unwrap();
+        let id2 = db.insert("t", &[("v", Value::Integer(2))]).unwrap();
+        let id3 = db.insert("t", &[("v", Value::Integer(3))]).unwrap();
+        assert_eq!(id1, 1);
+        assert_eq!(id2, 2);
+        assert_eq!(id3, 3);
+    }
+
+    #[test]
+    fn test_insert_with_id() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.boogy");
+        let db = BoogyDb::open(&path).unwrap();
+        db.create_table("t", &[ColumnDef::new("v", Type::Integer)]).unwrap();
+        db.insert_with_id("t", 100, &[("v", Value::Integer(42))]).unwrap();
+        let row = db.get("t", 100).unwrap().unwrap();
+        assert_eq!(row.id, 100);
+        assert_eq!(row.columns[0].1, Value::Integer(42));
+        // next auto-id should be past 100
+        let id = db.insert("t", &[("v", Value::Integer(99))]).unwrap();
+        assert_eq!(id, 101);
     }
 
     #[test]
@@ -1611,8 +1570,8 @@ mod tests {
         let db = BoogyDb::open(&path).unwrap();
         db.create_table("users", &[ColumnDef::new("name", Type::Text)]).unwrap();
         let id = db.insert("users", &[("name", Value::Text("alice".into()))]).unwrap();
-        db.update("users", &id, &[("name", Value::Text("bob".into()))]).unwrap();
-        let row = db.get("users", &id).unwrap().unwrap();
+        db.update("users", id, &[("name", Value::Text("bob".into()))]).unwrap();
+        let row = db.get("users", id).unwrap().unwrap();
         assert_eq!(row.columns[0].1, Value::Text("bob".into()));
     }
 
@@ -1623,8 +1582,8 @@ mod tests {
         let db = BoogyDb::open(&path).unwrap();
         db.create_table("users", &[ColumnDef::new("name", Type::Text)]).unwrap();
         let id = db.insert("users", &[("name", Value::Text("alice".into()))]).unwrap();
-        assert!(db.delete("users", &id).unwrap());
-        assert!(db.get("users", &id).unwrap().is_none());
+        assert!(db.delete("users", id).unwrap());
+        assert!(db.get("users", id).unwrap().is_none());
     }
 
     #[test]
@@ -1641,7 +1600,7 @@ mod tests {
         let path = dir.path().join("test.boogy");
         let db = BoogyDb::open(&path).unwrap();
         db.create_table("t", &[ColumnDef::new("x", Type::Integer)]).unwrap();
-        assert!(db.get("t", "nonexistent").unwrap().is_none());
+        assert!(db.get("t", 999).unwrap().is_none());
     }
 
     #[test]
@@ -1736,9 +1695,8 @@ mod tests {
         let handles: Vec<_> = (0..4)
             .map(|_| {
                 let db = Arc::clone(&db);
-                let id = id.clone();
                 thread::spawn(move || {
-                    let row = db.get("t", &id).unwrap().unwrap();
+                    let row = db.get("t", id).unwrap().unwrap();
                     assert_eq!(row.columns[0].1, Value::Integer(42));
                 })
             })
@@ -1881,7 +1839,7 @@ mod tests {
         }
         {
             let db = BoogyDb::open(&path).unwrap();
-            assert!(db.get("a", "x").is_err()); // table "a" should not exist
+            assert!(db.get("a", 1).is_err()); // table "a" should not exist
             assert_eq!(db.count("b", &[]).unwrap(), 1);
         }
     }
@@ -1912,27 +1870,23 @@ mod tests {
     }
 
     #[test]
-    fn test_index_basic_roundtrip() {
+    fn test_next_rowid_persists_across_reopen() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("test.boogy");
-        let db = BoogyDb::open(&path).unwrap();
-        db.create_table("t", &[ColumnDef::new("v", Type::Text)]).unwrap();
-        db.create_index("t", "idx_v", "v").unwrap();
-
-        let _id = db.insert("t", &[("v", Value::Text("hello".into()))]).unwrap();
-
-        // The index should be usable via find
-        let opts = crate::filter::FindOptions {
-            filters: vec![crate::filter::Filter::eq("v", "hello")],
-            ..Default::default()
-        };
-        let (rows, total) = db.find("t", opts).unwrap();
-        assert_eq!(total, 1);
-        assert_eq!(rows.len(), 1);
-
-        // Also via count
-        let count = db.count("t", &[crate::filter::Filter::eq("v", "hello")]).unwrap();
-        assert_eq!(count, 1);
+        {
+            let db = BoogyDb::open(&path).unwrap();
+            db.create_table("t", &[ColumnDef::new("v", Type::Integer)]).unwrap();
+            let id1 = db.insert("t", &[("v", Value::Integer(1))]).unwrap();
+            let id2 = db.insert("t", &[("v", Value::Integer(2))]).unwrap();
+            assert_eq!(id1, 1);
+            assert_eq!(id2, 2);
+        }
+        {
+            let db = BoogyDb::open(&path).unwrap();
+            // After reopen, next rowid should continue from where we left off
+            let id3 = db.insert("t", &[("v", Value::Integer(3))]).unwrap();
+            assert_eq!(id3, 3);
+        }
     }
 
     #[test]
@@ -1954,5 +1908,102 @@ mod tests {
         let mut tree = BTree::new(&mut file, state.meta.root_page);
         let all = tree.scan_all().unwrap();
         assert_eq!(all.len(), 100);
+    }
+
+    #[test]
+    fn test_index_basic_roundtrip() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.boogy");
+        let db = BoogyDb::open(&path).unwrap();
+        db.create_table("t", &[ColumnDef::new("v", Type::Text)]).unwrap();
+        db.create_index("t", "idx_v", "v").unwrap();
+        let _id = db.insert("t", &[("v", Value::Text("hello".into()))]).unwrap();
+        let opts = crate::filter::FindOptions {
+            filters: vec![crate::filter::Filter::eq("v", "hello")],
+            ..Default::default()
+        };
+        let (rows, total) = db.find("t", opts).unwrap();
+        assert_eq!(total, 1);
+        assert_eq!(rows.len(), 1);
+    }
+
+    #[test]
+    fn test_index_populated_on_create() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.boogy");
+        let db = BoogyDb::open(&path).unwrap();
+        db.create_table("t", &[ColumnDef::new("v", Type::Integer)]).unwrap();
+        // Insert rows BEFORE creating the index.
+        db.insert("t", &[("v", Value::Integer(10))]).unwrap();
+        db.insert("t", &[("v", Value::Integer(20))]).unwrap();
+        db.insert("t", &[("v", Value::Integer(30))]).unwrap();
+        // Index creation should backfill existing rows.
+        db.create_index("t", "idx_v", "v").unwrap();
+        let opts = crate::filter::FindOptions {
+            filters: vec![crate::filter::Filter::eq("v", 20i64)],
+            ..Default::default()
+        };
+        let (rows, total) = db.find("t", opts).unwrap();
+        assert_eq!(total, 1);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].columns[0].1, Value::Integer(20));
+    }
+
+    #[test]
+    fn test_index_maintained_on_delete() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.boogy");
+        let db = BoogyDb::open(&path).unwrap();
+        db.create_table("t", &[ColumnDef::new("v", Type::Text)]).unwrap();
+        db.create_index("t", "idx_v", "v").unwrap();
+        let id1 = db.insert("t", &[("v", Value::Text("a".into()))]).unwrap();
+        let _id2 = db.insert("t", &[("v", Value::Text("b".into()))]).unwrap();
+        db.delete("t", id1).unwrap();
+        let opts = crate::filter::FindOptions {
+            filters: vec![crate::filter::Filter::eq("v", "a")],
+            ..Default::default()
+        };
+        let (rows, _) = db.find("t", opts).unwrap();
+        assert_eq!(rows.len(), 0);
+    }
+
+    #[test]
+    fn test_index_maintained_on_update() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.boogy");
+        let db = BoogyDb::open(&path).unwrap();
+        db.create_table("t", &[ColumnDef::new("v", Type::Text)]).unwrap();
+        db.create_index("t", "idx_v", "v").unwrap();
+        let id = db.insert("t", &[("v", Value::Text("old".into()))]).unwrap();
+        db.update("t", id, &[("v", Value::Text("new".into()))]).unwrap();
+        // Old value should not be found.
+        let opts_old = crate::filter::FindOptions {
+            filters: vec![crate::filter::Filter::eq("v", "old")],
+            ..Default::default()
+        };
+        let (rows, _) = db.find("t", opts_old).unwrap();
+        assert_eq!(rows.len(), 0);
+        // New value should be found.
+        let opts_new = crate::filter::FindOptions {
+            filters: vec![crate::filter::Filter::eq("v", "new")],
+            ..Default::default()
+        };
+        let (rows, _) = db.find("t", opts_new).unwrap();
+        assert_eq!(rows.len(), 1);
+    }
+
+    #[test]
+    fn test_index_type_enforcement() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.boogy");
+        let db = BoogyDb::open(&path).unwrap();
+        db.create_table("t", &[ColumnDef::new("v", Type::Integer)]).unwrap();
+        db.create_index("t", "idx_v", "v").unwrap();
+        // Inserting wrong type should fail.
+        let result = db.insert("t", &[("v", Value::Text("hello".into()))]);
+        assert!(result.is_err());
+        // Null should be fine (not indexed).
+        let result = db.insert("t", &[("v", Value::Null)]);
+        assert!(result.is_ok());
     }
 }

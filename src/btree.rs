@@ -30,8 +30,8 @@ impl<'a> BTree<'a> {
     }
 
     /// Insert a row. Returns the (possibly new) root page number.
-    pub fn insert(&mut self, id: &str, row_data: &[u8]) -> Result<u32> {
-        let result = self.insert_recursive(self.root, id, row_data)?;
+    pub fn insert(&mut self, rowid: u64, row_data: &[u8]) -> Result<u32> {
+        let result = self.insert_recursive(self.root, rowid, row_data)?;
         match result {
             InsertResult::Fit => Ok(self.root),
             InsertResult::Split {
@@ -40,7 +40,7 @@ impl<'a> BTree<'a> {
             } => {
                 let new_root = self.file.allocate_page()?;
                 let mut root_page = Page::new_branch();
-                write_branch_entry(&mut root_page, 0, self.root, &separator);
+                write_branch_entry(&mut root_page, 0, self.root, separator);
                 set_branch_child(&mut root_page, 1, new_page);
                 root_page.set_num_rows(1);
                 root_page.update_checksum();
@@ -51,18 +51,18 @@ impl<'a> BTree<'a> {
         }
     }
 
-    /// Search for a row by _id. Returns the raw row bytes if found.
-    pub fn search(&mut self, id: &str) -> Result<Option<Vec<u8>>> {
-        self.search_recursive(self.root, id)
+    /// Search for a row by rowid. Returns the raw row bytes if found.
+    pub fn search(&mut self, rowid: u64) -> Result<Option<Vec<u8>>> {
+        self.search_recursive(self.root, rowid)
     }
 
-    /// Delete a row by _id. Returns true if the row existed.
-    pub fn delete(&mut self, id: &str) -> Result<bool> {
-        self.delete_recursive(self.root, id)
+    /// Delete a row by rowid. Returns true if the row existed.
+    pub fn delete(&mut self, rowid: u64) -> Result<bool> {
+        self.delete_recursive(self.root, rowid)
     }
 
-    /// Iterate all rows in key order. Returns (id, row_bytes) pairs.
-    pub fn scan_all(&mut self) -> Result<Vec<(String, Vec<u8>)>> {
+    /// Iterate all rows in key order. Returns (rowid, row_bytes) pairs.
+    pub fn scan_all(&mut self) -> Result<Vec<(u64, Vec<u8>)>> {
         let first_leaf = self.find_leftmost_leaf(self.root)?;
         let mut results = Vec::new();
         let mut current = first_leaf;
@@ -74,7 +74,7 @@ impl<'a> BTree<'a> {
                 if start < end && end <= PAGE_SIZE {
                     let data = &page.data[start..end];
                     if let Ok(id) = row::extract_id(data) {
-                        results.push((id.to_string(), data.to_vec()));
+                        results.push((id, data.to_vec()));
                     }
                 }
             }
@@ -97,7 +97,7 @@ impl<'a> BTree<'a> {
         filter_val: &crate::value::Value,
         limit: Option<u32>,
         offset: Option<u32>,
-    ) -> Result<(Vec<(String, Vec<u8>)>, u64)> {
+    ) -> Result<(Vec<(u64, Vec<u8>)>, u64)> {
         let first_leaf = self.find_leftmost_leaf(self.root)?;
         let mut total: u64 = 0;
         let mut results = Vec::new();
@@ -126,7 +126,7 @@ impl<'a> BTree<'a> {
                     total += 1;
                     if total > skip && (total - skip) <= take {
                         if let Ok(id) = row::extract_id(data) {
-                            results.push((id.to_string(), data.to_vec()));
+                            results.push((id, data.to_vec()));
                         }
                     }
                 }
@@ -176,70 +176,6 @@ impl<'a> BTree<'a> {
         Ok(count)
     }
 
-    /// Scan all keys that start with the given prefix.
-    /// Returns (id, row_bytes) pairs for matching entries.
-    pub fn scan_prefix(&mut self, prefix: &str) -> Result<Vec<(String, Vec<u8>)>> {
-        // Find the leaf where the prefix would be inserted.
-        let (leaf_page, start_idx) = self.find_leaf_for_prefix(self.root, prefix)?;
-        let mut results = Vec::new();
-        let mut current = leaf_page;
-        let mut skip = start_idx;
-        loop {
-            let page = self.file.read_page(current)?.clone();
-            let num_rows = page.num_rows() as usize;
-            for i in skip..num_rows {
-                let (start, end) = row_bounds(&page, i, num_rows);
-                if start < end && end <= PAGE_SIZE {
-                    let data = &page.data[start..end];
-                    if let Ok(id) = row::extract_id(data) {
-                        if id.starts_with(prefix) {
-                            results.push((id.to_string(), data.to_vec()));
-                        } else {
-                            // Past the prefix range, done.
-                            return Ok(results);
-                        }
-                    }
-                }
-            }
-            skip = 0;
-            let next = page.next_leaf();
-            if next == 0 {
-                break;
-            }
-            current = next;
-        }
-        Ok(results)
-    }
-
-    /// Find the leaf page and row index where keys >= prefix begin.
-    fn find_leaf_for_prefix(
-        &mut self,
-        page_no: u32,
-        prefix: &str,
-    ) -> Result<(u32, usize)> {
-        let page = self.file.read_page(page_no)?.clone();
-        if page.is_leaf() {
-            let num_rows = page.num_rows() as usize;
-            // Binary search for the first key >= prefix
-            let mut lo = 0usize;
-            let mut hi = num_rows;
-            while lo < hi {
-                let mid = lo + (hi - lo) / 2;
-                let (start, end) = row_bounds(&page, mid, num_rows);
-                let mid_id = row::extract_id(&page.data[start..end])?;
-                if mid_id < prefix {
-                    lo = mid + 1;
-                } else {
-                    hi = mid;
-                }
-            }
-            Ok((page_no, lo))
-        } else {
-            let (_, child_page_no) = find_child(&page, prefix);
-            self.find_leaf_for_prefix(child_page_no, prefix)
-        }
-    }
-
     // --- Internal methods ---
 
     fn find_leftmost_leaf(&mut self, page_no: u32) -> Result<u32> {
@@ -255,23 +191,23 @@ impl<'a> BTree<'a> {
     fn insert_recursive(
         &mut self,
         page_no: u32,
-        id: &str,
+        rowid: u64,
         row_data: &[u8],
     ) -> Result<InsertResult> {
         let page = self.file.read_page(page_no)?.clone();
 
         if page.is_leaf() {
-            self.insert_into_leaf(page_no, &page, id, row_data)
+            self.insert_into_leaf(page_no, &page, rowid, row_data)
         } else {
-            let (child_idx, child_page_no) = find_child(&page, id);
-            let result = self.insert_recursive(child_page_no, id, row_data)?;
+            let (child_idx, child_page_no) = find_child(&page, rowid);
+            let result = self.insert_recursive(child_page_no, rowid, row_data)?;
 
             match result {
                 InsertResult::Fit => Ok(InsertResult::Fit),
                 InsertResult::Split {
                     new_page,
                     separator,
-                } => self.insert_into_branch(page_no, child_idx, &separator, new_page),
+                } => self.insert_into_branch(page_no, child_idx, separator, new_page),
             }
         }
     }
@@ -280,15 +216,15 @@ impl<'a> BTree<'a> {
         &mut self,
         page_no: u32,
         page: &Page,
-        id: &str,
+        rowid: u64,
         row_data: &[u8],
     ) -> Result<InsertResult> {
         let num_rows = page.num_rows() as usize;
 
         // Binary search for insertion point and duplicate check.
-        let (pos, found) = find_insertion_point(page, id)?;
+        let (pos, found) = find_insertion_point(page, rowid)?;
         if found {
-            return Err(BoogyError::DuplicateKey(id.to_string()));
+            return Err(BoogyError::DuplicateKey(rowid));
         }
 
         // Check if the new row fits in the current page.
@@ -376,7 +312,7 @@ impl<'a> BTree<'a> {
         &mut self,
         page_no: u32,
         child_idx: usize,
-        separator: &str,
+        separator: u64,
         new_child: u32,
     ) -> Result<InsertResult> {
         let page = self.file.read_page(page_no)?.clone();
@@ -393,12 +329,12 @@ impl<'a> BTree<'a> {
             let (children, keys) = collect_branch_flat(&page);
             let mut new_children = children;
             let mut new_keys = keys;
-            new_keys.insert(child_idx, separator.to_string());
+            new_keys.insert(child_idx, separator);
             new_children.insert(child_idx + 1, new_child);
 
             let total_keys = new_keys.len();
             let mid = total_keys / 2;
-            let split_key = new_keys[mid].clone();
+            let split_key = new_keys[mid];
 
             let left_keys = &new_keys[..mid];
             let left_children = &new_children[..mid + 1];
@@ -422,7 +358,7 @@ impl<'a> BTree<'a> {
         }
     }
 
-    fn search_recursive(&mut self, page_no: u32, id: &str) -> Result<Option<Vec<u8>>> {
+    fn search_recursive(&mut self, page_no: u32, rowid: u64) -> Result<Option<Vec<u8>>> {
         let page = self.file.read_page(page_no)?.clone();
 
         if page.is_leaf() {
@@ -431,8 +367,8 @@ impl<'a> BTree<'a> {
                 return Ok(None);
             }
 
-            // Binary search for the target id.
-            let (pos, found) = find_insertion_point(&page, id)?;
+            // Binary search for the target rowid.
+            let (pos, found) = find_insertion_point(&page, rowid)?;
             if found {
                 let (start, end) = row_bounds(&page, pos, num_rows);
                 if start < end && end <= PAGE_SIZE {
@@ -441,12 +377,12 @@ impl<'a> BTree<'a> {
             }
             Ok(None)
         } else {
-            let (_, child_page_no) = find_child(&page, id);
-            self.search_recursive(child_page_no, id)
+            let (_, child_page_no) = find_child(&page, rowid);
+            self.search_recursive(child_page_no, rowid)
         }
     }
 
-    fn delete_recursive(&mut self, page_no: u32, id: &str) -> Result<bool> {
+    fn delete_recursive(&mut self, page_no: u32, rowid: u64) -> Result<bool> {
         let page = self.file.read_page(page_no)?.clone();
 
         if page.is_leaf() {
@@ -456,7 +392,7 @@ impl<'a> BTree<'a> {
             }
 
             // Binary search for the row to delete.
-            let (pos, found) = find_insertion_point(&page, id)?;
+            let (pos, found) = find_insertion_point(&page, rowid)?;
             if !found {
                 return Ok(false);
             }
@@ -473,15 +409,15 @@ impl<'a> BTree<'a> {
             page.update_checksum();
             Ok(true)
         } else {
-            let (_, child_page_no) = find_child(&page, id);
-            self.delete_recursive(child_page_no, id)
+            let (_, child_page_no) = find_child(&page, rowid);
+            self.delete_recursive(child_page_no, rowid)
         }
     }
 }
 
 enum InsertResult {
     Fit,
-    Split { new_page: u32, separator: String },
+    Split { new_page: u32, separator: u64 },
 }
 
 // ---------------------------------------------------------------------------
@@ -519,10 +455,10 @@ fn raw_free_space_offset(data: &[u8; PAGE_SIZE]) -> u16 {
     u16::from_le_bytes([data[6], data[7]])
 }
 
-/// Binary search within a leaf page for the insertion point of `id`.
+/// Binary search within a leaf page for the insertion point of `rowid`.
 /// Returns (index, true) if an exact match is found, or (index, false)
-/// for the position where `id` should be inserted to maintain sort order.
-fn find_insertion_point(page: &Page, id: &str) -> Result<(usize, bool)> {
+/// for the position where `rowid` should be inserted to maintain sort order.
+fn find_insertion_point(page: &Page, rowid: u64) -> Result<(usize, bool)> {
     let num_rows = page.num_rows() as usize;
     if num_rows == 0 {
         return Ok((0, false));
@@ -533,7 +469,7 @@ fn find_insertion_point(page: &Page, id: &str) -> Result<(usize, bool)> {
         let mid = lo + (hi - lo) / 2;
         let (start, end) = row_bounds(page, mid, num_rows);
         let mid_id = row::extract_id(&page.data[start..end])?;
-        match mid_id.cmp(id) {
+        match mid_id.cmp(&rowid) {
             std::cmp::Ordering::Less => lo = mid + 1,
             std::cmp::Ordering::Greater => hi = mid,
             std::cmp::Ordering::Equal => return Ok((mid, true)),
@@ -678,7 +614,7 @@ fn write_leaf_range(
     page.set_free_space_offset(write_pos as u16);
 }
 
-/// Extract the _id of the row at a given position in the virtual sequence
+/// Extract the rowid of the row at a given position in the virtual sequence
 /// (old rows + new row inserted at `insert_pos`).
 fn extract_id_at_virtual_pos(
     snapshot: &[u8; PAGE_SIZE],
@@ -686,9 +622,9 @@ fn extract_id_at_virtual_pos(
     insert_pos: usize,
     new_row: &[u8],
     virtual_pos: usize,
-) -> Result<String> {
+) -> Result<u64> {
     if virtual_pos == insert_pos {
-        Ok(row::extract_id(new_row)?.to_string())
+        row::extract_id(new_row)
     } else {
         let orig_idx = if virtual_pos < insert_pos {
             virtual_pos
@@ -696,32 +632,31 @@ fn extract_id_at_virtual_pos(
             virtual_pos - 1
         };
         let (s, e) = row_bounds_raw(snapshot, orig_idx, old_count);
-        Ok(row::extract_id(&snapshot[s..e])?.to_string())
+        row::extract_id(&snapshot[s..e])
     }
 }
 
 // ---------------------------------------------------------------------------
-// Branch page helpers (unchanged fixed-42-byte entry format)
+// Branch page helpers (fixed 12-byte entry format: [child:4][key:8])
 // ---------------------------------------------------------------------------
 
-const BRANCH_ENTRY_SIZE: usize = 42; // 4 (child) + 2 (key_len) + 36 (key data)
+const BRANCH_ENTRY_SIZE: usize = 12; // 4 (child) + 8 (key u64 LE)
 
 fn get_branch_child(page: &Page, idx: usize) -> u32 {
     let offset = PAGE_HEADER_SIZE + idx * BRANCH_ENTRY_SIZE;
     u32::from_le_bytes(page.data[offset..offset + 4].try_into().unwrap())
 }
 
-fn get_branch_key(page: &Page, idx: usize) -> String {
+fn get_branch_key(page: &Page, idx: usize) -> u64 {
     let offset = PAGE_HEADER_SIZE + idx * BRANCH_ENTRY_SIZE + 4;
-    let key_len = u16::from_le_bytes(page.data[offset..offset + 2].try_into().unwrap()) as usize;
-    String::from_utf8_lossy(&page.data[offset + 2..offset + 2 + key_len]).to_string()
+    u64::from_le_bytes(page.data[offset..offset + 8].try_into().unwrap())
 }
 
-fn find_child(page: &Page, id: &str) -> (usize, u32) {
+fn find_child(page: &Page, rowid: u64) -> (usize, u32) {
     let num_keys = page.num_rows() as usize;
     for i in 0..num_keys {
         let key = get_branch_key(page, i);
-        if id < key.as_str() {
+        if rowid < key {
             return (i, get_branch_child(page, i));
         }
     }
@@ -734,14 +669,10 @@ fn find_child(page: &Page, id: &str) -> (usize, u32) {
     (num_keys, child)
 }
 
-fn write_branch_entry(page: &mut Page, idx: usize, child: u32, key: &str) {
+fn write_branch_entry(page: &mut Page, idx: usize, child: u32, key: u64) {
     let offset = PAGE_HEADER_SIZE + idx * BRANCH_ENTRY_SIZE;
     page.data[offset..offset + 4].copy_from_slice(&child.to_le_bytes());
-    let key_bytes = key.as_bytes();
-    let key_len = key_bytes.len().min(36);
-    page.data[offset + 4..offset + 6].copy_from_slice(&(key_len as u16).to_le_bytes());
-    page.data[offset + 6..offset + 6 + 36].fill(0);
-    page.data[offset + 6..offset + 6 + key_len].copy_from_slice(&key_bytes[..key_len]);
+    page.data[offset + 4..offset + 12].copy_from_slice(&key.to_le_bytes());
 }
 
 fn set_branch_child(page: &mut Page, idx: usize, child: u32) {
@@ -749,17 +680,17 @@ fn set_branch_child(page: &mut Page, idx: usize, child: u32) {
     page.data[offset..offset + 4].copy_from_slice(&child.to_le_bytes());
 }
 
-fn insert_branch_entry(page: &mut Page, child_idx: usize, key: &str, new_child: u32) {
+fn insert_branch_entry(page: &mut Page, child_idx: usize, key: u64, new_child: u32) {
     let (children, keys) = collect_branch_flat(page);
     let mut new_children = children;
     let mut new_keys = keys;
-    new_keys.insert(child_idx, key.to_string());
+    new_keys.insert(child_idx, key);
     new_children.insert(child_idx + 1, new_child);
     rebuild_branch_flat(page, &new_children, &new_keys);
     page.set_num_rows(new_keys.len() as u16);
 }
 
-fn collect_branch_flat(page: &Page) -> (Vec<u32>, Vec<String>) {
+fn collect_branch_flat(page: &Page) -> (Vec<u32>, Vec<u64>) {
     let num_keys = page.num_rows() as usize;
     let mut children = Vec::with_capacity(num_keys + 1);
     let mut keys = Vec::with_capacity(num_keys);
@@ -771,11 +702,11 @@ fn collect_branch_flat(page: &Page) -> (Vec<u32>, Vec<String>) {
     (children, keys)
 }
 
-fn rebuild_branch_flat(page: &mut Page, children: &[u32], keys: &[String]) {
+fn rebuild_branch_flat(page: &mut Page, children: &[u32], keys: &[u64]) {
     page.set_flags(PAGE_BRANCH);
     page.set_num_rows(keys.len() as u16);
     page.data[PAGE_HEADER_SIZE..PAGE_SIZE - CHECKSUM_SIZE].fill(0);
-    for (i, key) in keys.iter().enumerate() {
+    for (i, &key) in keys.iter().enumerate() {
         write_branch_entry(page, i, children[i], key);
     }
     set_branch_child(page, keys.len(), children[keys.len()]);
@@ -788,8 +719,8 @@ mod tests {
     use crate::value::Value;
     use tempfile::NamedTempFile;
 
-    fn make_row(id: &str, name: &str) -> Vec<u8> {
-        row::encode_row(id, &[(0, &Value::Text(name.into()))])
+    fn make_row(rowid: u64, name: &str) -> Vec<u8> {
+        row::encode_row(rowid, &[(0, &Value::Text(name.into()))])
     }
 
     #[test]
@@ -799,13 +730,13 @@ mod tests {
         let root = BTree::create(&mut pf).unwrap();
         let mut tree = BTree::new(&mut pf, root);
 
-        let row = make_row("id1", "alice");
-        tree.insert("id1", &row).unwrap();
+        let row = make_row(1, "alice");
+        tree.insert(1, &row).unwrap();
 
-        let found = tree.search("id1").unwrap();
+        let found = tree.search(1).unwrap();
         assert!(found.is_some());
         let decoded = row::decode_row(&found.unwrap()).unwrap();
-        assert_eq!(decoded.id, "id1");
+        assert_eq!(decoded.id, 1);
         assert_eq!(decoded.columns[0].1, Value::Text("alice".into()));
     }
 
@@ -816,7 +747,7 @@ mod tests {
         let root = BTree::create(&mut pf).unwrap();
         let mut tree = BTree::new(&mut pf, root);
 
-        assert!(tree.search("nonexistent").unwrap().is_none());
+        assert!(tree.search(999).unwrap().is_none());
     }
 
     #[test]
@@ -826,9 +757,9 @@ mod tests {
         let root = BTree::create(&mut pf).unwrap();
         let mut tree = BTree::new(&mut pf, root);
 
-        let row = make_row("id1", "alice");
-        tree.insert("id1", &row).unwrap();
-        assert!(tree.insert("id1", &row).is_err());
+        let row = make_row(1, "alice");
+        tree.insert(1, &row).unwrap();
+        assert!(tree.insert(1, &row).is_err());
     }
 
     #[test]
@@ -837,18 +768,16 @@ mod tests {
         let mut pf = PageFile::open(tmp.path()).unwrap();
         let mut root = BTree::create(&mut pf).unwrap();
 
-        for i in 0..100 {
-            let id = format!("id_{i:04}");
-            let row = make_row(&id, &format!("name_{i}"));
+        for i in 0..100u64 {
+            let row = make_row(i, &format!("name_{i}"));
             let mut tree = BTree::new(&mut pf, root);
-            root = tree.insert(&id, &row).unwrap();
+            root = tree.insert(i, &row).unwrap();
         }
 
         // Verify all rows are findable
         let mut tree = BTree::new(&mut pf, root);
-        for i in 0..100 {
-            let id = format!("id_{i:04}");
-            assert!(tree.search(&id).unwrap().is_some(), "missing: {id}");
+        for i in 0..100u64 {
+            assert!(tree.search(i).unwrap().is_some(), "missing: {i}");
         }
     }
 
@@ -859,11 +788,11 @@ mod tests {
         let root = BTree::create(&mut pf).unwrap();
         let mut tree = BTree::new(&mut pf, root);
 
-        let row = make_row("id1", "alice");
-        tree.insert("id1", &row).unwrap();
-        assert!(tree.delete("id1").unwrap());
-        assert!(tree.search("id1").unwrap().is_none());
-        assert!(!tree.delete("id1").unwrap()); // already deleted
+        let row = make_row(1, "alice");
+        tree.insert(1, &row).unwrap();
+        assert!(tree.delete(1).unwrap());
+        assert!(tree.search(1).unwrap().is_none());
+        assert!(!tree.delete(1).unwrap()); // already deleted
     }
 
     #[test]
@@ -872,11 +801,10 @@ mod tests {
         let mut pf = PageFile::open(tmp.path()).unwrap();
         let mut root = BTree::create(&mut pf).unwrap();
 
-        for i in 0..20 {
-            let id = format!("id_{i:04}");
-            let row = make_row(&id, &format!("name_{i}"));
+        for i in 0..20u64 {
+            let row = make_row(i, &format!("name_{i}"));
             let mut tree = BTree::new(&mut pf, root);
-            root = tree.insert(&id, &row).unwrap();
+            root = tree.insert(i, &row).unwrap();
         }
 
         let mut tree = BTree::new(&mut pf, root);
@@ -885,26 +813,23 @@ mod tests {
     }
 
     #[test]
-    fn test_500_uuid_inserts_separate_tree_instances() {
+    fn test_500_sequential_inserts_separate_tree_instances() {
         let tmp = NamedTempFile::new().unwrap();
         let mut pf = PageFile::open(tmp.path()).unwrap();
         let mut root = BTree::create(&mut pf).unwrap();
 
-        let mut ids = Vec::new();
-        for i in 0..500 {
-            let id = uuid::Uuid::new_v4().to_string();
-            let row = row::encode_row(&id, &[(0, &Value::Integer(i))]);
+        for i in 0..500u64 {
+            let row = row::encode_row(i, &[(0, &Value::Integer(i as i64))]);
             let mut tree = BTree::new(&mut pf, root);
-            root = tree.insert(&id, &row).unwrap();
+            root = tree.insert(i, &row).unwrap();
             pf.flush().unwrap();
-            ids.push(id);
         }
 
         // Verify all rows are findable
-        for (i, id) in ids.iter().enumerate() {
+        for i in 0..500u64 {
             let mut tree = BTree::new(&mut pf, root);
-            let result = tree.search(id).unwrap();
-            assert!(result.is_some(), "missing row at i={i}, id={id}");
+            let result = tree.search(i).unwrap();
+            assert!(result.is_some(), "missing row at i={i}");
         }
     }
 }

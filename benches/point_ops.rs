@@ -9,7 +9,7 @@ fn main() {
         db.set_durability(Durability::None);
         db.create_table("t", &[ColumnDef::new("v", Type::Integer)]).unwrap();
 
-        let mut ids: Vec<String> = Vec::new();
+        let mut ids: Vec<u64> = Vec::new();
         for i in 0..seed_size as i64 {
             ids.push(db.insert("t", &[("v", Value::Integer(i))]).unwrap());
         }
@@ -24,7 +24,7 @@ fn main() {
 
         let t = Instant::now();
         for i in 0..n {
-            let _ = db.get("t", &ids[i % ids.len()]).unwrap();
+            let _ = db.get("t", ids[i % ids.len()]).unwrap();
         }
         let get_us = t.elapsed().as_micros() as f64 / n as f64;
 
