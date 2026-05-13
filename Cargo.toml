@@ -19,3 +19,6 @@ harness = false
 [[bench]]
 name = "point_ops"
 harness = false
+[[bench]]
+name = "profile_ops"
+harness = false
