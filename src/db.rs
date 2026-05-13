@@ -457,66 +457,143 @@ impl BoogyDb {
 
     // --- Index key helpers ---
 
-    /// Serialize a Value into index key bytes.
-    fn value_to_index_key(val: &Value) -> Vec<u8> {
-        let mut buf = Vec::new();
+    /// Convert a Value into a deterministic string key for the index B+ tree.
+    ///
+    /// Type prefixes ensure no cross-type collisions:
+    ///   - Null    → "\x00null"
+    ///   - Text    → raw text (no prefix; most common case, avoids extra byte)
+    ///   - Integer → "\x01" + zero-padded 20-digit decimal (sortable)
+    ///   - Real    → "\x02" + decimal representation
+    ///   - Boolean → "\x03" + "0"/"1"
+    ///   - Blob    → "\x04" + hex encoding
+    ///
+    /// The key is used as the B+ tree _id, so it must fit in a row header.
+    /// Branch nodes only store up to 36 bytes of a key for routing, but full
+    /// keys live in leaf pages, so exact-match lookup is always correct.
+    fn value_to_key_string(val: &Value) -> String {
         match val {
-            Value::Null => buf.push(0),
-            Value::Text(s) => {
-                buf.push(1);
-                buf.extend_from_slice(s.as_bytes());
-            }
+            Value::Null => "\x00null".to_string(),
+            Value::Text(s) => s.clone(),
             Value::Integer(i) => {
-                buf.push(2);
-                buf.extend_from_slice(&i.to_le_bytes());
+                // Bias by i64::MIN magnitude so negatives sort before positives.
+                let sortable = (*i as u64) ^ (1u64 << 63);
+                format!("\x01{sortable:020}")
             }
-            Value::Real(f) => {
-                buf.push(3);
-                buf.extend_from_slice(&f.to_le_bytes());
-            }
+            Value::Real(f) => format!("\x02{f}"),
+            Value::Boolean(b) => format!("\x03{}", if *b { "1" } else { "0" }),
             Value::Blob(b) => {
-                buf.push(4);
-                buf.extend_from_slice(b);
-            }
-            Value::Boolean(b) => {
-                buf.push(5);
-                buf.push(if *b { 1 } else { 0 });
+                let hex: String = b.iter().map(|byte| format!("{byte:02x}")).collect();
+                format!("\x04{hex}")
             }
         }
-        buf
     }
 
-    /// Build a composite index key: hash(value) + ":" + row_id.
-    /// The hash is 8 hex chars, separator is 1 char, and the row_id
-    /// (UUID) adds up to 36 chars.  Total: 8+1+36 = 45 chars.
-    /// The first 36 chars stored in branch entries are: 8 hash + ":" + 27 UUID prefix.
-    /// This is sufficient for correct B+ tree routing because the hash
-    /// groups entries by value, and the UUID portion disambiguates within a group.
-    fn index_composite_key(val_hash: &str, row_id: &str) -> String {
-        format!("{val_hash}:{row_id}")
+    /// Maximum IDs stored per B+ tree entry (one chunk).
+    ///
+    /// Each UUID is 36 bytes + 1 byte separator = 37 bytes per ID.
+    /// A page is 4096 bytes; row overhead (key + col header) is ~50 bytes.
+    /// We cap at 80 IDs/chunk (~2960 bytes payload), leaving ample room
+    /// for the key and encoding overhead, staying well under a page.
+    const INDEX_IDS_PER_CHUNK: usize = 80;
+
+    /// Return the B+ tree key for overflow chunk `chunk` of a value key.
+    /// Chunk 0 uses the bare value key; subsequent chunks append "\xff\xff{chunk:06}".
+    fn chunk_key(base_key: &str, chunk: usize) -> String {
+        if chunk == 0 {
+            base_key.to_string()
+        } else {
+            format!("{base_key}\u{ff}\u{ff}{chunk:06}")
+        }
     }
 
-    /// Build a minimal row-format entry for the index B+ tree.
-    /// The B+ tree requires row::extract_id-compatible format.
-    fn encode_index_entry(composite_key: &str) -> Vec<u8> {
-        // Minimal row: just the _id with no columns.
-        row::encode_row(composite_key, &[])
+    /// Encode an ID list as a row suitable for storage in the index B+ tree.
+    /// The list is stored as a single Text column (col_id=0) with IDs joined by "\n".
+    fn encode_id_list_as_entry(key: &str, ids: &[String]) -> Vec<u8> {
+        let joined = ids.join("\n");
+        row::encode_row(key, &[(0u16, &Value::Text(joined))])
+    }
+
+    /// Decode an ID list from a raw index entry (as returned by BTree::search).
+    fn decode_id_list(bytes: &[u8]) -> Result<Vec<String>> {
+        let decoded = row::decode_row(bytes)?;
+        match decoded.columns.first() {
+            Some((_, Value::Text(joined))) if !joined.is_empty() => {
+                Ok(joined.split('\n').map(|s| s.to_string()).collect())
+            }
+            _ => Ok(Vec::new()),
+        }
+    }
+
+    /// Read all IDs stored for `base_key` across all chunks.
+    fn read_all_chunks(file: &mut PageFile, idx_root: u32, base_key: &str) -> Result<Vec<String>> {
+        let mut all_ids = Vec::new();
+        let mut chunk = 0usize;
+        loop {
+            let k = Self::chunk_key(base_key, chunk);
+            let mut tree = BTree::new(file, idx_root);
+            match tree.search(&k)? {
+                Some(bytes) => {
+                    let chunk_ids = Self::decode_id_list(&bytes)?;
+                    all_ids.extend(chunk_ids);
+                    chunk += 1;
+                }
+                None => break,
+            }
+        }
+        Ok(all_ids)
+    }
+
+    /// Delete all chunk entries for `base_key`. Returns updated root.
+    fn delete_all_chunks(file: &mut PageFile, idx_root: u32, base_key: &str) -> Result<u32> {
+        let mut root = idx_root;
+        let mut chunk = 0usize;
+        loop {
+            let k = Self::chunk_key(base_key, chunk);
+            let mut tree = BTree::new(file, root);
+            if tree.delete(&k)? {
+                root = tree.root_page();
+                chunk += 1;
+            } else {
+                break;
+            }
+        }
+        Ok(root)
+    }
+
+    /// Write `ids` into chunked entries under `base_key`. Returns updated root.
+    fn write_chunked_ids(
+        file: &mut PageFile,
+        idx_root: u32,
+        base_key: &str,
+        ids: &[String],
+    ) -> Result<u32> {
+        let mut root = idx_root;
+        for (chunk, id_slice) in ids.chunks(Self::INDEX_IDS_PER_CHUNK).enumerate() {
+            let k = Self::chunk_key(base_key, chunk);
+            let entry = Self::encode_id_list_as_entry(&k, id_slice);
+            let mut tree = BTree::new(file, root);
+            root = tree.insert(&k, &entry)?;
+        }
+        Ok(root)
     }
 
     /// Add a row_id to an index for a given column value.
+    /// Uses chunked storage: up to INDEX_IDS_PER_CHUNK IDs per B+ tree entry.
     fn index_add(
         file: &mut PageFile,
         idx_root: u32,
         col_val: &Value,
         row_id: &str,
     ) -> Result<u32> {
-        let key = Self::value_to_index_key(col_val);
-        let val_hash = Self::index_value_hash(&key);
-        let composite = Self::index_composite_key(&val_hash, row_id);
-        let entry = Self::encode_index_entry(&composite);
-        let mut tree = BTree::new(file, idx_root);
-        let new_root = tree.insert(&composite, &entry)?;
-        Ok(new_root)
+        let key = Self::value_to_key_string(col_val);
+
+        // Read all existing IDs across all chunks, append new ID.
+        let mut ids = Self::read_all_chunks(file, idx_root, &key)?;
+        ids.push(row_id.to_string());
+
+        // Delete all old chunks, then re-write with new chunked layout.
+        let root = Self::delete_all_chunks(file, idx_root, &key)?;
+        Self::write_chunked_ids(file, root, &key, &ids)
     }
 
     /// Remove a row_id from the index for a given column value.
@@ -526,43 +603,36 @@ impl BoogyDb {
         col_val: &Value,
         row_id: &str,
     ) -> Result<u32> {
-        let key = Self::value_to_index_key(col_val);
-        let val_hash = Self::index_value_hash(&key);
-        let composite = Self::index_composite_key(&val_hash, row_id);
-        let mut tree = BTree::new(file, idx_root);
-        tree.delete(&composite)?;
-        Ok(tree.root_page())
+        let key = Self::value_to_key_string(col_val);
+
+        // Read all IDs, remove the one we're deleting.
+        let mut ids = Self::read_all_chunks(file, idx_root, &key)?;
+        let before_len = ids.len();
+        ids.retain(|id| id != row_id);
+
+        if ids.len() == before_len {
+            // Nothing to remove (row_id wasn't in the index).
+            return Ok(idx_root);
+        }
+
+        // Delete all old chunks, then re-write remaining IDs.
+        let root = Self::delete_all_chunks(file, idx_root, &key)?;
+        if ids.is_empty() {
+            Ok(root)
+        } else {
+            Self::write_chunked_ids(file, root, &key, &ids)
+        }
     }
 
     /// Look up all row_ids for a given column value in the index.
-    /// Uses prefix scan on the hash, then extracts row_ids.
+    /// Reads all chunks: O(k * log n) where k = ceil(matching_rows / IDS_PER_CHUNK).
     fn index_lookup(
         file: &mut PageFile,
         idx_root: u32,
         col_val: &Value,
     ) -> Result<Vec<String>> {
-        let key = Self::value_to_index_key(col_val);
-        let val_hash = Self::index_value_hash(&key);
-        let prefix = format!("{val_hash}:");
-        let mut tree = BTree::new(file, idx_root);
-        let entries = tree.scan_prefix(&prefix)?;
-
-        let mut ids = Vec::with_capacity(entries.len());
-        for (composite_key, _) in &entries {
-            // The row_id is everything after the prefix
-            if let Some(row_id) = composite_key.strip_prefix(&prefix) {
-                ids.push(row_id.to_string());
-            }
-        }
-        Ok(ids)
-    }
-
-    /// Hash a value's key bytes into a short, fixed-length hex prefix.
-    /// Uses CRC32 for a compact 8-char hex string that fits within
-    /// the 36-byte branch key limit alongside the row_id.
-    fn index_value_hash(key: &[u8]) -> String {
-        let hash = crc32fast::hash(key);
-        format!("{hash:08x}")
+        let key = Self::value_to_key_string(col_val);
+        Self::read_all_chunks(file, idx_root, &key)
     }
 
     /// Create a new table.
