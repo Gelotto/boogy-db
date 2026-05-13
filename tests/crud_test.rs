@@ -1239,3 +1239,194 @@ fn test_insert_many_empty_batch() {
     assert!(ids.is_empty());
     assert_eq!(db.count("t", &[]).unwrap(), 0);
 }
+
+// ===========================================================================
+// Encrypted table tests
+// ===========================================================================
+
+#[test]
+fn test_encrypted_table_roundtrip() {
+    let (db, _dir) = create_db();
+    let key: [u8; 32] = [0xAB; 32];
+    db.create_table_encrypted(
+        "secrets",
+        &[
+            ColumnDef::new("name", Type::Text),
+            ColumnDef::new("value", Type::Integer),
+        ],
+        &key,
+    )
+    .unwrap();
+
+    let id1 = db
+        .insert("secrets", &[("name", Value::Text("api_key".into())), ("value", Value::Integer(42))])
+        .unwrap();
+    let id2 = db
+        .insert("secrets", &[("name", Value::Text("token".into())), ("value", Value::Integer(99))])
+        .unwrap();
+
+    let row1 = db.get("secrets", id1).unwrap().unwrap();
+    assert_eq!(row1.get("name").unwrap(), Value::Text("api_key".into()));
+    assert_eq!(row1.get("value").unwrap(), Value::Integer(42));
+
+    let row2 = db.get("secrets", id2).unwrap().unwrap();
+    assert_eq!(row2.get("name").unwrap(), Value::Text("token".into()));
+    assert_eq!(row2.get("value").unwrap(), Value::Integer(99));
+
+    assert_eq!(db.count("secrets", &[]).unwrap(), 2);
+}
+
+#[test]
+fn test_encrypted_table_locked_without_key() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("test.boogy");
+    let key: [u8; 32] = [0xCD; 32];
+
+    // Create encrypted table and insert data.
+    {
+        let db = BoogyDb::open(&path).unwrap();
+        db.create_table_encrypted(
+            "secrets",
+            &[ColumnDef::new("v", Type::Integer)],
+            &key,
+        )
+        .unwrap();
+        db.insert("secrets", &[("v", Value::Integer(1))]).unwrap();
+        db.insert("secrets", &[("v", Value::Integer(2))]).unwrap();
+    }
+
+    // Reopen without unlocking: all operations should fail with TableLocked.
+    {
+        let db = BoogyDb::open(&path).unwrap();
+
+        // insert should fail
+        let err = db.insert("secrets", &[("v", Value::Integer(3))]);
+        assert!(err.is_err());
+
+        // get should fail
+        let err = db.get("secrets", 1);
+        assert!(err.is_err());
+
+        // count should fail
+        let err = db.count("secrets", &[]);
+        assert!(err.is_err());
+
+        // find should fail
+        let err = db.find("secrets", FindOptions::default());
+        assert!(err.is_err());
+
+        // Now unlock and verify everything works.
+        db.unlock_table("secrets", &key).unwrap();
+
+        assert_eq!(db.count("secrets", &[]).unwrap(), 2);
+        let row = db.get("secrets", 1).unwrap().unwrap();
+        assert_eq!(row.get("v").unwrap(), Value::Integer(1));
+    }
+}
+
+#[test]
+fn test_encrypted_table_wrong_key() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("test.boogy");
+    let key: [u8; 32] = [0xEF; 32];
+    let wrong_key: [u8; 32] = [0x11; 32];
+
+    {
+        let db = BoogyDb::open(&path).unwrap();
+        db.create_table_encrypted(
+            "secrets",
+            &[ColumnDef::new("v", Type::Integer)],
+            &key,
+        )
+        .unwrap();
+        db.insert("secrets", &[("v", Value::Integer(42))]).unwrap();
+    }
+
+    {
+        let db = BoogyDb::open(&path).unwrap();
+        let result = db.unlock_table("secrets", &wrong_key);
+        assert!(result.is_err(), "wrong key should be rejected");
+
+        // Correct key should work.
+        db.unlock_table("secrets", &key).unwrap();
+        let row = db.get("secrets", 1).unwrap().unwrap();
+        assert_eq!(row.get("v").unwrap(), Value::Integer(42));
+    }
+}
+
+#[test]
+fn test_mixed_encrypted_unencrypted() {
+    let (db, _dir) = create_db();
+    let key: [u8; 32] = [0x99; 32];
+
+    db.create_table("public", &[ColumnDef::new("v", Type::Integer)])
+        .unwrap();
+    db.create_table_encrypted(
+        "private",
+        &[ColumnDef::new("v", Type::Integer)],
+        &key,
+    )
+    .unwrap();
+
+    // Both tables work independently.
+    let pub_id = db.insert("public", &[("v", Value::Integer(1))]).unwrap();
+    let priv_id = db.insert("private", &[("v", Value::Integer(2))]).unwrap();
+
+    let pub_row = db.get("public", pub_id).unwrap().unwrap();
+    assert_eq!(pub_row.get("v").unwrap(), Value::Integer(1));
+
+    let priv_row = db.get("private", priv_id).unwrap().unwrap();
+    assert_eq!(priv_row.get("v").unwrap(), Value::Integer(2));
+
+    assert_eq!(db.count("public", &[]).unwrap(), 1);
+    assert_eq!(db.count("private", &[]).unwrap(), 1);
+}
+
+#[test]
+fn test_encrypted_table_with_index() {
+    let (db, _dir) = create_db();
+    let key: [u8; 32] = [0x77; 32];
+
+    db.create_table_encrypted(
+        "items",
+        &[
+            ColumnDef::new("category", Type::Text),
+            ColumnDef::new("value", Type::Integer),
+        ],
+        &key,
+    )
+    .unwrap();
+    db.create_index("items", "idx_category", "category").unwrap();
+
+    for i in 0..50 {
+        let cat = format!("cat_{}", i % 5);
+        db.insert(
+            "items",
+            &[
+                ("category", Value::Text(cat)),
+                ("value", Value::Integer(i)),
+            ],
+        )
+        .unwrap();
+    }
+
+    // Query via index.
+    let result = db
+        .find(
+            "items",
+            FindOptions {
+                filters: vec![Filter::eq("category", "cat_2")],
+                include_total: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(result.total.unwrap(), 10);
+    assert_eq!(result.rows.len(), 10);
+
+    // Count via index.
+    let count = db
+        .count("items", &[Filter::eq("category", "cat_0")])
+        .unwrap();
+    assert_eq!(count, 10);
+}
