@@ -1,5 +1,5 @@
 use crate::error::Result;
-use crate::file::PageFile;
+use crate::file::{PageFile, WriteGuard};
 use crate::page::{Page, PAGE_BRANCH, PAGE_HEADER_SIZE, PAGE_LEAF, PAGE_SIZE};
 use crate::value::{Type, Value};
 
@@ -128,7 +128,7 @@ fn encode_f64_sortable(val: f64) -> [u8; 8] {
 }
 
 // ---------------------------------------------------------------------------
-// IndexTree — B+ tree for byte-slice keys
+// IndexTreeReader — read-only access via &PageFile
 // ---------------------------------------------------------------------------
 
 /// Checksum occupies the last 4 bytes of each page.
@@ -138,23 +138,13 @@ const CHECKSUM_SIZE: usize = 4;
 const IDX_BRANCH_ENTRY_SIZE: usize = 42;
 const IDX_BRANCH_KEY_MAX: usize = 36;
 
-/// A B+ tree that stores raw byte keys (no payload — key alone is the entry).
-/// Used for secondary indexes where keys are composite `(encoded_value, rowid)`.
-pub struct IndexTree<'a> {
-    file: &'a mut PageFile,
+pub struct IndexTreeReader<'a> {
+    file: &'a PageFile,
     root: u32,
 }
 
-impl<'a> IndexTree<'a> {
-    /// Create a new empty IndexTree (single empty leaf page). Returns the root page number.
-    pub fn create(file: &mut PageFile) -> Result<u32> {
-        let page_no = file.allocate_page()?;
-        let page = Page::new_leaf();
-        file.put_page(page_no, page);
-        Ok(page_no)
-    }
-
-    pub fn new(file: &'a mut PageFile, root: u32) -> Self {
+impl<'a> IndexTreeReader<'a> {
+    pub fn new(file: &'a PageFile, root: u32) -> Self {
         Self { file, root }
     }
 
@@ -162,42 +152,15 @@ impl<'a> IndexTree<'a> {
         self.root
     }
 
-    /// Insert a key. Returns the (possibly new) root page number.
-    pub fn insert(&mut self, key: &[u8]) -> Result<u32> {
-        let result = self.insert_recursive(self.root, key)?;
-        match result {
-            InsertResult::Fit => Ok(self.root),
-            InsertResult::Split {
-                new_page,
-                separator,
-            } => {
-                let new_root = self.file.allocate_page()?;
-                let mut root_page = Page::new_branch();
-                write_idx_branch_entry(&mut root_page, 0, self.root, &separator);
-                set_idx_branch_child(&mut root_page, 1, new_page);
-                root_page.set_num_rows(1);
-                root_page.update_checksum();
-                self.file.put_page(new_root, root_page);
-                self.root = new_root;
-                Ok(self.root)
-            }
-        }
-    }
-
-    /// Delete a key. Returns true if the key existed.
-    pub fn delete(&mut self, key: &[u8]) -> Result<bool> {
-        self.delete_recursive(self.root, key)
-    }
-
     /// Return all keys that start with `prefix`, in sorted order.
-    pub fn scan_prefix(&mut self, prefix: &[u8]) -> Result<Vec<Vec<u8>>> {
+    pub fn scan_prefix(&self, prefix: &[u8]) -> Result<Vec<Vec<u8>>> {
         let first_leaf = self.find_leaf_for_key(self.root, prefix)?;
         let mut results = Vec::new();
         let mut current = first_leaf;
         let mut found_start = false;
 
         loop {
-            let page = self.file.read_page(current)?.clone();
+            let page = self.file.read_page(current)?;
             let num_entries = page.num_rows() as usize;
 
             for i in 0..num_entries {
@@ -207,7 +170,7 @@ impl<'a> IndexTree<'a> {
                         found_start = true;
                         results.push(k.to_vec());
                     } else if found_start {
-                        // Past the prefix range — done
+                        // Past the prefix range -- done
                         return Ok(results);
                     }
                 }
@@ -224,14 +187,14 @@ impl<'a> IndexTree<'a> {
     }
 
     /// Count entries whose key starts with `prefix` without collecting them.
-    pub fn count_prefix(&mut self, prefix: &[u8]) -> Result<u64> {
+    pub fn count_prefix(&self, prefix: &[u8]) -> Result<u64> {
         let first_leaf = self.find_leaf_for_key(self.root, prefix)?;
         let mut count = 0u64;
         let mut current = first_leaf;
         let mut found_start = false;
 
         loop {
-            let page = self.file.read_page(current)?.clone();
+            let page = self.file.read_page(current)?;
             let num_entries = page.num_rows() as usize;
 
             for i in 0..num_entries {
@@ -255,14 +218,14 @@ impl<'a> IndexTree<'a> {
     }
 
     /// Same as scan_prefix but stops after collecting `max` keys.
-    pub fn scan_prefix_limit(&mut self, prefix: &[u8], max: usize) -> Result<Vec<Vec<u8>>> {
+    pub fn scan_prefix_limit(&self, prefix: &[u8], max: usize) -> Result<Vec<Vec<u8>>> {
         let first_leaf = self.find_leaf_for_key(self.root, prefix)?;
         let mut results = Vec::with_capacity(max.min(256));
         let mut current = first_leaf;
         let mut found_start = false;
 
         loop {
-            let page = self.file.read_page(current)?.clone();
+            let page = self.file.read_page(current)?;
             let num_entries = page.num_rows() as usize;
 
             for i in 0..num_entries {
@@ -291,9 +254,8 @@ impl<'a> IndexTree<'a> {
     // --- Internal methods ---
 
     /// Navigate the B+ tree to find the leaf page containing (or nearest to) `key`.
-    /// Uses branch keys for O(log n) routing instead of scanning from leftmost leaf.
-    fn find_leaf_for_key(&mut self, page_no: u32, key: &[u8]) -> Result<u32> {
-        let page = self.file.read_page(page_no)?.clone();
+    fn find_leaf_for_key(&self, page_no: u32, key: &[u8]) -> Result<u32> {
+        let page = self.file.read_page(page_no)?;
         if page.is_leaf() {
             Ok(page_no)
         } else {
@@ -301,9 +263,65 @@ impl<'a> IndexTree<'a> {
             self.find_leaf_for_key(child, key)
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// IndexTreeWriter — write access via &mut WriteGuard
+// ---------------------------------------------------------------------------
+
+pub struct IndexTreeWriter<'a, 'b> {
+    guard: &'a mut WriteGuard<'b>,
+    root: u32,
+}
+
+impl<'a, 'b> IndexTreeWriter<'a, 'b> {
+    pub fn new(guard: &'a mut WriteGuard<'b>, root: u32) -> Self {
+        Self { guard, root }
+    }
+
+    pub fn root_page(&self) -> u32 {
+        self.root
+    }
+
+    /// Create a new empty IndexTree (single empty leaf page). Returns the root page number.
+    pub fn create(guard: &mut WriteGuard) -> Result<u32> {
+        let page_no = guard.allocate_page()?;
+        let page = Page::new_leaf();
+        guard.put_page(page_no, page);
+        Ok(page_no)
+    }
+
+    /// Insert a key. Returns the (possibly new) root page number.
+    pub fn insert(&mut self, key: &[u8]) -> Result<u32> {
+        let result = self.insert_recursive(self.root, key)?;
+        match result {
+            InsertResult::Fit => Ok(self.root),
+            InsertResult::Split {
+                new_page,
+                separator,
+            } => {
+                let new_root = self.guard.allocate_page()?;
+                let mut root_page = Page::new_branch();
+                write_idx_branch_entry(&mut root_page, 0, self.root, &separator);
+                set_idx_branch_child(&mut root_page, 1, new_page);
+                root_page.set_num_rows(1);
+                root_page.update_checksum();
+                self.guard.put_page(new_root, root_page);
+                self.root = new_root;
+                Ok(self.root)
+            }
+        }
+    }
+
+    /// Delete a key. Returns true if the key existed.
+    pub fn delete(&mut self, key: &[u8]) -> Result<bool> {
+        self.delete_recursive(self.root, key)
+    }
+
+    // --- Internal methods ---
 
     fn insert_recursive(&mut self, page_no: u32, key: &[u8]) -> Result<InsertResult> {
-        let page = self.file.read_page(page_no)?.clone();
+        let page = (*self.guard.read_page(page_no)?).clone();
 
         if page.is_leaf() {
             self.insert_into_leaf(page_no, &page, key)
@@ -336,7 +354,6 @@ impl<'a> IndexTree<'a> {
         let entry_len = 2 + key.len();
 
         // Check if the new entry fits.
-        // After insert: header + (num_entries+1)*2 offsets + existing_data + new_entry + checksum
         let offset_array_start = PAGE_HEADER_SIZE + num_entries * 2;
         let current_free = page.free_space_offset() as usize;
         let existing_data_size = if current_free > offset_array_start {
@@ -353,7 +370,7 @@ impl<'a> IndexTree<'a> {
         if needed <= PAGE_SIZE {
             // Fits: in-place insert
             let snapshot = page.data;
-            let page = self.file.write_page(page_no)?;
+            let page = self.guard.write_page(page_no)?;
             write_idx_leaf_with_insert(page, &snapshot, num_entries, pos, key);
             page.update_checksum();
             Ok(InsertResult::Fit)
@@ -365,13 +382,13 @@ impl<'a> IndexTree<'a> {
             let total = num_entries + 1;
             let mid = total / 2;
 
-            let new_page_no = self.file.allocate_page()?;
+            let new_page_no = self.guard.allocate_page()?;
 
             // Separator: the key of the first entry in the right half.
             let separator = extract_key_at_virtual_pos(&snapshot, num_entries, pos, key, mid);
 
             // Write left half (indices 0..mid).
-            let left_page = self.file.write_page(page_no)?;
+            let left_page = self.guard.write_page(page_no)?;
             write_idx_leaf_range(left_page, &snapshot, num_entries, pos, key, 0, mid);
             left_page.set_next_leaf(new_page_no);
             left_page.set_prev_leaf(prev_leaf);
@@ -391,11 +408,11 @@ impl<'a> IndexTree<'a> {
             right_page.set_prev_leaf(page_no);
             right_page.set_next_leaf(next_leaf);
             right_page.update_checksum();
-            self.file.put_page(new_page_no, right_page);
+            self.guard.put_page(new_page_no, right_page);
 
             // Fix old next page's prev pointer.
             if next_leaf != 0 {
-                let np = self.file.write_page(next_leaf)?;
+                let np = self.guard.write_page(next_leaf)?;
                 np.set_prev_leaf(new_page_no);
                 np.update_checksum();
             }
@@ -414,14 +431,14 @@ impl<'a> IndexTree<'a> {
         separator: &[u8],
         new_child: u32,
     ) -> Result<InsertResult> {
-        let page = self.file.read_page(page_no)?.clone();
+        let page = (*self.guard.read_page(page_no)?).clone();
         let num_keys = page.num_rows() as usize;
 
         let max_keys =
             (PAGE_SIZE - PAGE_HEADER_SIZE - 4 - CHECKSUM_SIZE) / IDX_BRANCH_ENTRY_SIZE;
 
         if num_keys < max_keys {
-            let page = self.file.write_page(page_no)?;
+            let page = self.guard.write_page(page_no)?;
             insert_idx_branch_entry(page, child_idx, separator, new_child);
             page.update_checksum();
             Ok(InsertResult::Fit)
@@ -441,15 +458,15 @@ impl<'a> IndexTree<'a> {
             let right_keys = &new_keys[mid + 1..];
             let right_children = &new_children[mid + 1..];
 
-            let left_page = self.file.write_page(page_no)?;
+            let left_page = self.guard.write_page(page_no)?;
             rebuild_idx_branch_flat(left_page, left_children, left_keys);
             left_page.update_checksum();
 
-            let new_page_no = self.file.allocate_page()?;
+            let new_page_no = self.guard.allocate_page()?;
             let mut new_page = Page::new_branch();
             rebuild_idx_branch_flat(&mut new_page, right_children, right_keys);
             new_page.update_checksum();
-            self.file.put_page(new_page_no, new_page);
+            self.guard.put_page(new_page_no, new_page);
 
             Ok(InsertResult::Split {
                 new_page: new_page_no,
@@ -459,7 +476,7 @@ impl<'a> IndexTree<'a> {
     }
 
     fn delete_recursive(&mut self, page_no: u32, key: &[u8]) -> Result<bool> {
-        let page = self.file.read_page(page_no)?.clone();
+        let page = (*self.guard.read_page(page_no)?).clone();
 
         if page.is_leaf() {
             let num_entries = page.num_rows() as usize;
@@ -491,7 +508,7 @@ impl<'a> IndexTree<'a> {
             let next_leaf = page.next_leaf();
             let prev_leaf = page.prev_leaf();
 
-            let page = self.file.write_page(page_no)?;
+            let page = self.guard.write_page(page_no)?;
             write_idx_leaf_without(page, &snapshot, num_entries, pos);
             page.set_next_leaf(next_leaf);
             page.set_prev_leaf(prev_leaf);
@@ -1058,27 +1075,33 @@ mod tests {
     #[test]
     fn test_index_tree_insert_and_scan_prefix() {
         let tmp = NamedTempFile::new().unwrap();
-        let mut pf = PageFile::open(tmp.path()).unwrap();
-        let mut root = IndexTree::create(&mut pf).unwrap();
+        let pf = PageFile::open(tmp.path()).unwrap();
 
-        // Insert keys for value=42, rowids 1,2,3
-        for rowid in 1..=3u64 {
-            let key = encode_index_key_integer(42, rowid);
-            let mut tree = IndexTree::new(&mut pf, root);
-            root = tree.insert(&key).unwrap();
-        }
-
-        // Also insert value=99, rowid=10
+        let mut root;
         {
-            let key = encode_index_key_integer(99, 10);
-            let mut tree = IndexTree::new(&mut pf, root);
-            root = tree.insert(&key).unwrap();
+            let mut guard = pf.begin_write();
+            root = IndexTreeWriter::create(&mut guard).unwrap();
+
+            // Insert keys for value=42, rowids 1,2,3
+            for rowid in 1..=3u64 {
+                let key = encode_index_key_integer(42, rowid);
+                let mut tree = IndexTreeWriter::new(&mut guard, root);
+                root = tree.insert(&key).unwrap();
+            }
+
+            // Also insert value=99, rowid=10
+            {
+                let key = encode_index_key_integer(99, 10);
+                let mut tree = IndexTreeWriter::new(&mut guard, root);
+                root = tree.insert(&key).unwrap();
+            }
+            guard.commit(false).unwrap();
         }
 
         // Scan prefix for value=42
         let prefix = encode_integer_prefix(42);
-        let mut tree = IndexTree::new(&mut pf, root);
-        let results = tree.scan_prefix(&prefix).unwrap();
+        let reader = IndexTreeReader::new(&pf, root);
+        let results = reader.scan_prefix(&prefix).unwrap();
         assert_eq!(results.len(), 3);
 
         // Verify rowids
@@ -1089,7 +1112,7 @@ mod tests {
 
         // Scan prefix for value=99
         let prefix = encode_integer_prefix(99);
-        let results = tree.scan_prefix(&prefix).unwrap();
+        let results = reader.scan_prefix(&prefix).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(extract_rowid(Type::Integer, &results[0]), 10);
     }
@@ -1097,27 +1120,33 @@ mod tests {
     #[test]
     fn test_index_tree_delete() {
         let tmp = NamedTempFile::new().unwrap();
-        let mut pf = PageFile::open(tmp.path()).unwrap();
-        let mut root = IndexTree::create(&mut pf).unwrap();
+        let pf = PageFile::open(tmp.path()).unwrap();
 
-        // Insert 3 keys
-        for rowid in 1..=3u64 {
-            let key = encode_index_key_integer(42, rowid);
-            let mut tree = IndexTree::new(&mut pf, root);
-            root = tree.insert(&key).unwrap();
-        }
-
-        // Delete middle key (rowid=2)
+        let mut root;
         {
-            let key = encode_index_key_integer(42, 2);
-            let mut tree = IndexTree::new(&mut pf, root);
-            assert!(tree.delete(&key).unwrap());
+            let mut guard = pf.begin_write();
+            root = IndexTreeWriter::create(&mut guard).unwrap();
+
+            // Insert 3 keys
+            for rowid in 1..=3u64 {
+                let key = encode_index_key_integer(42, rowid);
+                let mut tree = IndexTreeWriter::new(&mut guard, root);
+                root = tree.insert(&key).unwrap();
+            }
+
+            // Delete middle key (rowid=2)
+            {
+                let key = encode_index_key_integer(42, 2);
+                let mut tree = IndexTreeWriter::new(&mut guard, root);
+                assert!(tree.delete(&key).unwrap());
+            }
+            guard.commit(false).unwrap();
         }
 
         // Verify only 2 remain
         let prefix = encode_integer_prefix(42);
-        let mut tree = IndexTree::new(&mut pf, root);
-        let results = tree.scan_prefix(&prefix).unwrap();
+        let reader = IndexTreeReader::new(&pf, root);
+        let results = reader.scan_prefix(&prefix).unwrap();
         assert_eq!(results.len(), 2);
         assert_eq!(extract_rowid(Type::Integer, &results[0]), 1);
         assert_eq!(extract_rowid(Type::Integer, &results[1]), 3);
@@ -1126,33 +1155,46 @@ mod tests {
     #[test]
     fn test_index_tree_delete_nonexistent() {
         let tmp = NamedTempFile::new().unwrap();
-        let mut pf = PageFile::open(tmp.path()).unwrap();
-        let root = IndexTree::create(&mut pf).unwrap();
+        let pf = PageFile::open(tmp.path()).unwrap();
 
+        let root;
+        {
+            let mut guard = pf.begin_write();
+            root = IndexTreeWriter::create(&mut guard).unwrap();
+            guard.commit(false).unwrap();
+        }
+
+        let mut guard = pf.begin_write();
         let key = encode_index_key_integer(42, 1);
-        let mut tree = IndexTree::new(&mut pf, root);
+        let mut tree = IndexTreeWriter::new(&mut guard, root);
         assert!(!tree.delete(&key).unwrap());
+        guard.commit(false).unwrap();
     }
 
     #[test]
     fn test_index_tree_many_inserts_trigger_splits() {
         let tmp = NamedTempFile::new().unwrap();
-        let mut pf = PageFile::open(tmp.path()).unwrap();
-        let mut root = IndexTree::create(&mut pf).unwrap();
+        let pf = PageFile::open(tmp.path()).unwrap();
 
-        // Insert 200 keys — enough to trigger multiple splits.
-        for i in 0..200u64 {
-            let key = encode_index_key_integer(i as i64, i);
-            let mut tree = IndexTree::new(&mut pf, root);
-            root = tree.insert(&key).unwrap();
-            pf.flush().unwrap();
+        let mut root;
+        {
+            let mut guard = pf.begin_write();
+            root = IndexTreeWriter::create(&mut guard).unwrap();
+
+            // Insert 200 keys -- enough to trigger multiple splits.
+            for i in 0..200u64 {
+                let key = encode_index_key_integer(i as i64, i);
+                let mut tree = IndexTreeWriter::new(&mut guard, root);
+                root = tree.insert(&key).unwrap();
+            }
+            guard.commit(false).unwrap();
         }
 
         // Verify all keys are findable via scan_prefix
+        let reader = IndexTreeReader::new(&pf, root);
         for i in 0..200u64 {
             let prefix = encode_integer_prefix(i as i64);
-            let mut tree = IndexTree::new(&mut pf, root);
-            let results = tree.scan_prefix(&prefix).unwrap();
+            let results = reader.scan_prefix(&prefix).unwrap();
             assert_eq!(results.len(), 1, "missing key for value {i}");
             assert_eq!(extract_rowid(Type::Integer, &results[0]), i);
         }
@@ -1161,21 +1203,26 @@ mod tests {
     #[test]
     fn test_index_tree_many_same_value_inserts() {
         let tmp = NamedTempFile::new().unwrap();
-        let mut pf = PageFile::open(tmp.path()).unwrap();
-        let mut root = IndexTree::create(&mut pf).unwrap();
+        let pf = PageFile::open(tmp.path()).unwrap();
 
-        // 150 rows all with the same column value (42), different rowids
-        for rowid in 0..150u64 {
-            let key = encode_index_key_integer(42, rowid);
-            let mut tree = IndexTree::new(&mut pf, root);
-            root = tree.insert(&key).unwrap();
-            pf.flush().unwrap();
+        let mut root;
+        {
+            let mut guard = pf.begin_write();
+            root = IndexTreeWriter::create(&mut guard).unwrap();
+
+            // 150 rows all with the same column value (42), different rowids
+            for rowid in 0..150u64 {
+                let key = encode_index_key_integer(42, rowid);
+                let mut tree = IndexTreeWriter::new(&mut guard, root);
+                root = tree.insert(&key).unwrap();
+            }
+            guard.commit(false).unwrap();
         }
 
         // scan_prefix should return all 150
         let prefix = encode_integer_prefix(42);
-        let mut tree = IndexTree::new(&mut pf, root);
-        let results = tree.scan_prefix(&prefix).unwrap();
+        let reader = IndexTreeReader::new(&pf, root);
+        let results = reader.scan_prefix(&prefix).unwrap();
         assert_eq!(results.len(), 150);
 
         // Verify sorted by rowid
@@ -1187,27 +1234,34 @@ mod tests {
     #[test]
     fn test_index_tree_with_text_keys() {
         let tmp = NamedTempFile::new().unwrap();
-        let mut pf = PageFile::open(tmp.path()).unwrap();
-        let mut root = IndexTree::create(&mut pf).unwrap();
+        let pf = PageFile::open(tmp.path()).unwrap();
 
-        let words = ["apple", "banana", "cherry", "apple", "banana"];
-        for (rowid, word) in words.iter().enumerate() {
-            let key = encode_index_key_text(word, rowid as u64);
-            let mut tree = IndexTree::new(&mut pf, root);
-            root = tree.insert(&key).unwrap();
+        let mut root;
+        {
+            let mut guard = pf.begin_write();
+            root = IndexTreeWriter::create(&mut guard).unwrap();
+
+            let words = ["apple", "banana", "cherry", "apple", "banana"];
+            for (rowid, word) in words.iter().enumerate() {
+                let key = encode_index_key_text(word, rowid as u64);
+                let mut tree = IndexTreeWriter::new(&mut guard, root);
+                root = tree.insert(&key).unwrap();
+            }
+            guard.commit(false).unwrap();
         }
 
-        // Scan for "apple" — should get rowids 0, 3
+        let reader = IndexTreeReader::new(&pf, root);
+
+        // Scan for "apple" -- should get rowids 0, 3
         let prefix = encode_text_prefix("apple");
-        let mut tree = IndexTree::new(&mut pf, root);
-        let results = tree.scan_prefix(&prefix).unwrap();
+        let results = reader.scan_prefix(&prefix).unwrap();
         assert_eq!(results.len(), 2);
         assert_eq!(extract_rowid(Type::Text, &results[0]), 0);
         assert_eq!(extract_rowid(Type::Text, &results[1]), 3);
 
-        // Scan for "banana" — should get rowids 1, 4
+        // Scan for "banana" -- should get rowids 1, 4
         let prefix = encode_text_prefix("banana");
-        let results = tree.scan_prefix(&prefix).unwrap();
+        let results = reader.scan_prefix(&prefix).unwrap();
         assert_eq!(results.len(), 2);
         assert_eq!(extract_rowid(Type::Text, &results[0]), 1);
         assert_eq!(extract_rowid(Type::Text, &results[1]), 4);
@@ -1216,24 +1270,29 @@ mod tests {
     #[test]
     fn test_index_tree_text_many_inserts_trigger_splits() {
         let tmp = NamedTempFile::new().unwrap();
-        let mut pf = PageFile::open(tmp.path()).unwrap();
-        let mut root = IndexTree::create(&mut pf).unwrap();
+        let pf = PageFile::open(tmp.path()).unwrap();
 
-        // Insert 100 different text values.
-        for i in 0..100u64 {
-            let text = format!("item_{:04}", i);
-            let key = encode_index_key_text(&text, i);
-            let mut tree = IndexTree::new(&mut pf, root);
-            root = tree.insert(&key).unwrap();
-            pf.flush().unwrap();
+        let mut root;
+        {
+            let mut guard = pf.begin_write();
+            root = IndexTreeWriter::create(&mut guard).unwrap();
+
+            // Insert 100 different text values.
+            for i in 0..100u64 {
+                let text = format!("item_{:04}", i);
+                let key = encode_index_key_text(&text, i);
+                let mut tree = IndexTreeWriter::new(&mut guard, root);
+                root = tree.insert(&key).unwrap();
+            }
+            guard.commit(false).unwrap();
         }
 
         // Verify each is findable
+        let reader = IndexTreeReader::new(&pf, root);
         for i in 0..100u64 {
             let text = format!("item_{:04}", i);
             let prefix = encode_text_prefix(&text);
-            let mut tree = IndexTree::new(&mut pf, root);
-            let results = tree.scan_prefix(&prefix).unwrap();
+            let results = reader.scan_prefix(&prefix).unwrap();
             assert_eq!(results.len(), 1, "missing key for text {text}");
             assert_eq!(extract_rowid(Type::Text, &results[0]), i);
         }
@@ -1242,29 +1301,38 @@ mod tests {
     #[test]
     fn test_index_tree_delete_after_splits() {
         let tmp = NamedTempFile::new().unwrap();
-        let mut pf = PageFile::open(tmp.path()).unwrap();
-        let mut root = IndexTree::create(&mut pf).unwrap();
+        let pf = PageFile::open(tmp.path()).unwrap();
 
-        // Insert enough to cause splits
-        for i in 0..100u64 {
-            let key = encode_index_key_integer(i as i64, i);
-            let mut tree = IndexTree::new(&mut pf, root);
-            root = tree.insert(&key).unwrap();
-            pf.flush().unwrap();
+        let mut root;
+        {
+            let mut guard = pf.begin_write();
+            root = IndexTreeWriter::create(&mut guard).unwrap();
+
+            // Insert enough to cause splits
+            for i in 0..100u64 {
+                let key = encode_index_key_integer(i as i64, i);
+                let mut tree = IndexTreeWriter::new(&mut guard, root);
+                root = tree.insert(&key).unwrap();
+            }
+            guard.commit(false).unwrap();
         }
 
         // Delete every other key
-        for i in (0..100u64).step_by(2) {
-            let key = encode_index_key_integer(i as i64, i);
-            let mut tree = IndexTree::new(&mut pf, root);
-            assert!(tree.delete(&key).unwrap(), "should find key {i}");
+        {
+            let mut guard = pf.begin_write();
+            for i in (0..100u64).step_by(2) {
+                let key = encode_index_key_integer(i as i64, i);
+                let mut tree = IndexTreeWriter::new(&mut guard, root);
+                assert!(tree.delete(&key).unwrap(), "should find key {i}");
+            }
+            guard.commit(false).unwrap();
         }
 
         // Verify only odd keys remain
+        let reader = IndexTreeReader::new(&pf, root);
         for i in 0..100u64 {
             let prefix = encode_integer_prefix(i as i64);
-            let mut tree = IndexTree::new(&mut pf, root);
-            let results = tree.scan_prefix(&prefix).unwrap();
+            let results = reader.scan_prefix(&prefix).unwrap();
             if i % 2 == 0 {
                 assert_eq!(results.len(), 0, "key {i} should be deleted");
             } else {
@@ -1283,23 +1351,29 @@ mod tests {
     #[test]
     fn test_index_tree_real_keys_with_splits() {
         let tmp = NamedTempFile::new().unwrap();
-        let mut pf = PageFile::open(tmp.path()).unwrap();
-        let mut root = IndexTree::create(&mut pf).unwrap();
+        let pf = PageFile::open(tmp.path()).unwrap();
 
-        // Insert real-valued keys including negatives
-        let values: Vec<f64> = (-50..50).map(|i| i as f64 * 0.1).collect();
-        for (rowid, &val) in values.iter().enumerate() {
-            let key = encode_index_key_real(val, rowid as u64);
-            let mut tree = IndexTree::new(&mut pf, root);
-            root = tree.insert(&key).unwrap();
-            pf.flush().unwrap();
+        let mut root;
+        {
+            let mut guard = pf.begin_write();
+            root = IndexTreeWriter::create(&mut guard).unwrap();
+
+            // Insert real-valued keys including negatives
+            let values: Vec<f64> = (-50..50).map(|i| i as f64 * 0.1).collect();
+            for (rowid, &val) in values.iter().enumerate() {
+                let key = encode_index_key_real(val, rowid as u64);
+                let mut tree = IndexTreeWriter::new(&mut guard, root);
+                root = tree.insert(&key).unwrap();
+            }
+            guard.commit(false).unwrap();
         }
 
         // Verify each is findable
+        let reader = IndexTreeReader::new(&pf, root);
+        let values: Vec<f64> = (-50..50).map(|i| i as f64 * 0.1).collect();
         for (rowid, &val) in values.iter().enumerate() {
             let prefix = encode_real_prefix(val);
-            let mut tree = IndexTree::new(&mut pf, root);
-            let results = tree.scan_prefix(&prefix).unwrap();
+            let results = reader.scan_prefix(&prefix).unwrap();
             assert!(
                 !results.is_empty(),
                 "missing key for real value {val} (rowid {rowid})"
@@ -1318,67 +1392,89 @@ mod tests {
     #[test]
     fn test_count_prefix() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
-        let mut pf = PageFile::open(tmp.path()).unwrap();
-        let root = IndexTree::create(&mut pf).unwrap();
-        let mut tree = IndexTree::new(&mut pf, root);
+        let pf = PageFile::open(tmp.path()).unwrap();
 
-        for rowid in 1..=5u64 {
-            let key = encode_index_key_integer(42, rowid);
-            tree.insert(&key).unwrap();
-        }
-        for rowid in 1..=3u64 {
-            let key = encode_index_key_integer(99, rowid);
-            tree.insert(&key).unwrap();
+        let root;
+        {
+            let mut guard = pf.begin_write();
+            root = IndexTreeWriter::create(&mut guard).unwrap();
+            let mut tree = IndexTreeWriter::new(&mut guard, root);
+
+            for rowid in 1..=5u64 {
+                let key = encode_index_key_integer(42, rowid);
+                tree.insert(&key).unwrap();
+            }
+            for rowid in 1..=3u64 {
+                let key = encode_index_key_integer(99, rowid);
+                tree.insert(&key).unwrap();
+            }
+            guard.commit(false).unwrap();
         }
 
+        let reader = IndexTreeReader::new(&pf, root);
         let prefix_42 = encode_integer_prefix(42);
-        assert_eq!(tree.count_prefix(&prefix_42).unwrap(), 5);
+        assert_eq!(reader.count_prefix(&prefix_42).unwrap(), 5);
         let prefix_99 = encode_integer_prefix(99);
-        assert_eq!(tree.count_prefix(&prefix_99).unwrap(), 3);
+        assert_eq!(reader.count_prefix(&prefix_99).unwrap(), 3);
         let prefix_0 = encode_integer_prefix(0);
-        assert_eq!(tree.count_prefix(&prefix_0).unwrap(), 0);
+        assert_eq!(reader.count_prefix(&prefix_0).unwrap(), 0);
     }
 
     #[test]
     fn test_count_prefix_text() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
-        let mut pf = PageFile::open(tmp.path()).unwrap();
-        let root = IndexTree::create(&mut pf).unwrap();
-        let mut tree = IndexTree::new(&mut pf, root);
+        let pf = PageFile::open(tmp.path()).unwrap();
 
-        for rowid in 1..=10u64 {
-            tree.insert(&encode_index_key_text("alice", rowid)).unwrap();
-        }
-        for rowid in 1..=7u64 {
-            tree.insert(&encode_index_key_text("bob", rowid)).unwrap();
+        let root;
+        {
+            let mut guard = pf.begin_write();
+            root = IndexTreeWriter::create(&mut guard).unwrap();
+            let mut tree = IndexTreeWriter::new(&mut guard, root);
+
+            for rowid in 1..=10u64 {
+                tree.insert(&encode_index_key_text("alice", rowid)).unwrap();
+            }
+            for rowid in 1..=7u64 {
+                tree.insert(&encode_index_key_text("bob", rowid)).unwrap();
+            }
+            guard.commit(false).unwrap();
         }
 
-        assert_eq!(tree.count_prefix(&encode_text_prefix("alice")).unwrap(), 10);
-        assert_eq!(tree.count_prefix(&encode_text_prefix("bob")).unwrap(), 7);
-        assert_eq!(tree.count_prefix(&encode_text_prefix("charlie")).unwrap(), 0);
+        let reader = IndexTreeReader::new(&pf, root);
+        assert_eq!(reader.count_prefix(&encode_text_prefix("alice")).unwrap(), 10);
+        assert_eq!(reader.count_prefix(&encode_text_prefix("bob")).unwrap(), 7);
+        assert_eq!(reader.count_prefix(&encode_text_prefix("charlie")).unwrap(), 0);
     }
 
     #[test]
     fn test_scan_prefix_limit() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
-        let mut pf = PageFile::open(tmp.path()).unwrap();
-        let root = IndexTree::create(&mut pf).unwrap();
-        let mut tree = IndexTree::new(&mut pf, root);
+        let pf = PageFile::open(tmp.path()).unwrap();
 
-        for rowid in 1..=100u64 {
-            tree.insert(&encode_index_key_integer(42, rowid)).unwrap();
+        let root;
+        {
+            let mut guard = pf.begin_write();
+            root = IndexTreeWriter::create(&mut guard).unwrap();
+            let mut tree = IndexTreeWriter::new(&mut guard, root);
+
+            for rowid in 1..=100u64 {
+                tree.insert(&encode_index_key_integer(42, rowid)).unwrap();
+            }
+            guard.commit(false).unwrap();
         }
+
+        let reader = IndexTreeReader::new(&pf, root);
 
         // Limit to 5
         let prefix = encode_integer_prefix(42);
-        let results = tree.scan_prefix_limit(&prefix, 5).unwrap();
+        let results = reader.scan_prefix_limit(&prefix, 5).unwrap();
         assert_eq!(results.len(), 5);
         // Should be first 5 rowids
         assert_eq!(extract_rowid_integer(&results[0]), 1);
         assert_eq!(extract_rowid_integer(&results[4]), 5);
 
         // Limit higher than available
-        let results = tree.scan_prefix_limit(&prefix, 200).unwrap();
+        let results = reader.scan_prefix_limit(&prefix, 200).unwrap();
         assert_eq!(results.len(), 100);
     }
 }
