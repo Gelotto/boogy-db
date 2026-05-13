@@ -381,6 +381,9 @@ impl BoogyDb {
     /// Set the durability level for writes.
     pub fn set_durability(&self, d: Durability) {
         self.durability.store(d as u8, std::sync::atomic::Ordering::Relaxed);
+        if let Ok(mut file) = self.file.lock() {
+            file.set_capture_before_images(!matches!(d, Durability::None));
+        }
     }
 
     /// Get current durability level.
