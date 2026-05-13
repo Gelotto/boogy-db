@@ -23,10 +23,11 @@ A fast embedded storage engine for Rust, purpose-built for concurrent API worklo
 - **Secondary indexes** via composite-key B+ trees with O(log n) lookup and insert
 - **Concurrent readers** that never block each other or writers (lock-free read path via `Arc<Page>` cache)
 - **Per-table write locks** so writes to different tables are fully concurrent
-- **Write-ahead log** with configurable durability (immediate fsync, deferred, or none)
-- **Crash recovery** via WAL before-image replay on open
+- **Redo-log WAL** with configurable durability — commits write only to the WAL (one I/O per page), data file flushed on checkpoint
+- **Crash recovery** via WAL redo replay on open
 - **Lazy row decoding** that defers column extraction until access, avoiding allocation on the query hot path
 - **Zero-copy filter evaluation** that compares raw bytes on disk pages without decoding values
+- **Batch bulk operations** that walk the leaf chain once for delete/update instead of per-row tree surgery
 
 ## Quick Start
 
@@ -106,7 +107,7 @@ All benchmarks run on:
 Each benchmark shows boogy-db at two durability settings:
 
 - **None** — No WAL writes. Fastest mode. Data survives process crashes (OS page cache) but not power loss.
-- **Normal** — WAL before-images written on every commit, but not fsynced. Survives process crashes; may lose the last few milliseconds of writes on power loss. This is the production-realistic setting, comparable to SQLite's `synchronous=NORMAL`.
+- **Normal** — Redo-log WAL: after-images written on every commit, not fsynced. Data file updated on checkpoint (clean shutdown). Survives process crashes; may lose the last few milliseconds of writes on power loss. This is the production-realistic setting, comparable to SQLite's `synchronous=NORMAL`.
 
 SQLite runs at `PRAGMA synchronous=NORMAL` (WAL mode) in all tests.
 
@@ -116,10 +117,10 @@ Isolated insert and get operations at various table sizes. Each row has 3 column
 
 | Table Size | Insert (None) | Insert (Normal) | Get |
 |-----------|--------------|----------------|-----|
-| 100 rows | 494K/s (2.0 us) | 182K/s (5.5 us) | 5.2M/s (0.2 us) |
-| 1,000 rows | 515K/s (1.9 us) | 183K/s (5.5 us) | 5.3M/s (0.2 us) |
-| 5,000 rows | 506K/s (2.0 us) | 179K/s (5.6 us) | 5.0M/s (0.2 us) |
-| 10,000 rows | 503K/s (2.0 us) | 178K/s (5.6 us) | 4.1M/s (0.2 us) |
+| 100 rows | 439K/s (2.3 us) | 217K/s (4.6 us) | 5.3M/s (0.2 us) |
+| 1,000 rows | 449K/s (2.2 us) | 214K/s (4.7 us) | 5.2M/s (0.2 us) |
+| 5,000 rows | 444K/s (2.3 us) | 208K/s (4.8 us) | 4.5M/s (0.2 us) |
+| 10,000 rows | 441K/s (2.3 us) | 212K/s (4.7 us) | 4.0M/s (0.3 us) |
 
 Get performance is identical across durability modes (reads don't touch the WAL).
 
@@ -131,29 +132,29 @@ A realistic API workload: 30% inserts, 30% point reads, 25% filtered queries (eq
 
 | | boogy (None) | boogy (Normal) | SQLite | |
 |-|-------------|---------------|--------|-|
-| **Total ops/sec** | **20,972** | **20,898** | 11,732 | **1.78x** |
-| p50 latency | 2 us | 6 us | 8 us | |
-| p99 latency | 536 us | 519 us | 908 us | |
-| Insert | 6,248/s | 6,228/s | 3,530/s | |
-| Get | 6,301/s | 6,279/s | 3,506/s | |
-| Find (limit 20) | 5,233/s | 5,215/s | 2,921/s | |
-| Count | 3,190/s | 3,176/s | 1,776/s | |
+| **Total ops/sec** | **20,397** | **20,856** | 11,716 | **1.78x** |
+| p50 latency | 2 us | 5 us | 8 us | |
+| p99 latency | 548 us | 524 us | 910 us | |
+| Insert | 6,076/s | 6,217/s | 3,526/s | |
+| Get | 6,135/s | 6,266/s | 3,500/s | |
+| Find (limit 20) | 5,086/s | 5,205/s | 2,917/s | |
+| Count | 3,101/s | 3,168/s | 1,773/s | |
 
-Without indexes, the read-heavy workload dominates and WAL overhead has minimal impact. boogy-db is ~1.78x faster at both durability levels.
+Without indexes, reads dominate the workload and WAL overhead is negligible. boogy-db is ~1.78x faster at both durability levels.
 
 **With secondary index** on the filter column:
 
 | | boogy (None) | boogy (Normal) | SQLite | |
 |-|-------------|---------------|--------|-|
-| **Total ops/sec** | **95,205** | **79,626** | 39,982 | **1.99x** |
-| p50 latency | 5 us | 6 us | 11 us | |
-| p99 latency | 84 us | 71 us | 203 us | |
-| Insert | 28,399/s | 23,774/s | 11,901/s | |
-| Get | 28,644/s | 23,933/s | 12,007/s | |
-| Find (limit 20) | 23,763/s | 19,864/s | 9,995/s | |
-| Count | 14,400/s | 12,055/s | 6,078/s | |
+| **Total ops/sec** | **92,723** | **82,952** | 39,570 | **2.10x** |
+| p50 latency | 6 us | 6 us | 10 us | |
+| p99 latency | 85 us | 75 us | 203 us | |
+| Insert | 27,665/s | 24,759/s | 11,772/s | |
+| Get | 27,913/s | 24,935/s | 11,877/s | |
+| Find (limit 20) | 23,132/s | 20,683/s | 9,897/s | |
+| Count | 14,012/s | 12,576/s | 6,023/s | |
 
-With indexes, Normal durability introduces WAL overhead on the higher insert throughput, reducing from 2.38x to 1.99x vs SQLite. Still nearly 2x faster.
+With indexes, Normal durability is 2.10x faster than SQLite. The redo-log WAL keeps the None-to-Normal gap small (~10%) by writing only to the WAL, never to the data file during commits.
 
 ### Mixed Workload (Concurrent)
 
@@ -163,19 +164,19 @@ Same workload distributed across multiple threads hitting the same table simulta
 
 | Threads | boogy (None) | boogy (Normal) | SQLite | |
 |---------|-------------|---------------|--------|-|
-| 1 | **21,246** | **21,184** | 11,580 | 1.83x |
-| 2 | **22,112** | **21,380** | 15,340 | 1.39x |
-| 4 | **23,967** | **23,731** | 19,707 | 1.20x |
-| 8 | **26,247** | **26,290** | 21,878 | 1.20x |
+| 1 | **20,956** | **20,903** | 11,460 | 1.82x |
+| 2 | **22,122** | **21,660** | 15,237 | 1.42x |
+| 4 | **23,570** | **23,654** | 19,285 | 1.23x |
+| 8 | **26,271** | **26,440** | 21,823 | 1.21x |
 
 **With secondary index:**
 
 | Threads | boogy (None) | boogy (Normal) | SQLite | |
 |---------|-------------|---------------|--------|-|
-| 1 | **94,397** | **78,832** | 39,302 | 2.01x |
-| 2 | **98,571** | **78,821** | 42,058 | 1.87x |
-| 4 | **104,463** | **80,636** | 47,269 | 1.71x |
-| 8 | **114,585** | **80,496** | 47,729 | 1.69x |
+| 1 | **95,450** | **85,054** | 39,296 | 2.16x |
+| 2 | **96,317** | **85,686** | 42,101 | 2.04x |
+| 4 | **103,643** | **89,533** | 46,007 | 1.95x |
+| 8 | **109,451** | **90,447** | 48,006 | 1.88x |
 
 Readers operate on a shared page cache without blocking each other or writers. The ratio column compares Normal (the production-realistic mode) against SQLite.
 
@@ -187,13 +188,13 @@ boogy-db performs this as two separate calls (`get` for the user + `find` with f
 
 | Configuration | boogy (None) | boogy (Normal) | SQLite | |
 |---|---|---|---|---|
-| No index, 1 thread | **2,402 q/s** | **2,339 q/s** | 741 q/s | 3.16x |
-| With index, 1 thread | **66,418 q/s** | **66,283 q/s** | 42,874 q/s | 1.55x |
-| With index, no sort | **473,413 q/s** | **463,180 q/s** | 157,134 q/s | 2.95x |
-| With index, 4 threads | **157,812 q/s** | **161,155 q/s** | 120,416 q/s | 1.34x |
-| With index, 8 threads | **167,231 q/s** | **201,428 q/s** | 122,736 q/s | 1.64x |
+| No index, 1 thread | **2,384 q/s** | **2,389 q/s** | 715 q/s | 3.34x |
+| With index, 1 thread | **65,671 q/s** | **65,543 q/s** | 43,444 q/s | 1.51x |
+| With index, no sort | **456,755 q/s** | **460,988 q/s** | 155,505 q/s | 2.96x |
+| With index, 4 threads | **157,930 q/s** | **161,514 q/s** | 123,131 q/s | 1.31x |
+| With index, 8 threads | **262,223 q/s** | **184,386 q/s** | 124,978 q/s | 1.47x |
 
-The "no sort" row shows performance when fetching any 5 posts without ordering, isolating the cost of application-side sorting. The sorted rows are the realistic case — boogy-db is 1.55x faster despite doing two separate queries and application-side sorting while SQLite uses its native query planner with a single JOIN.
+The "no sort" row shows performance when fetching any 5 posts without ordering, isolating the cost of application-side sorting. The sorted rows are the realistic case — boogy-db is 1.51x faster despite doing two separate queries and application-side sorting while SQLite uses its native query planner with a single JOIN.
 
 ### Bulk Operations
 
@@ -203,45 +204,45 @@ Batch insert, update, and delete operations. Bulk insert uses `insert_many` (boo
 
 | Batch Size | boogy (None) | boogy (Normal) | SQLite | |
 |-----------|-------------|---------------|--------|-|
-| 100 | **834K r/s** | **926K r/s** | 523K r/s | 1.77x |
-| 1,000 | **738K r/s** | **744K r/s** | 561K r/s | 1.33x |
-| 10,000 | **688K r/s** | **697K r/s** | 576K r/s | 1.21x |
-| 50,000 | 578K r/s | 569K r/s | **572K r/s** | 1.00x |
+| 100 | **820K r/s** | **907K r/s** | 526K r/s | 1.72x |
+| 1,000 | **673K r/s** | **676K r/s** | 557K r/s | 1.21x |
+| 10,000 | **657K r/s** | **650K r/s** | 569K r/s | 1.14x |
+| 50,000 | 547K r/s | 546K r/s | **579K r/s** | 0.94x |
 
 **Bulk Insert with Index** on one column:
 
 | Batch Size | boogy (None) | boogy (Normal) | SQLite | |
 |-----------|-------------|---------------|--------|-|
-| 100 | **481K r/s** | **436K r/s** | 436K r/s | 1.00x |
-| 1,000 | 318K r/s | 325K r/s | **430K r/s** | 0.76x |
-| 10,000 | 274K r/s | 266K r/s | **401K r/s** | 0.66x |
-| 50,000 | 210K r/s | 208K r/s | **385K r/s** | 0.54x |
+| 100 | 434K r/s | **465K r/s** | 443K r/s | 1.05x |
+| 1,000 | 324K r/s | 320K r/s | **437K r/s** | 0.73x |
+| 10,000 | 269K r/s | 262K r/s | **406K r/s** | 0.65x |
+| 50,000 | 208K r/s | 202K r/s | **391K r/s** | 0.52x |
 
 **Bulk Update** (`update_where` vs `UPDATE ... WHERE`, 10K-row table):
 
 | Rows Affected | boogy (None) | boogy (Normal) | SQLite | |
 |---|---|---|---|---|
-| ~1,000 | 839K r/s | 462K r/s | **1.07M r/s** | 0.43x |
-| ~2,000 | 886K r/s | 408K r/s | **1.04M r/s** | 0.39x |
+| ~1,000 | **1.1M r/s** | 705K r/s | **1.03M r/s** | 0.68x |
+| ~2,000 | **1.1M r/s** | 679K r/s | **1.00M r/s** | 0.68x |
 
 **Bulk Delete** (`delete_where` vs `DELETE ... WHERE`, 10K-row table):
 
 | Rows Deleted | boogy (None) | boogy (Normal) | SQLite | |
 |---|---|---|---|---|
-| ~1,000 | **3.6M r/s** | **2.7M r/s** | 1.5M r/s | 1.79x |
-| ~5,000 | **4.2M r/s** | **3.4M r/s** | **5.8M r/s** | 0.59x |
-| ~9,000 | **9.3M r/s** | **4.8M r/s** | **7.7M r/s** | 0.63x |
+| ~1,000 | **3.4M r/s** | **2.9M r/s** | 2.2M r/s | 1.34x |
+| ~5,000 | **7.4M r/s** | **5.5M r/s** | 5.9M r/s | 0.93x |
+| ~9,000 | **9.0M r/s** | **6.2M r/s** | 7.4M r/s | 0.84x |
 
-boogy-db wins on small-to-medium bulk inserts and now beats SQLite on small-batch bulk deletes (1.79x at ~1,000 rows). Bulk update closed the gap significantly, from 0.21x to 0.43x (Normal durability vs SQLite), though SQLite still leads there due to its in-place row modification. Indexed bulk inserts also favor SQLite at scale due to tighter C-level index maintenance. Bulk update remains the main area for future optimization.
+boogy-db wins on bulk inserts up to ~50K rows and on small-batch bulk deletes. Bulk update with Normal durability trails SQLite at ~0.68x — the per-page WAL write overhead compounds across the ~25 leaf pages touched. With None durability, bulk update beats SQLite (1.1M vs 1.03M). Indexed bulk inserts favor SQLite at scale due to tighter C-level index maintenance.
 
 ## Architecture
 
 - **Storage**: Single file per database, 4 KB page-aligned. Page 0 is the system page (table registry). Each table is a separate B+ tree.
-- **Row format**: `[rowid:8][num_cols:2][offset_directory][column_data]`. The offset directory enables O(1) column access by ID via binary search.
-- **B+ tree**: u64 integer keys with fixed 12-byte branch entries (`[child:4][key:8]`). Leaf pages store rows inline with a row-offset array.
+- **Row format**: `[rowid:8][num_cols:2][offset_directory][column_data]`. The offset directory enables O(1) column access by ID via binary search. Updates use `patch_row` to splice raw bytes without full decode.
+- **B+ tree**: u64 integer keys with fixed 12-byte branch entries (`[child:4][key:8]`). Leaf pages store rows inline with a row-offset array. Bulk operations walk the leaf chain for batch page rebuilds.
 - **Indexes**: Each secondary index is a separate B+ tree keyed by composite `(encoded_value, rowid)` bytes. Values are encoded for correct byte-order sorting (integers: big-endian with sign-flip; floats: IEEE 754 with sign normalization; text: null-terminated UTF-8).
-- **Concurrency**: Per-table `RwLock` for table metadata. Page cache uses `RwLock<Vec<Option<Arc<Page>>>>` so readers clone `Arc` pointers without blocking. Writers get exclusive access to a dirty-page overlay via `WriteGuard`.
-- **WAL**: Before-image undo log. On crash, original pages are restored from the WAL. Configurable durability: `Immediate` (fsync every commit), `Normal` (WAL writes without fsync), `None` (no WAL writes).
+- **Concurrency**: Per-table `RwLock` for table metadata. Page cache uses `RwLock<Vec<Option<Arc<Page>>>>` so readers clone `Arc` pointers without blocking. Writers get exclusive access to a dirty-page overlay via `WriteGuard`. BTreeReader/IndexTreeReader take `&PageFile` for lock-free reads.
+- **WAL**: Redo-log (after-image) design. Commits write new page data to the WAL only — the data file is never modified during commits. On clean shutdown, all cached pages are flushed to the data file and the WAL is truncated. On crash recovery, the WAL is replayed forward to apply committed changes. Configurable durability: `Immediate` (fsync WAL every commit), `Normal` (WAL writes without fsync), `None` (no WAL writes).
 
 ## License
 
