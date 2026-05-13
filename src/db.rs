@@ -763,7 +763,7 @@ impl BoogyDb {
         match result {
             Some(bytes) => {
                 let decoded = row::decode_row(&bytes)?;
-                Ok(Some(decoded_to_row(&decoded, &state.meta)))
+                Ok(Some(decoded_to_row(decoded, &state.meta)))
             }
             None => Ok(None),
         }
@@ -962,7 +962,7 @@ impl BoogyDb {
             let mut rows = Vec::with_capacity(raw_rows.len());
             for bytes in &raw_rows {
                 let decoded = row::decode_row(bytes)?;
-                let row = decoded_to_row(&decoded, &state.meta);
+                let row = decoded_to_row(decoded, &state.meta);
                 if has_extra_filters {
                     let passes = opts.filters.iter().all(|f| {
                         let col_val = row
@@ -1032,7 +1032,7 @@ impl BoogyDb {
                 let matching: Vec<Row> = raw_rows.iter()
                     .map(|(_, bytes)| {
                         let decoded = row::decode_row(bytes).unwrap();
-                        decoded_to_row(&decoded, &state.meta)
+                        decoded_to_row(decoded, &state.meta)
                     })
                     .collect();
                 let total = if opts.include_total { Some(count) } else { None };
@@ -1056,7 +1056,7 @@ impl BoogyDb {
             let matching: Vec<Row> = all.iter()
                 .map(|(_, bytes)| {
                     let decoded = row::decode_row(bytes).unwrap();
-                    decoded_to_row(&decoded, &state.meta)
+                    decoded_to_row(decoded, &state.meta)
                 })
                 .collect();
             (matching, total)
@@ -1069,7 +1069,7 @@ impl BoogyDb {
             let mut matching = Vec::new();
             for (_, bytes) in &all {
                 let decoded = row::decode_row(bytes)?;
-                let row = decoded_to_row(&decoded, &state.meta);
+                let row = decoded_to_row(decoded, &state.meta);
                 let passes = opts.filters.iter().all(|f| {
                     let col_val = row.columns.iter().find(|(name, _)| name == &f.column).map(|(_, v)| v);
                     match col_val {
@@ -1184,7 +1184,7 @@ impl BoogyDb {
         let mut count = 0u64;
         for (_, bytes) in &all {
             let decoded = row::decode_row(bytes)?;
-            let row = decoded_to_row(&decoded, &state.meta);
+            let row = decoded_to_row(decoded, &state.meta);
             let passes = filters.iter().all(|f| {
                 let col_val = row.columns.iter().find(|(name, _)| name == &f.column).map(|(_, v)| v);
                 match col_val {
@@ -1354,7 +1354,15 @@ impl BoogyDb {
             let mut to_update: Vec<(u64, HashMap<u16, Value>, Vec<u8>)> = Vec::new();
             for (_, bytes) in &candidates {
                 let decoded = row::decode_row(bytes)?;
-                let row = decoded_to_row(&decoded, &state.meta);
+                let rowid = decoded.id;
+                let old_col_map: HashMap<u16, Value> = decoded.columns.into_iter().collect();
+                let row = Row {
+                    id: rowid,
+                    columns: old_col_map.iter().filter_map(|(col_id, val)| {
+                        state.meta.columns.get(*col_id as usize)
+                            .map(|def| (def.name.clone(), val.clone()))
+                    }).collect(),
+                };
 
                 let passes = filters.iter().all(|f| {
                     let col_val = row
@@ -1369,8 +1377,7 @@ impl BoogyDb {
                 });
 
                 if passes {
-                    let old_col_map: HashMap<u16, Value> = decoded.columns.into_iter().collect();
-                    to_update.push((decoded.id, old_col_map, bytes.clone()));
+                    to_update.push((rowid, old_col_map, bytes.clone()));
                 }
             }
 
@@ -1442,7 +1449,8 @@ impl BoogyDb {
             let mut to_delete: Vec<(u64, Vec<u8>)> = Vec::new();
             for (_, bytes) in &candidates {
                 let decoded = row::decode_row(bytes)?;
-                let row = decoded_to_row(&decoded, &state.meta);
+                let rowid = decoded.id;
+                let row = decoded_to_row(decoded, &state.meta);
 
                 let passes = filters.iter().all(|f| {
                     let col_val = row
@@ -1457,7 +1465,7 @@ impl BoogyDb {
                 });
 
                 if passes {
-                    to_delete.push((decoded.id, bytes.clone()));
+                    to_delete.push((rowid, bytes.clone()));
                 }
             }
 
@@ -1587,14 +1595,14 @@ impl<'a> TransactionCtx<'a> {
     }
 }
 
-fn decoded_to_row(decoded: &row::DecodedRow, meta: &TableMeta) -> Row {
+fn decoded_to_row(decoded: row::DecodedRow, meta: &TableMeta) -> Row {
     let columns: Vec<(String, Value)> = decoded
         .columns
-        .iter()
+        .into_iter()
         .filter_map(|(col_id, val)| {
             meta.columns
-                .get(*col_id as usize)
-                .map(|def| (def.name.clone(), val.clone()))
+                .get(col_id as usize)
+                .map(|def| (def.name.clone(), val))  // move val, don't clone
         })
         .collect();
     Row {
