@@ -25,6 +25,8 @@ pub struct TableMeta {
     pub root_page: u32,
     /// Number of rows (maintained by insert/delete).
     pub row_count: u64,
+    /// Next rowid to assign on insert.
+    pub next_rowid: u64,
     /// Secondary indexes on this table.
     pub indexes: Vec<IndexMeta>,
 }
@@ -43,6 +45,7 @@ impl TableMeta {
             col_name_to_id,
             root_page,
             row_count: 0,
+            next_rowid: 1,
             indexes: Vec::new(),
         }
     }
