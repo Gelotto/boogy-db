@@ -159,6 +159,14 @@ impl Page {
     }
 }
 
+impl Page {
+    /// Construct a page from raw bytes without validation.
+    /// Used during WAL recovery to restore before-images.
+    pub fn from_bytes_unchecked(data: [u8; PAGE_SIZE]) -> Self {
+        Self { data }
+    }
+}
+
 impl Default for Page {
     fn default() -> Self {
         Self { data: [0; PAGE_SIZE] }

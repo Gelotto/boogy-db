@@ -15,6 +15,9 @@ pub struct PageFile {
     cache: HashMap<u32, Page>,
     /// Pages modified since last flush.
     dirty: HashMap<u32, Page>,
+    /// Before-images of pages captured when they first become dirty.
+    /// Keyed by page_no. Only present for pages that existed on disk.
+    before_images: HashMap<u32, [u8; PAGE_SIZE]>,
 }
 
 impl PageFile {
@@ -35,6 +38,7 @@ impl PageFile {
             num_pages,
             cache: HashMap::new(),
             dirty: HashMap::new(),
+            before_images: HashMap::new(),
         })
     }
 
@@ -61,6 +65,7 @@ impl PageFile {
     }
 
     /// Get a mutable reference to a page. Marks it dirty.
+    /// Captures a before-image of the original page data for WAL use.
     pub fn write_page(&mut self, page_no: u32) -> Result<&mut Page> {
         if !self.dirty.contains_key(&page_no) {
             // Copy from cache or disk into dirty set
@@ -73,6 +78,10 @@ impl PageFile {
                     "page {page_no} out of range"
                 )));
             };
+            // Capture before-image for existing pages (not newly allocated).
+            if !self.before_images.contains_key(&page_no) {
+                self.before_images.insert(page_no, page.data);
+            }
             self.dirty.insert(page_no, page);
         }
         Ok(self.dirty.get_mut(&page_no).unwrap())
@@ -88,8 +97,24 @@ impl PageFile {
         Ok(page_no)
     }
 
-    /// Write a new page at a specific page number (for initialization).
+    /// Write a page at a specific page number.
+    /// If the page already exists, captures a before-image for WAL use.
     pub fn put_page(&mut self, page_no: u32, page: Page) {
+        // Capture before-image if this is an existing page being overwritten.
+        if page_no < self.num_pages && !self.before_images.contains_key(&page_no) {
+            // Get original from dirty (already modified), cache, or we skip
+            // (reading from disk here would require Result return type).
+            if let Some(dirty_page) = self.dirty.get(&page_no) {
+                // Already dirty -- the original before-image should have been
+                // captured when it first became dirty via write_page.
+                let _ = dirty_page;
+            } else if let Some(cached) = self.cache.get(&page_no) {
+                self.before_images.insert(page_no, cached.data);
+            }
+            // Note: if the page is on disk but not cached, we skip before-image.
+            // The caller (db.rs commit_with_wal) will read it from disk if needed.
+            // In practice, page 0 will always be cached after first open.
+        }
         if page_no >= self.num_pages {
             self.num_pages = page_no + 1;
         }
@@ -108,6 +133,8 @@ impl PageFile {
         for (page_no, page) in self.dirty.drain() {
             self.cache.insert(page_no, page);
         }
+        // Clear before-images after successful flush
+        self.before_images.clear();
         Ok(())
     }
 
@@ -121,6 +148,13 @@ impl PageFile {
     /// Discard all dirty pages (rollback).
     pub fn discard_dirty(&mut self) {
         self.dirty.clear();
+        self.before_images.clear();
+    }
+
+    /// Take all captured before-images, clearing the internal buffer.
+    /// Returns (page_no, original_page_data) pairs.
+    pub fn take_before_images(&mut self) -> Vec<(u32, [u8; PAGE_SIZE])> {
+        self.before_images.drain().collect()
     }
 
     /// Number of pages in the file.

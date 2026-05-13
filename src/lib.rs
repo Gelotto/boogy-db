@@ -12,4 +12,4 @@ pub mod db;
 pub use error::{BoogyError, Result};
 pub use value::{ColumnDef, Type, Value};
 pub use filter::{Filter, FilterOp, FindOptions, Sort, SortDir};
-pub use db::{BoogyDb, Row};
+pub use db::{BoogyDb, Durability, Row};
