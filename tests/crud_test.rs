@@ -471,6 +471,152 @@ fn test_valid_path_accepted() {
     assert!(BoogyDb::open(&path).is_ok());
 }
 
+// --- Security: null byte in path ---
+
+#[test]
+fn test_null_byte_in_path_rejected() {
+    // std::path::Path handles this at the OS level -- paths with null bytes
+    // will either be rejected by the OS or by our validate_path function.
+    let result = BoogyDb::open("/tmp/test\0evil.boogy");
+    assert!(result.is_err(), "null byte in path should be rejected");
+}
+
+// --- Security: empty table name ---
+
+#[test]
+fn test_empty_table_name() {
+    let (db, _dir) = create_db();
+    // Empty table name -- should work at the API level but is weird
+    let result = db.create_table("", &[ColumnDef::new("v", Type::Integer)]);
+    // The API doesn't explicitly reject empty names but it should work without panicking
+    if result.is_ok() {
+        db.insert("", &[("v", Value::Integer(1))]).unwrap();
+        assert_eq!(db.count("", &[]).unwrap(), 1);
+    }
+}
+
+// --- Security: insert into nonexistent table ---
+
+#[test]
+fn test_insert_nonexistent_table_returns_error() {
+    let (db, _dir) = create_db();
+    let result = db.insert("does_not_exist", &[("v", Value::Integer(1))]);
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_get_nonexistent_table_returns_error() {
+    let (db, _dir) = create_db();
+    assert!(db.get("does_not_exist", 1).is_err());
+}
+
+#[test]
+fn test_delete_nonexistent_table_returns_error() {
+    let (db, _dir) = create_db();
+    assert!(db.delete("does_not_exist", 1).is_err());
+}
+
+#[test]
+fn test_update_nonexistent_table_returns_error() {
+    let (db, _dir) = create_db();
+    assert!(db.update("does_not_exist", 1, &[]).is_err());
+}
+
+#[test]
+fn test_count_nonexistent_table_returns_error() {
+    let (db, _dir) = create_db();
+    assert!(db.count("does_not_exist", &[]).is_err());
+}
+
+#[test]
+fn test_find_nonexistent_table_returns_error() {
+    let (db, _dir) = create_db();
+    assert!(db.find("does_not_exist", FindOptions::default()).is_err());
+}
+
+// --- Security: very large column values ---
+
+#[test]
+fn test_large_text_value_no_crash() {
+    let (db, _dir) = create_db();
+    db.create_table("t", &[ColumnDef::new("v", Type::Text)])
+        .unwrap();
+
+    // Text value near page capacity (~3500 bytes fits in a page with header overhead).
+    // Row layout: rowid(8) + num_cols(2) + offset_dir(4) + tag(1) + len(4) + text_bytes
+    // Max usable per row in a page ≈ 4096 - 16(header) - 2(offset_array) - 4(checksum) = 4074
+    let big_text = "x".repeat(3500);
+    let id = db
+        .insert("t", &[("v", Value::Text(big_text.clone()))])
+        .unwrap();
+    let row = db.get("t", id).unwrap().unwrap();
+    let retrieved = row.get("v").unwrap();
+    if let Value::Text(s) = retrieved {
+        assert_eq!(s.len(), 3500);
+    } else {
+        panic!("expected Text value");
+    }
+}
+
+#[test]
+fn test_large_blob_value_no_crash() {
+    let (db, _dir) = create_db();
+    db.create_table("t", &[ColumnDef::new("v", Type::Blob)])
+        .unwrap();
+
+    let big_blob = vec![0xABu8; 3500];
+    let id = db
+        .insert("t", &[("v", Value::Blob(big_blob.clone()))])
+        .unwrap();
+    let row = db.get("t", id).unwrap().unwrap();
+    let retrieved = row.get("v").unwrap();
+    if let Value::Blob(b) = retrieved {
+        assert_eq!(b.len(), 3500);
+    } else {
+        panic!("expected Blob value");
+    }
+}
+
+// --- Security: many columns ---
+
+#[test]
+fn test_many_columns_no_crash() {
+    let (db, _dir) = create_db();
+    let cols: Vec<ColumnDef> = (0..100)
+        .map(|i| ColumnDef::new(format!("col_{i}"), Type::Integer))
+        .collect();
+    db.create_table("t", &cols).unwrap();
+
+    // Insert a row with all columns set
+    let data: Vec<(&str, Value)> = cols
+        .iter()
+        .enumerate()
+        .map(|(i, c)| (c.name.as_str(), Value::Integer(i as i64)))
+        .collect();
+    let id = db.insert("t", &data).unwrap();
+
+    let row = db.get("t", id).unwrap().unwrap();
+    assert_eq!(row.get("col_0").unwrap(), Value::Integer(0));
+    assert_eq!(row.get("col_99").unwrap(), Value::Integer(99));
+}
+
+// --- Security: integer overflow / boundary rowid ---
+
+#[test]
+fn test_insert_with_max_rowid() {
+    let (db, _dir) = create_db();
+    db.create_table("t", &[ColumnDef::new("v", Type::Integer)])
+        .unwrap();
+
+    // Insert with a very large rowid
+    db.insert_with_id("t", u64::MAX - 1, &[("v", Value::Integer(42))])
+        .unwrap();
+
+    let row = db.get("t", u64::MAX - 1).unwrap().unwrap();
+    assert_eq!(row.id, u64::MAX - 1);
+    assert_eq!(row.get("v").unwrap(), Value::Integer(42));
+}
+
 // --- Bulk operation tests ---
 
 #[test]
@@ -571,4 +717,525 @@ fn test_delete_where_with_index() {
     assert_eq!(deleted, 10);
     assert_eq!(db.count("t", &[]).unwrap(), 40);
     assert_eq!(db.count("t", &[Filter::eq("v", "val_2")]).unwrap(), 0);
+}
+
+// ===========================================================================
+// Durability / Recovery tests
+// ===========================================================================
+
+#[test]
+fn test_durability_normal_persists_across_reopen() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("test.boogy");
+    {
+        let db = BoogyDb::open(&path).unwrap();
+        db.set_durability(Durability::Normal);
+        db.create_table(
+            "t",
+            &[
+                ColumnDef::new("name", Type::Text),
+                ColumnDef::new("age", Type::Integer),
+            ],
+        )
+        .unwrap();
+        db.insert(
+            "t",
+            &[
+                ("name", Value::Text("alice".into())),
+                ("age", Value::Integer(30)),
+            ],
+        )
+        .unwrap();
+        db.insert(
+            "t",
+            &[
+                ("name", Value::Text("bob".into())),
+                ("age", Value::Integer(25)),
+            ],
+        )
+        .unwrap();
+        // Drop triggers clean shutdown with flush
+    }
+    {
+        let db = BoogyDb::open(&path).unwrap();
+        assert_eq!(db.count("t", &[]).unwrap(), 2);
+        let row = db.get("t", 1).unwrap().unwrap();
+        assert_eq!(row.get("name").unwrap(), Value::Text("alice".into()));
+        assert_eq!(row.get("age").unwrap(), Value::Integer(30));
+    }
+}
+
+#[test]
+fn test_durability_immediate_persists_across_reopen() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("test.boogy");
+    {
+        let db = BoogyDb::open(&path).unwrap();
+        db.set_durability(Durability::Immediate);
+        db.create_table("t", &[ColumnDef::new("v", Type::Integer)])
+            .unwrap();
+        for i in 0..10 {
+            db.insert("t", &[("v", Value::Integer(i))]).unwrap();
+        }
+    }
+    {
+        let db = BoogyDb::open(&path).unwrap();
+        assert_eq!(db.count("t", &[]).unwrap(), 10);
+        for i in 1..=10u64 {
+            let row = db.get("t", i).unwrap().unwrap();
+            assert_eq!(row.get("v").unwrap(), Value::Integer(i as i64 - 1));
+        }
+    }
+}
+
+#[test]
+fn test_durability_none_no_crash_on_reopen() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("test.boogy");
+    {
+        let db = BoogyDb::open(&path).unwrap();
+        db.set_durability(Durability::None);
+        db.create_table("t", &[ColumnDef::new("v", Type::Integer)])
+            .unwrap();
+        db.insert("t", &[("v", Value::Integer(1))]).unwrap();
+        // Data may or may not persist with Durability::None, but reopen must not crash
+    }
+    {
+        // This must not crash regardless of what was flushed
+        let _db = BoogyDb::open(&path).unwrap();
+        // We don't assert the count because Durability::None makes no guarantees
+    }
+}
+
+#[test]
+fn test_index_data_persists_across_reopen() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("test.boogy");
+    {
+        let db = BoogyDb::open(&path).unwrap();
+        db.create_table("t", &[ColumnDef::new("category", Type::Text)])
+            .unwrap();
+        db.create_index("t", "idx_category", "category").unwrap();
+        for i in 0..50 {
+            db.insert(
+                "t",
+                &[("category", Value::Text(format!("cat_{}", i % 5)))],
+            )
+            .unwrap();
+        }
+    }
+    {
+        let db = BoogyDb::open(&path).unwrap();
+        // Index should still be usable for queries
+        let count = db
+            .count("t", &[Filter::eq("category", "cat_3")])
+            .unwrap();
+        assert_eq!(count, 10);
+
+        // Find via index path
+        let result = db
+            .find(
+                "t",
+                FindOptions {
+                    filters: vec![Filter::eq("category", "cat_0")],
+                    include_total: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(result.total, Some(10));
+        assert_eq!(result.rows.len(), 10);
+    }
+}
+
+#[test]
+fn test_multiple_reopen_cycles_with_writes() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("test.boogy");
+
+    // Cycle 1: create table and insert
+    {
+        let db = BoogyDb::open(&path).unwrap();
+        db.create_table("t", &[ColumnDef::new("v", Type::Integer)])
+            .unwrap();
+        for i in 0..10 {
+            db.insert("t", &[("v", Value::Integer(i))]).unwrap();
+        }
+    }
+
+    // Cycle 2: reopen, verify, insert more
+    {
+        let db = BoogyDb::open(&path).unwrap();
+        assert_eq!(db.count("t", &[]).unwrap(), 10);
+        for i in 10..20 {
+            db.insert("t", &[("v", Value::Integer(i))]).unwrap();
+        }
+    }
+
+    // Cycle 3: reopen, verify, delete some
+    {
+        let db = BoogyDb::open(&path).unwrap();
+        assert_eq!(db.count("t", &[]).unwrap(), 20);
+        db.delete("t", 1).unwrap();
+        db.delete("t", 2).unwrap();
+    }
+
+    // Cycle 4: reopen, verify, update
+    {
+        let db = BoogyDb::open(&path).unwrap();
+        assert_eq!(db.count("t", &[]).unwrap(), 18);
+        db.update("t", 3, &[("v", Value::Integer(999))]).unwrap();
+    }
+
+    // Cycle 5: final verification
+    {
+        let db = BoogyDb::open(&path).unwrap();
+        assert_eq!(db.count("t", &[]).unwrap(), 18);
+        let row = db.get("t", 3).unwrap().unwrap();
+        assert_eq!(row.get("v").unwrap(), Value::Integer(999));
+        // Deleted rows should be gone
+        assert!(db.get("t", 1).unwrap().is_none());
+        assert!(db.get("t", 2).unwrap().is_none());
+    }
+}
+
+#[test]
+fn test_reopen_preserves_multiple_tables_and_indexes() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("test.boogy");
+    {
+        let db = BoogyDb::open(&path).unwrap();
+        db.create_table(
+            "users",
+            &[
+                ColumnDef::new("name", Type::Text),
+                ColumnDef::new("email", Type::Text),
+            ],
+        )
+        .unwrap();
+        db.create_table(
+            "posts",
+            &[
+                ColumnDef::new("title", Type::Text),
+                ColumnDef::new("author_id", Type::Integer),
+            ],
+        )
+        .unwrap();
+        db.create_index("users", "idx_name", "name").unwrap();
+        db.create_index("posts", "idx_author", "author_id").unwrap();
+
+        db.insert(
+            "users",
+            &[
+                ("name", Value::Text("alice".into())),
+                ("email", Value::Text("alice@example.com".into())),
+            ],
+        )
+        .unwrap();
+        db.insert(
+            "posts",
+            &[
+                ("title", Value::Text("Hello World".into())),
+                ("author_id", Value::Integer(1)),
+            ],
+        )
+        .unwrap();
+    }
+    {
+        let db = BoogyDb::open(&path).unwrap();
+        // Tables should be restored
+        assert_eq!(db.count("users", &[]).unwrap(), 1);
+        assert_eq!(db.count("posts", &[]).unwrap(), 1);
+
+        // Indexes should work
+        let result = db
+            .find(
+                "users",
+                FindOptions {
+                    filters: vec![Filter::eq("name", "alice")],
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(
+            result.rows[0].get("email").unwrap(),
+            Value::Text("alice@example.com".into())
+        );
+
+        let result = db
+            .find(
+                "posts",
+                FindOptions {
+                    filters: vec![Filter::eq("author_id", 1i64)],
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(result.rows.len(), 1);
+    }
+}
+
+#[test]
+fn test_update_where_persists_across_reopen() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("test.boogy");
+    {
+        let db = BoogyDb::open(&path).unwrap();
+        db.create_table(
+            "t",
+            &[
+                ColumnDef::new("status", Type::Text),
+                ColumnDef::new("v", Type::Integer),
+            ],
+        )
+        .unwrap();
+        for i in 0..20 {
+            db.insert(
+                "t",
+                &[
+                    ("status", Value::Text("active".into())),
+                    ("v", Value::Integer(i)),
+                ],
+            )
+            .unwrap();
+        }
+        db.update_where(
+            "t",
+            &[Filter::ge("v", 10i64)],
+            &[("status", Value::Text("archived".into()))],
+        )
+        .unwrap();
+    }
+    {
+        let db = BoogyDb::open(&path).unwrap();
+        let active = db
+            .count("t", &[Filter::eq("status", "active")])
+            .unwrap();
+        let archived = db
+            .count("t", &[Filter::eq("status", "archived")])
+            .unwrap();
+        assert_eq!(active, 10);
+        assert_eq!(archived, 10);
+    }
+}
+
+// ===========================================================================
+// Additional security / edge case tests
+// ===========================================================================
+
+#[test]
+fn test_drop_nonexistent_table_returns_error() {
+    let (db, _dir) = create_db();
+    assert!(db.drop_table("does_not_exist").is_err());
+}
+
+#[test]
+fn test_create_index_on_nonexistent_column() {
+    let (db, _dir) = create_db();
+    db.create_table("t", &[ColumnDef::new("v", Type::Integer)])
+        .unwrap();
+    let result = db.create_index("t", "idx_bad", "nonexistent");
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_create_index_on_nonexistent_table() {
+    let (db, _dir) = create_db();
+    let result = db.create_index("does_not_exist", "idx", "col");
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_drop_index_on_nonexistent_table() {
+    let (db, _dir) = create_db();
+    let result = db.drop_index("does_not_exist", "idx");
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_update_nonexistent_row_returns_false() {
+    let (db, _dir) = create_db();
+    db.create_table("t", &[ColumnDef::new("v", Type::Integer)])
+        .unwrap();
+    let result = db.update("t", 999, &[("v", Value::Integer(1))]).unwrap();
+    assert!(!result);
+}
+
+#[test]
+fn test_delete_nonexistent_row_returns_false() {
+    let (db, _dir) = create_db();
+    db.create_table("t", &[ColumnDef::new("v", Type::Integer)])
+        .unwrap();
+    let result = db.delete("t", 999).unwrap();
+    assert!(!result);
+}
+
+#[test]
+fn test_all_value_types_roundtrip() {
+    let (db, _dir) = create_db();
+    db.create_table(
+        "t",
+        &[
+            ColumnDef::new("text_col", Type::Text),
+            ColumnDef::new("int_col", Type::Integer),
+            ColumnDef::new("real_col", Type::Real),
+            ColumnDef::new("blob_col", Type::Blob),
+            ColumnDef::new("bool_col", Type::Boolean),
+        ],
+    )
+    .unwrap();
+
+    let id = db
+        .insert(
+            "t",
+            &[
+                ("text_col", Value::Text("hello".into())),
+                ("int_col", Value::Integer(i64::MIN)),
+                ("real_col", Value::Real(std::f64::consts::PI)),
+                ("blob_col", Value::Blob(vec![0, 1, 2, 255])),
+                ("bool_col", Value::Boolean(true)),
+            ],
+        )
+        .unwrap();
+
+    let row = db.get("t", id).unwrap().unwrap();
+    assert_eq!(row.get("text_col").unwrap(), Value::Text("hello".into()));
+    assert_eq!(row.get("int_col").unwrap(), Value::Integer(i64::MIN));
+    assert_eq!(row.get("real_col").unwrap(), Value::Real(std::f64::consts::PI));
+    assert_eq!(row.get("blob_col").unwrap(), Value::Blob(vec![0, 1, 2, 255]));
+    assert_eq!(row.get("bool_col").unwrap(), Value::Boolean(true));
+}
+
+#[test]
+fn test_null_values_roundtrip() {
+    let (db, _dir) = create_db();
+    db.create_table(
+        "t",
+        &[
+            ColumnDef::new("a", Type::Text),
+            ColumnDef::new("b", Type::Integer),
+        ],
+    )
+    .unwrap();
+
+    // Insert with only one column -- the other should be absent/null
+    let id = db
+        .insert("t", &[("a", Value::Text("hello".into()))])
+        .unwrap();
+
+    let row = db.get("t", id).unwrap().unwrap();
+    assert_eq!(row.get("a").unwrap(), Value::Text("hello".into()));
+    assert!(row.get("b").is_none());
+}
+
+#[test]
+fn test_find_with_multiple_filters() {
+    let (db, _dir) = create_db();
+    db.create_table(
+        "t",
+        &[
+            ColumnDef::new("category", Type::Text),
+            ColumnDef::new("value", Type::Integer),
+        ],
+    )
+    .unwrap();
+
+    for i in 0..100 {
+        db.insert(
+            "t",
+            &[
+                ("category", Value::Text(format!("cat_{}", i % 5))),
+                ("value", Value::Integer(i)),
+            ],
+        )
+        .unwrap();
+    }
+
+    // Multi-filter: category = "cat_0" AND value >= 50
+    let result = db
+        .find(
+            "t",
+            FindOptions {
+                filters: vec![
+                    Filter::eq("category", "cat_0"),
+                    Filter::ge("value", 50i64),
+                ],
+                include_total: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    // cat_0 values: 0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60, 65, 70, 75, 80, 85, 90, 95
+    // >= 50: 50, 55, 60, 65, 70, 75, 80, 85, 90, 95 = 10
+    assert_eq!(result.total, Some(10));
+    assert_eq!(result.rows.len(), 10);
+}
+
+#[test]
+fn test_row_columns_method() {
+    let (db, _dir) = create_db();
+    db.create_table(
+        "t",
+        &[
+            ColumnDef::new("name", Type::Text),
+            ColumnDef::new("age", Type::Integer),
+        ],
+    )
+    .unwrap();
+
+    let id = db
+        .insert(
+            "t",
+            &[
+                ("name", Value::Text("alice".into())),
+                ("age", Value::Integer(30)),
+            ],
+        )
+        .unwrap();
+
+    let row = db.get("t", id).unwrap().unwrap();
+    let cols = row.columns();
+    assert_eq!(cols.len(), 2);
+    // columns() returns all decoded columns
+    assert!(cols.iter().any(|(name, val)| name == "name" && *val == Value::Text("alice".into())));
+    assert!(cols.iter().any(|(name, val)| name == "age" && *val == Value::Integer(30)));
+}
+
+#[test]
+fn test_delete_where_empty_result() {
+    let (db, _dir) = create_db();
+    db.create_table("t", &[ColumnDef::new("v", Type::Integer)])
+        .unwrap();
+    for i in 0..10 {
+        db.insert("t", &[("v", Value::Integer(i))]).unwrap();
+    }
+    // Filter matches nothing
+    let deleted = db.delete_where("t", &[Filter::eq("v", 999i64)]).unwrap();
+    assert_eq!(deleted, 0);
+    assert_eq!(db.count("t", &[]).unwrap(), 10);
+}
+
+#[test]
+fn test_update_where_empty_result() {
+    let (db, _dir) = create_db();
+    db.create_table("t", &[ColumnDef::new("v", Type::Integer)])
+        .unwrap();
+    for i in 0..10 {
+        db.insert("t", &[("v", Value::Integer(i))]).unwrap();
+    }
+    let updated = db
+        .update_where("t", &[Filter::eq("v", 999i64)], &[("v", Value::Integer(0))])
+        .unwrap();
+    assert_eq!(updated, 0);
+}
+
+#[test]
+fn test_insert_many_empty_batch() {
+    let (db, _dir) = create_db();
+    db.create_table("t", &[ColumnDef::new("v", Type::Integer)])
+        .unwrap();
+    let ids = db.insert_many("t", &[]).unwrap();
+    assert!(ids.is_empty());
+    assert_eq!(db.count("t", &[]).unwrap(), 0);
 }

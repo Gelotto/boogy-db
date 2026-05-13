@@ -453,4 +453,205 @@ mod tests {
         assert_eq!(decoded.columns[1], (1, Value::Integer(200)));
         assert_eq!(decoded.columns[2], (2, Value::Integer(300)));
     }
+
+    // --- patch_row tests ---
+
+    #[test]
+    fn test_patch_row_same_size() {
+        // Integer -> Integer is same size (9 bytes), triggers the direct overwrite path
+        let v0 = Value::Integer(100);
+        let v1 = Value::Text("hello".into());
+        let cols = vec![(0u16, &v0), (1, &v1)];
+        let encoded = encode_row(1, &cols);
+
+        let patched = patch_row(&encoded, 0, &Value::Integer(999)).unwrap();
+        let decoded = decode_row(&patched).unwrap();
+        assert_eq!(decoded.id, 1);
+        assert_eq!(decoded.columns[0], (0, Value::Integer(999)));
+        assert_eq!(decoded.columns[1], (1, Value::Text("hello".into())));
+    }
+
+    #[test]
+    fn test_patch_row_different_size() {
+        // Text "hi" -> Text "goodbye" is different size, triggers splice path
+        let v0 = Value::Text("hi".into());
+        let v1 = Value::Integer(42);
+        let cols = vec![(0u16, &v0), (1, &v1)];
+        let encoded = encode_row(1, &cols);
+
+        let patched = patch_row(&encoded, 0, &Value::Text("goodbye".into())).unwrap();
+        let decoded = decode_row(&patched).unwrap();
+        assert_eq!(decoded.id, 1);
+        assert_eq!(decoded.columns[0], (0, Value::Text("goodbye".into())));
+        assert_eq!(decoded.columns[1], (1, Value::Integer(42)));
+    }
+
+    #[test]
+    fn test_patch_row_column_not_found() {
+        let v0 = Value::Integer(1);
+        let cols = vec![(0u16, &v0)];
+        let encoded = encode_row(1, &cols);
+
+        // Patching a column that doesn't exist returns unchanged data
+        let patched = patch_row(&encoded, 99, &Value::Integer(999)).unwrap();
+        assert_eq!(patched, encoded);
+    }
+
+    #[test]
+    fn test_patch_row_zero_columns() {
+        let cols: Vec<(u16, &Value)> = vec![];
+        let encoded = encode_row(1, &cols);
+
+        // Patching an empty row returns unchanged data
+        let patched = patch_row(&encoded, 0, &Value::Integer(1)).unwrap();
+        assert_eq!(patched, encoded);
+    }
+
+    #[test]
+    fn test_patch_row_last_column() {
+        // Patch the last column -- boundary case for offset calculation
+        let v0 = Value::Integer(1);
+        let v1 = Value::Integer(2);
+        let v2 = Value::Text("short".into());
+        let cols = vec![(0u16, &v0), (1, &v1), (2, &v2)];
+        let encoded = encode_row(1, &cols);
+
+        let patched = patch_row(&encoded, 2, &Value::Text("a much longer replacement string".into())).unwrap();
+        let decoded = decode_row(&patched).unwrap();
+        assert_eq!(decoded.columns[0], (0, Value::Integer(1)));
+        assert_eq!(decoded.columns[1], (1, Value::Integer(2)));
+        assert_eq!(decoded.columns[2], (2, Value::Text("a much longer replacement string".into())));
+    }
+
+    #[test]
+    fn test_patch_row_first_column_shrinks() {
+        // First column shrinks -- tests offset update for subsequent columns
+        let v0 = Value::Text("long text value here".into());
+        let v1 = Value::Integer(42);
+        let cols = vec![(0u16, &v0), (1, &v1)];
+        let encoded = encode_row(1, &cols);
+
+        let patched = patch_row(&encoded, 0, &Value::Text("x".into())).unwrap();
+        let decoded = decode_row(&patched).unwrap();
+        assert_eq!(decoded.columns[0], (0, Value::Text("x".into())));
+        assert_eq!(decoded.columns[1], (1, Value::Integer(42)));
+    }
+
+    // --- patch_row_multi tests ---
+
+    #[test]
+    fn test_patch_row_multi_multiple_columns() {
+        let v0 = Value::Text("alice".into());
+        let v1 = Value::Integer(30);
+        let v2 = Value::Boolean(true);
+        let cols = vec![(0u16, &v0), (1, &v1), (2, &v2)];
+        let encoded = encode_row(1, &cols);
+
+        let patched = patch_row_multi(
+            &encoded,
+            &[
+                (0, &Value::Text("bob".into())),
+                (1, &Value::Integer(25)),
+            ],
+        )
+        .unwrap();
+        let decoded = decode_row(&patched).unwrap();
+        assert_eq!(decoded.columns[0], (0, Value::Text("bob".into())));
+        assert_eq!(decoded.columns[1], (1, Value::Integer(25)));
+        assert_eq!(decoded.columns[2], (2, Value::Boolean(true)));
+    }
+
+    #[test]
+    fn test_patch_row_multi_empty_patches() {
+        let v0 = Value::Integer(42);
+        let cols = vec![(0u16, &v0)];
+        let encoded = encode_row(1, &cols);
+
+        let patched = patch_row_multi(&encoded, &[]).unwrap();
+        assert_eq!(patched, encoded);
+    }
+
+    // --- encode_value_to_vec tests ---
+
+    #[test]
+    fn test_encode_value_to_vec_all_types() {
+        // Null
+        let buf = encode_value_to_vec(&Value::Null);
+        assert_eq!(buf, vec![0]); // TAG_NULL
+
+        // Integer
+        let buf = encode_value_to_vec(&Value::Integer(42));
+        assert_eq!(buf.len(), 9); // 1 tag + 8 bytes
+        assert_eq!(buf[0], 2); // TAG_INTEGER
+
+        // Real
+        let buf = encode_value_to_vec(&Value::Real(3.14));
+        assert_eq!(buf.len(), 9); // 1 tag + 8 bytes
+        assert_eq!(buf[0], 3); // TAG_REAL
+
+        // Boolean
+        let buf = encode_value_to_vec(&Value::Boolean(true));
+        assert_eq!(buf, vec![5, 1]); // TAG_BOOLEAN + 1
+        let buf = encode_value_to_vec(&Value::Boolean(false));
+        assert_eq!(buf, vec![5, 0]); // TAG_BOOLEAN + 0
+
+        // Text
+        let buf = encode_value_to_vec(&Value::Text("hi".into()));
+        assert_eq!(buf[0], 1); // TAG_TEXT
+        assert_eq!(buf.len(), 1 + 4 + 2); // tag + len(u32) + "hi"
+
+        // Blob
+        let buf = encode_value_to_vec(&Value::Blob(vec![0xAB, 0xCD]));
+        assert_eq!(buf[0], 4); // TAG_BLOB
+        assert_eq!(buf.len(), 1 + 4 + 2); // tag + len(u32) + blob
+    }
+
+    // --- extract_column_raw tests ---
+
+    #[test]
+    fn test_extract_column_raw_returns_raw_slice() {
+        let v0 = Value::Integer(42);
+        let v1 = Value::Text("hello".into());
+        let cols = vec![(0u16, &v0), (1, &v1)];
+        let encoded = encode_row(1, &cols);
+
+        // extract_column_raw for column 0 should return the raw integer encoding
+        let raw = extract_column_raw(&encoded, 0).unwrap().unwrap();
+        assert_eq!(raw[0], 2); // TAG_INTEGER
+        let i = i64::from_le_bytes(raw[1..9].try_into().unwrap());
+        assert_eq!(i, 42);
+
+        // Column not found
+        let raw = extract_column_raw(&encoded, 99).unwrap();
+        assert!(raw.is_none());
+    }
+
+    #[test]
+    fn test_extract_column_raw_zero_columns() {
+        let cols: Vec<(u16, &Value)> = vec![];
+        let encoded = encode_row(1, &cols);
+        let raw = extract_column_raw(&encoded, 0).unwrap();
+        assert!(raw.is_none());
+    }
+
+    // --- truncated data tests ---
+
+    #[test]
+    fn test_decode_row_truncated_data() {
+        // Just a few bytes -- not enough for even a rowid
+        let short = vec![0u8; 5];
+        assert!(decode_row(&short).is_err());
+    }
+
+    #[test]
+    fn test_extract_id_truncated() {
+        let short = vec![0u8; 4];
+        assert!(extract_id(&short).is_err());
+    }
+
+    #[test]
+    fn test_extract_column_truncated() {
+        let short = vec![0u8; 5];
+        assert!(extract_column(&short, 0).is_err());
+    }
 }

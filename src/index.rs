@@ -1477,4 +1477,182 @@ mod tests {
         let results = reader.scan_prefix_limit(&prefix, 200).unwrap();
         assert_eq!(results.len(), 100);
     }
+
+    // --- Composite key edge cases ---
+
+    #[test]
+    fn test_integer_key_extreme_negative() {
+        let k_min = encode_index_key_integer(i64::MIN, 1);
+        let k_min_plus1 = encode_index_key_integer(i64::MIN + 1, 1);
+        assert!(k_min < k_min_plus1, "i64::MIN should sort before i64::MIN+1");
+    }
+
+    #[test]
+    fn test_integer_key_around_zero() {
+        let k_neg1 = encode_index_key_integer(-1, 1);
+        let k_zero = encode_index_key_integer(0, 1);
+        let k_pos1 = encode_index_key_integer(1, 1);
+        assert!(k_neg1 < k_zero);
+        assert!(k_zero < k_pos1);
+    }
+
+    #[test]
+    fn test_text_key_empty_string() {
+        let k_empty = encode_index_key_text("", 1);
+        let k_a = encode_index_key_text("a", 1);
+        // Empty string: just null terminator + rowid
+        assert!(k_empty < k_a, "empty string should sort before 'a'");
+    }
+
+    #[test]
+    fn test_text_key_empty_string_different_rowids() {
+        let k1 = encode_index_key_text("", 1);
+        let k2 = encode_index_key_text("", 2);
+        assert!(k1 < k2);
+    }
+
+    #[test]
+    fn test_text_key_long_value() {
+        // Long text value that would exceed branch key truncation limit (36 bytes)
+        let long_text = "a".repeat(100);
+        let k = encode_index_key_text(&long_text, 1);
+        // Should be: 100 bytes text + 1 null terminator + 8 rowid = 109 bytes
+        assert_eq!(k.len(), 100 + 1 + 8);
+        assert_eq!(extract_rowid(Type::Text, &k), 1);
+    }
+
+    #[test]
+    fn test_text_key_unicode() {
+        let k_emoji = encode_index_key_text("hello", 1);
+        let k_z = encode_index_key_text("zzz", 1);
+        // Both should round-trip through extract_rowid
+        assert_eq!(extract_rowid(Type::Text, &k_emoji), 1);
+        assert_eq!(extract_rowid(Type::Text, &k_z), 1);
+    }
+
+    #[test]
+    fn test_real_key_negative_zero_vs_positive_zero() {
+        let k_neg_zero = encode_index_key_real(-0.0, 1);
+        let k_pos_zero = encode_index_key_real(0.0, 1);
+        // -0.0 and +0.0 should be adjacent in sort order
+        assert!(k_neg_zero <= k_pos_zero);
+    }
+
+    #[test]
+    fn test_real_key_very_small_positive() {
+        let k_tiny = encode_index_key_real(f64::MIN_POSITIVE, 1);
+        let k_zero = encode_index_key_real(0.0, 1);
+        let k_one = encode_index_key_real(1.0, 1);
+        assert!(k_zero < k_tiny);
+        assert!(k_tiny < k_one);
+    }
+
+    #[test]
+    fn test_integer_key_rowid_max() {
+        // Test with u64::MAX rowid
+        let k = encode_index_key_integer(42, u64::MAX);
+        assert_eq!(extract_rowid(Type::Integer, &k), u64::MAX);
+    }
+
+    #[test]
+    fn test_integer_key_rowid_zero() {
+        let k = encode_index_key_integer(42, 0);
+        assert_eq!(extract_rowid(Type::Integer, &k), 0);
+    }
+
+    #[test]
+    fn test_encode_index_key_cross_type_coercion() {
+        // Integer column with Real value -> coerced
+        let key = encode_index_key(Type::Integer, &Value::Real(42.0), 1);
+        assert!(key.is_some());
+
+        // Real column with Integer value -> coerced
+        let key = encode_index_key(Type::Real, &Value::Integer(42), 1);
+        assert!(key.is_some());
+
+        // Unsupported type combination -> None
+        let key = encode_index_key(Type::Text, &Value::Integer(42), 1);
+        assert!(key.is_none());
+
+        let key = encode_index_key(Type::Integer, &Value::Text("42".into()), 1);
+        assert!(key.is_none());
+    }
+
+    #[test]
+    fn test_encode_value_prefix_cross_type_coercion() {
+        // Integer column with Real value
+        let prefix = encode_value_prefix(Type::Integer, &Value::Real(42.0));
+        assert!(prefix.is_some());
+
+        // Real column with Integer value
+        let prefix = encode_value_prefix(Type::Real, &Value::Integer(42));
+        assert!(prefix.is_some());
+    }
+
+    // --- IndexTree with long text keys that trigger branch truncation ---
+
+    #[test]
+    fn test_index_tree_long_text_keys_trigger_splits() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let pf = PageFile::open(tmp.path()).unwrap();
+
+        let mut root;
+        {
+            let mut guard = pf.begin_write();
+            root = IndexTreeWriter::create(&mut guard).unwrap();
+
+            // Insert keys with long text values (exceeding the 36-byte branch key limit)
+            for i in 0..50u64 {
+                let text = format!("long_key_value_that_exceeds_branch_limit_{:04}", i);
+                let key = encode_index_key_text(&text, i);
+                let mut tree = IndexTreeWriter::new(&mut guard, root);
+                root = tree.insert(&key).unwrap();
+            }
+            guard.commit().unwrap();
+        }
+
+        let reader = IndexTreeReader::new(&pf, root);
+        for i in 0..50u64 {
+            let text = format!("long_key_value_that_exceeds_branch_limit_{:04}", i);
+            let prefix = encode_text_prefix(&text);
+            let results = reader.scan_prefix(&prefix).unwrap();
+            assert_eq!(results.len(), 1, "missing key for text '{text}'");
+            assert_eq!(extract_rowid(Type::Text, &results[0]), i);
+        }
+    }
+
+    #[test]
+    fn test_scan_prefix_empty_tree() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let pf = PageFile::open(tmp.path()).unwrap();
+
+        let root;
+        {
+            let mut guard = pf.begin_write();
+            root = IndexTreeWriter::create(&mut guard).unwrap();
+            guard.commit().unwrap();
+        }
+
+        let reader = IndexTreeReader::new(&pf, root);
+        let prefix = encode_integer_prefix(42);
+        let results = reader.scan_prefix(&prefix).unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_count_prefix_empty_tree() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let pf = PageFile::open(tmp.path()).unwrap();
+
+        let root;
+        {
+            let mut guard = pf.begin_write();
+            root = IndexTreeWriter::create(&mut guard).unwrap();
+            guard.commit().unwrap();
+        }
+
+        let reader = IndexTreeReader::new(&pf, root);
+        let prefix = encode_integer_prefix(42);
+        assert_eq!(reader.count_prefix(&prefix).unwrap(), 0);
+    }
 }

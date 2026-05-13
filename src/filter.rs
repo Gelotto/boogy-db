@@ -196,4 +196,180 @@ mod tests {
         assert!(f.matches(&Value::Null));
         assert!(!f.matches(&Value::Integer(0)));
     }
+
+    // --- eval_filter_op comprehensive tests ---
+
+    #[test]
+    fn test_eval_filter_op_integer_all_ops() {
+        assert!(eval_filter_op(&Value::Integer(5), &FilterOp::Eq, &Value::Integer(5)));
+        assert!(!eval_filter_op(&Value::Integer(5), &FilterOp::Eq, &Value::Integer(6)));
+
+        assert!(eval_filter_op(&Value::Integer(5), &FilterOp::Ne, &Value::Integer(6)));
+        assert!(!eval_filter_op(&Value::Integer(5), &FilterOp::Ne, &Value::Integer(5)));
+
+        assert!(eval_filter_op(&Value::Integer(3), &FilterOp::Lt, &Value::Integer(5)));
+        assert!(!eval_filter_op(&Value::Integer(5), &FilterOp::Lt, &Value::Integer(5)));
+
+        assert!(eval_filter_op(&Value::Integer(5), &FilterOp::Le, &Value::Integer(5)));
+        assert!(eval_filter_op(&Value::Integer(3), &FilterOp::Le, &Value::Integer(5)));
+        assert!(!eval_filter_op(&Value::Integer(6), &FilterOp::Le, &Value::Integer(5)));
+
+        assert!(eval_filter_op(&Value::Integer(6), &FilterOp::Gt, &Value::Integer(5)));
+        assert!(!eval_filter_op(&Value::Integer(5), &FilterOp::Gt, &Value::Integer(5)));
+
+        assert!(eval_filter_op(&Value::Integer(5), &FilterOp::Ge, &Value::Integer(5)));
+        assert!(eval_filter_op(&Value::Integer(6), &FilterOp::Ge, &Value::Integer(5)));
+        assert!(!eval_filter_op(&Value::Integer(4), &FilterOp::Ge, &Value::Integer(5)));
+    }
+
+    #[test]
+    fn test_eval_filter_op_text_all_ops() {
+        let apple = Value::Text("apple".into());
+        let banana = Value::Text("banana".into());
+
+        assert!(eval_filter_op(&apple, &FilterOp::Eq, &apple));
+        assert!(!eval_filter_op(&apple, &FilterOp::Eq, &banana));
+
+        assert!(eval_filter_op(&apple, &FilterOp::Ne, &banana));
+        assert!(eval_filter_op(&apple, &FilterOp::Lt, &banana));
+        assert!(eval_filter_op(&apple, &FilterOp::Le, &banana));
+        assert!(eval_filter_op(&apple, &FilterOp::Le, &apple));
+        assert!(eval_filter_op(&banana, &FilterOp::Gt, &apple));
+        assert!(eval_filter_op(&banana, &FilterOp::Ge, &apple));
+        assert!(eval_filter_op(&banana, &FilterOp::Ge, &banana));
+    }
+
+    #[test]
+    fn test_eval_filter_op_real() {
+        assert!(eval_filter_op(&Value::Real(3.14), &FilterOp::Lt, &Value::Real(4.0)));
+        assert!(eval_filter_op(&Value::Real(3.14), &FilterOp::Ge, &Value::Real(3.14)));
+        assert!(!eval_filter_op(&Value::Real(3.14), &FilterOp::Gt, &Value::Real(3.14)));
+    }
+
+    #[test]
+    fn test_eval_filter_op_boolean() {
+        assert!(eval_filter_op(&Value::Boolean(true), &FilterOp::Eq, &Value::Boolean(true)));
+        assert!(!eval_filter_op(&Value::Boolean(true), &FilterOp::Eq, &Value::Boolean(false)));
+        assert!(eval_filter_op(&Value::Boolean(false), &FilterOp::Lt, &Value::Boolean(true)));
+    }
+
+    #[test]
+    fn test_eval_filter_op_cross_type_returns_false() {
+        // Incompatible types should not match
+        assert!(!eval_filter_op(&Value::Integer(5), &FilterOp::Eq, &Value::Text("5".into())));
+        assert!(!eval_filter_op(&Value::Text("true".to_string()), &FilterOp::Eq, &Value::Boolean(true)));
+    }
+
+    #[test]
+    fn test_eval_filter_op_null_handling() {
+        // Null < everything else
+        assert!(eval_filter_op(&Value::Null, &FilterOp::Lt, &Value::Integer(0)));
+        assert!(eval_filter_op(&Value::Null, &FilterOp::Eq, &Value::Null));
+        assert!(!eval_filter_op(&Value::Null, &FilterOp::Gt, &Value::Integer(0)));
+    }
+
+    // --- eval_filter_raw comprehensive tests ---
+
+    #[test]
+    fn test_eval_filter_raw_integer_eq() {
+        use crate::row::encode_value_to_vec;
+        let raw = encode_value_to_vec(&Value::Integer(42));
+        assert_eq!(eval_filter_raw(&raw, &FilterOp::Eq, &Value::Integer(42)), Some(true));
+        assert_eq!(eval_filter_raw(&raw, &FilterOp::Eq, &Value::Integer(43)), Some(false));
+    }
+
+    #[test]
+    fn test_eval_filter_raw_integer_all_ops() {
+        use crate::row::encode_value_to_vec;
+        let raw = encode_value_to_vec(&Value::Integer(10));
+
+        assert_eq!(eval_filter_raw(&raw, &FilterOp::Lt, &Value::Integer(20)), Some(true));
+        assert_eq!(eval_filter_raw(&raw, &FilterOp::Lt, &Value::Integer(10)), Some(false));
+        assert_eq!(eval_filter_raw(&raw, &FilterOp::Le, &Value::Integer(10)), Some(true));
+        assert_eq!(eval_filter_raw(&raw, &FilterOp::Gt, &Value::Integer(5)), Some(true));
+        assert_eq!(eval_filter_raw(&raw, &FilterOp::Gt, &Value::Integer(10)), Some(false));
+        assert_eq!(eval_filter_raw(&raw, &FilterOp::Ge, &Value::Integer(10)), Some(true));
+        assert_eq!(eval_filter_raw(&raw, &FilterOp::Ne, &Value::Integer(10)), Some(false));
+        assert_eq!(eval_filter_raw(&raw, &FilterOp::Ne, &Value::Integer(11)), Some(true));
+    }
+
+    #[test]
+    fn test_eval_filter_raw_text_eq() {
+        use crate::row::encode_value_to_vec;
+        let raw = encode_value_to_vec(&Value::Text("hello".into()));
+        assert_eq!(eval_filter_raw(&raw, &FilterOp::Eq, &Value::Text("hello".into())), Some(true));
+        assert_eq!(eval_filter_raw(&raw, &FilterOp::Eq, &Value::Text("world".into())), Some(false));
+    }
+
+    #[test]
+    fn test_eval_filter_raw_text_length_mismatch() {
+        use crate::row::encode_value_to_vec;
+        let raw = encode_value_to_vec(&Value::Text("hi".into()));
+        // Different length -> fast false
+        assert_eq!(eval_filter_raw(&raw, &FilterOp::Eq, &Value::Text("hello".into())), Some(false));
+    }
+
+    #[test]
+    fn test_eval_filter_raw_falls_back_for_unsupported() {
+        use crate::row::encode_value_to_vec;
+        // Real value: eval_filter_raw doesn't handle Real, should return None
+        let raw = encode_value_to_vec(&Value::Real(3.14));
+        assert_eq!(eval_filter_raw(&raw, &FilterOp::Eq, &Value::Real(3.14)), None);
+
+        // Boolean value: also not handled
+        let raw = encode_value_to_vec(&Value::Boolean(true));
+        assert_eq!(eval_filter_raw(&raw, &FilterOp::Eq, &Value::Boolean(true)), None);
+
+        // Text with non-Eq op: not handled
+        let raw = encode_value_to_vec(&Value::Text("hello".into()));
+        assert_eq!(eval_filter_raw(&raw, &FilterOp::Lt, &Value::Text("world".into())), None);
+    }
+
+    #[test]
+    fn test_eval_filter_raw_empty_bytes() {
+        assert_eq!(eval_filter_raw(&[], &FilterOp::Eq, &Value::Integer(0)), None);
+    }
+
+    // --- Filter convenience constructors ---
+
+    #[test]
+    fn test_filter_all_constructors() {
+        let _ = Filter::eq("a", 1i64);
+        let _ = Filter::ne("a", 1i64);
+        let _ = Filter::lt("a", 1i64);
+        let _ = Filter::le("a", 1i64);
+        let _ = Filter::gt("a", 1i64);
+        let _ = Filter::ge("a", 1i64);
+    }
+
+    #[test]
+    fn test_filter_le() {
+        let f = Filter::le("v", 5i64);
+        assert!(f.matches(&Value::Integer(5)));
+        assert!(f.matches(&Value::Integer(3)));
+        assert!(!f.matches(&Value::Integer(6)));
+    }
+
+    #[test]
+    fn test_filter_ge() {
+        let f = Filter::ge("v", 5i64);
+        assert!(f.matches(&Value::Integer(5)));
+        assert!(f.matches(&Value::Integer(7)));
+        assert!(!f.matches(&Value::Integer(4)));
+    }
+
+    #[test]
+    fn test_filter_ne() {
+        let f = Filter::ne("v", "alice");
+        assert!(f.matches(&Value::Text("bob".into())));
+        assert!(!f.matches(&Value::Text("alice".into())));
+    }
+
+    #[test]
+    fn test_filter_lt() {
+        let f = Filter::lt("v", 10i64);
+        assert!(f.matches(&Value::Integer(5)));
+        assert!(!f.matches(&Value::Integer(10)));
+        assert!(!f.matches(&Value::Integer(15)));
+    }
 }

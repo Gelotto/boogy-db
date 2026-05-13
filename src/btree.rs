@@ -1338,4 +1338,303 @@ mod tests {
             assert!(result.is_some(), "missing row at i={i}");
         }
     }
+
+    // --- delete_matching edge cases ---
+
+    #[test]
+    fn test_delete_matching_empty_table() {
+        let tmp = NamedTempFile::new().unwrap();
+        let pf = PageFile::open(tmp.path()).unwrap();
+
+        let root;
+        {
+            let mut guard = pf.begin_write();
+            root = BTreeWriter::create(&mut guard).unwrap();
+            guard.commit().unwrap();
+        }
+
+        {
+            let mut guard = pf.begin_write();
+            let mut tree = BTreeWriter::new(&mut guard, root);
+            let deleted = tree.delete_matching(|_data| true).unwrap();
+            assert!(deleted.is_empty());
+            guard.commit().unwrap();
+        }
+    }
+
+    #[test]
+    fn test_delete_matching_all_rows() {
+        let tmp = NamedTempFile::new().unwrap();
+        let pf = PageFile::open(tmp.path()).unwrap();
+
+        let mut root;
+        {
+            let mut guard = pf.begin_write();
+            root = BTreeWriter::create(&mut guard).unwrap();
+            for i in 0..20u64 {
+                let row = row::encode_row(i, &[(0, &Value::Integer(i as i64))]);
+                let mut tree = BTreeWriter::new(&mut guard, root);
+                root = tree.insert(i, &row).unwrap();
+            }
+            guard.commit().unwrap();
+        }
+
+        // Delete ALL rows
+        {
+            let mut guard = pf.begin_write();
+            let mut tree = BTreeWriter::new(&mut guard, root);
+            let deleted = tree.delete_matching(|_data| true).unwrap();
+            assert_eq!(deleted.len(), 20);
+            root = tree.root_page();
+            guard.commit().unwrap();
+        }
+
+        // Verify empty
+        let reader = BTreeReader::new(&pf, root);
+        let all = reader.scan_all().unwrap();
+        assert_eq!(all.len(), 0);
+    }
+
+    #[test]
+    fn test_delete_matching_no_rows_match() {
+        let tmp = NamedTempFile::new().unwrap();
+        let pf = PageFile::open(tmp.path()).unwrap();
+
+        let mut root;
+        {
+            let mut guard = pf.begin_write();
+            root = BTreeWriter::create(&mut guard).unwrap();
+            for i in 0..10u64 {
+                let row = row::encode_row(i, &[(0, &Value::Integer(i as i64))]);
+                let mut tree = BTreeWriter::new(&mut guard, root);
+                root = tree.insert(i, &row).unwrap();
+            }
+            guard.commit().unwrap();
+        }
+
+        // Nothing matches
+        {
+            let mut guard = pf.begin_write();
+            let mut tree = BTreeWriter::new(&mut guard, root);
+            let deleted = tree.delete_matching(|_data| false).unwrap();
+            assert!(deleted.is_empty());
+            root = tree.root_page();
+            guard.commit().unwrap();
+        }
+
+        // All rows still there
+        let reader = BTreeReader::new(&pf, root);
+        let all = reader.scan_all().unwrap();
+        assert_eq!(all.len(), 10);
+    }
+
+    // --- update_matching edge cases ---
+
+    #[test]
+    fn test_update_matching_empty_table() {
+        let tmp = NamedTempFile::new().unwrap();
+        let pf = PageFile::open(tmp.path()).unwrap();
+
+        let root;
+        {
+            let mut guard = pf.begin_write();
+            root = BTreeWriter::create(&mut guard).unwrap();
+            guard.commit().unwrap();
+        }
+
+        {
+            let mut guard = pf.begin_write();
+            let mut tree = BTreeWriter::new(&mut guard, root);
+            let (updated, overflow) = tree.update_matching(
+                |_| true,
+                |old| old.to_vec(),
+            ).unwrap();
+            assert!(updated.is_empty());
+            assert!(overflow.is_empty());
+            guard.commit().unwrap();
+        }
+    }
+
+    #[test]
+    fn test_update_matching_no_rows_match() {
+        let tmp = NamedTempFile::new().unwrap();
+        let pf = PageFile::open(tmp.path()).unwrap();
+
+        let mut root;
+        {
+            let mut guard = pf.begin_write();
+            root = BTreeWriter::create(&mut guard).unwrap();
+            for i in 0..10u64 {
+                let row = row::encode_row(i, &[(0, &Value::Integer(i as i64))]);
+                let mut tree = BTreeWriter::new(&mut guard, root);
+                root = tree.insert(i, &row).unwrap();
+            }
+            guard.commit().unwrap();
+        }
+
+        {
+            let mut guard = pf.begin_write();
+            let mut tree = BTreeWriter::new(&mut guard, root);
+            let (updated, overflow) = tree.update_matching(
+                |_| false,
+                |old| old.to_vec(),
+            ).unwrap();
+            assert!(updated.is_empty());
+            assert!(overflow.is_empty());
+            guard.commit().unwrap();
+        }
+    }
+
+    #[test]
+    fn test_update_matching_overflow() {
+        // Force overflow by making rows much larger
+        let tmp = NamedTempFile::new().unwrap();
+        let pf = PageFile::open(tmp.path()).unwrap();
+
+        let mut root;
+        {
+            let mut guard = pf.begin_write();
+            root = BTreeWriter::create(&mut guard).unwrap();
+            // Insert rows with small values
+            for i in 0..5u64 {
+                let row = row::encode_row(i, &[(0, &Value::Text("x".into()))]);
+                let mut tree = BTreeWriter::new(&mut guard, root);
+                root = tree.insert(i, &row).unwrap();
+            }
+            guard.commit().unwrap();
+        }
+
+        // Update all rows to have very large values that won't fit in the page
+        {
+            let mut guard = pf.begin_write();
+            let mut tree = BTreeWriter::new(&mut guard, root);
+            let big_text = "x".repeat(2000);
+            let (updated, overflow) = tree.update_matching(
+                |_| true,
+                |old_bytes| {
+                    let decoded = row::decode_row(old_bytes).unwrap();
+                    row::encode_row(decoded.id, &[(0, &Value::Text(big_text.clone()))])
+                },
+            ).unwrap();
+            // All should overflow since the page can't hold 5 * 2000+ bytes
+            assert_eq!(updated.len() + overflow.len(), 5);
+            guard.commit().unwrap();
+        }
+    }
+
+    // --- multi_get_sorted tests ---
+
+    #[test]
+    fn test_multi_get_sorted_basic() {
+        let tmp = NamedTempFile::new().unwrap();
+        let pf = PageFile::open(tmp.path()).unwrap();
+
+        let mut root;
+        {
+            let mut guard = pf.begin_write();
+            root = BTreeWriter::create(&mut guard).unwrap();
+            for i in 0..50u64 {
+                let row = row::encode_row(i, &[(0, &Value::Integer(i as i64))]);
+                let mut tree = BTreeWriter::new(&mut guard, root);
+                root = tree.insert(i, &row).unwrap();
+            }
+            guard.commit().unwrap();
+        }
+
+        let reader = BTreeReader::new(&pf, root);
+        let results = reader.multi_get_sorted(&[5, 10, 25, 49]).unwrap();
+        assert_eq!(results.len(), 4);
+        assert_eq!(row::extract_id(&results[0]).unwrap(), 5);
+        assert_eq!(row::extract_id(&results[1]).unwrap(), 10);
+        assert_eq!(row::extract_id(&results[2]).unwrap(), 25);
+        assert_eq!(row::extract_id(&results[3]).unwrap(), 49);
+    }
+
+    #[test]
+    fn test_multi_get_sorted_empty_input() {
+        let tmp = NamedTempFile::new().unwrap();
+        let pf = PageFile::open(tmp.path()).unwrap();
+
+        let root;
+        {
+            let mut guard = pf.begin_write();
+            root = BTreeWriter::create(&mut guard).unwrap();
+            guard.commit().unwrap();
+        }
+
+        let reader = BTreeReader::new(&pf, root);
+        let results = reader.multi_get_sorted(&[]).unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_multi_get_sorted_missing_keys() {
+        let tmp = NamedTempFile::new().unwrap();
+        let pf = PageFile::open(tmp.path()).unwrap();
+
+        let mut root;
+        {
+            let mut guard = pf.begin_write();
+            root = BTreeWriter::create(&mut guard).unwrap();
+            for i in (0..20u64).step_by(2) {
+                let row = row::encode_row(i, &[(0, &Value::Integer(i as i64))]);
+                let mut tree = BTreeWriter::new(&mut guard, root);
+                root = tree.insert(i, &row).unwrap();
+            }
+            guard.commit().unwrap();
+        }
+
+        let reader = BTreeReader::new(&pf, root);
+        // Ask for some keys that exist and some that don't
+        let results = reader.multi_get_sorted(&[0, 1, 4, 5, 18, 19]).unwrap();
+        // Only even numbers exist: 0, 4, 18
+        assert_eq!(results.len(), 3);
+    }
+
+    // --- scan_all on empty tree ---
+
+    #[test]
+    fn test_scan_all_empty() {
+        let tmp = NamedTempFile::new().unwrap();
+        let pf = PageFile::open(tmp.path()).unwrap();
+
+        let root;
+        {
+            let mut guard = pf.begin_write();
+            root = BTreeWriter::create(&mut guard).unwrap();
+            guard.commit().unwrap();
+        }
+
+        let reader = BTreeReader::new(&pf, root);
+        let all = reader.scan_all().unwrap();
+        assert!(all.is_empty());
+    }
+
+    // --- insert, delete, re-insert the same key ---
+
+    #[test]
+    fn test_delete_and_reinsert() {
+        let tmp = NamedTempFile::new().unwrap();
+        let pf = PageFile::open(tmp.path()).unwrap();
+
+        let root;
+        {
+            let mut guard = pf.begin_write();
+            root = BTreeWriter::create(&mut guard).unwrap();
+            let mut tree = BTreeWriter::new(&mut guard, root);
+            let row = make_row(1, "alice");
+            tree.insert(1, &row).unwrap();
+            assert!(tree.delete(1).unwrap());
+
+            // Re-insert the same key with different data
+            let row = make_row(1, "bob");
+            tree.insert(1, &row).unwrap();
+            guard.commit().unwrap();
+        }
+
+        let reader = BTreeReader::new(&pf, root);
+        let found = reader.search(1).unwrap().unwrap();
+        let decoded = row::decode_row(&found).unwrap();
+        assert_eq!(decoded.columns[0].1, Value::Text("bob".into()));
+    }
 }

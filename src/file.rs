@@ -372,4 +372,125 @@ mod tests {
             h.join().unwrap();
         }
     }
+
+    #[test]
+    fn test_commit_returns_after_images() {
+        let tmp = NamedTempFile::new().unwrap();
+        let pf = PageFile::open(tmp.path()).unwrap();
+
+        let after_images;
+        {
+            let mut guard = pf.begin_write();
+            let pg0 = guard.allocate_page().unwrap();
+            let page = guard.write_page(pg0).unwrap();
+            *page = Page::new_leaf();
+            page.set_num_rows(3);
+            page.update_checksum();
+            after_images = guard.commit().unwrap();
+        }
+
+        // commit() should return exactly one after-image for pg0
+        assert_eq!(after_images.len(), 1);
+        let (page_no, data) = &after_images[0];
+        assert_eq!(*page_no, 0);
+        // Verify the after-image is a leaf page with 3 rows
+        let page = Page::from_bytes_unchecked(*data);
+        assert!(page.is_leaf());
+        assert_eq!(page.num_rows(), 3);
+    }
+
+    #[test]
+    fn test_commit_multiple_pages_after_images() {
+        let tmp = NamedTempFile::new().unwrap();
+        let pf = PageFile::open(tmp.path()).unwrap();
+
+        let after_images;
+        {
+            let mut guard = pf.begin_write();
+            let pg0 = guard.allocate_page().unwrap();
+            let pg1 = guard.allocate_page().unwrap();
+
+            let page0 = guard.write_page(pg0).unwrap();
+            *page0 = Page::new_leaf();
+            page0.set_num_rows(1);
+            page0.update_checksum();
+
+            let page1 = guard.write_page(pg1).unwrap();
+            *page1 = Page::new_branch();
+            page1.set_num_rows(2);
+            page1.update_checksum();
+
+            after_images = guard.commit().unwrap();
+        }
+
+        // Should have after-images for both pages
+        assert_eq!(after_images.len(), 2);
+        let page_nos: Vec<u32> = after_images.iter().map(|(pn, _)| *pn).collect();
+        assert!(page_nos.contains(&0));
+        assert!(page_nos.contains(&1));
+    }
+
+    #[test]
+    fn test_discard_produces_no_visible_changes() {
+        let tmp = NamedTempFile::new().unwrap();
+        let pf = PageFile::open(tmp.path()).unwrap();
+
+        // First create a page with known data
+        {
+            let mut guard = pf.begin_write();
+            let pg0 = guard.allocate_page().unwrap();
+            let page = guard.write_page(pg0).unwrap();
+            *page = Page::new_leaf();
+            page.set_num_rows(5);
+            page.update_checksum();
+            guard.commit().unwrap();
+        }
+
+        // Now modify it but discard
+        {
+            let mut guard = pf.begin_write();
+            let page = guard.write_page(0).unwrap();
+            page.set_num_rows(99);
+            page.update_checksum();
+            guard.discard();
+        }
+
+        // Original value should be unchanged
+        let page = pf.read_page(0).unwrap();
+        assert_eq!(page.num_rows(), 5);
+    }
+
+    #[test]
+    fn test_write_guard_reads_dirty_overlay() {
+        let tmp = NamedTempFile::new().unwrap();
+        let pf = PageFile::open(tmp.path()).unwrap();
+
+        // Create a page
+        {
+            let mut guard = pf.begin_write();
+            let pg0 = guard.allocate_page().unwrap();
+            let page = guard.write_page(pg0).unwrap();
+            *page = Page::new_leaf();
+            page.set_num_rows(1);
+            page.update_checksum();
+            guard.commit().unwrap();
+        }
+
+        // Within a write guard, reads should see the dirty overlay
+        {
+            let mut guard = pf.begin_write();
+            let page = guard.write_page(0).unwrap();
+            page.set_num_rows(42);
+            page.update_checksum();
+
+            // Reading within the same guard should see 42
+            let read = guard.read_page(0).unwrap();
+            assert_eq!(read.num_rows(), 42);
+            guard.discard();
+        }
+
+        // After discard, original is unchanged
+        let page = pf.read_page(0).unwrap();
+        assert_eq!(page.num_rows(), 1);
+    }
 }
