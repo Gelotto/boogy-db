@@ -3,6 +3,9 @@ use crate::file::PageFile;
 use crate::page::{Page, PAGE_BRANCH, PAGE_HEADER_SIZE, PAGE_LEAF, PAGE_SIZE};
 use crate::row;
 
+/// Checksum occupies the last 4 bytes of each page.
+const CHECKSUM_SIZE: usize = 4;
+
 /// A B+ tree rooted at a given page number.
 pub struct BTree<'a> {
     file: &'a mut PageFile,
@@ -35,10 +38,8 @@ impl<'a> BTree<'a> {
                 new_page,
                 separator,
             } => {
-                // Create new root branch page with old root as left child and new_page as right
                 let new_root = self.file.allocate_page()?;
                 let mut root_page = Page::new_branch();
-                // Layout: child0 | key0 | child1
                 write_branch_entry(&mut root_page, 0, self.root, &separator);
                 set_branch_child(&mut root_page, 1, new_page);
                 root_page.set_num_rows(1);
@@ -62,15 +63,20 @@ impl<'a> BTree<'a> {
 
     /// Iterate all rows in key order. Returns (id, row_bytes) pairs.
     pub fn scan_all(&mut self) -> Result<Vec<(String, Vec<u8>)>> {
-        // Find the leftmost leaf
         let first_leaf = self.find_leftmost_leaf(self.root)?;
         let mut results = Vec::new();
         let mut current = first_leaf;
         loop {
             let page = self.file.read_page(current)?.clone();
-            let rows = collect_leaf_rows(&page);
-            for (id, data) in rows {
-                results.push((id, data));
+            let num_rows = page.num_rows() as usize;
+            for i in 0..num_rows {
+                let (start, end) = row_bounds(&page, i, num_rows);
+                if start < end && end <= PAGE_SIZE {
+                    let data = &page.data[start..end];
+                    if let Ok(id) = row::extract_id(data) {
+                        results.push((id.to_string(), data.to_vec()));
+                    }
+                }
             }
             let next = page.next_leaf();
             if next == 0 {
@@ -124,74 +130,86 @@ impl<'a> BTree<'a> {
         id: &str,
         row_data: &[u8],
     ) -> Result<InsertResult> {
-        // Check for duplicate
         let num_rows = page.num_rows() as usize;
-        for i in 0..num_rows {
-            let (start, end) = row_bounds(page, i, num_rows);
-            if start < end && end <= PAGE_SIZE {
-                let existing_id = row::extract_id(&page.data[start..end])?;
-                if existing_id == id {
-                    return Err(BoogyError::DuplicateKey(id.to_string()));
-                }
-            }
+
+        // Binary search for insertion point and duplicate check.
+        let (pos, found) = find_insertion_point(page, id)?;
+        if found {
+            return Err(BoogyError::DuplicateKey(id.to_string()));
         }
 
-        // Collect all existing rows and add the new one
-        let mut all_rows = collect_leaf_rows(page);
-        all_rows.push((id.to_string(), row_data.to_vec()));
+        // Check if the new row fits in the current page.
+        // After insert we need:  header + (num_rows+1)*2 offsets + existing_data + new_row + checksum
+        let offset_array_start = PAGE_HEADER_SIZE + num_rows * 2;
+        let current_free = page.free_space_offset() as usize;
+        // existing_data_size: bytes of row data currently stored
+        // (row data lives between the old offset array end and free_space_offset)
+        let existing_data_size = if current_free > offset_array_start {
+            current_free - offset_array_start
+        } else {
+            0
+        };
+        let needed = PAGE_HEADER_SIZE
+            + (num_rows + 1) * 2
+            + existing_data_size
+            + row_data.len()
+            + CHECKSUM_SIZE;
 
-        // Check if all rows fit in a single page
-        let total_row_bytes: usize = all_rows.iter().map(|(_, d)| d.len()).sum();
-        let offset_array_bytes = all_rows.len() * 2;
-        let total_needed = PAGE_HEADER_SIZE + offset_array_bytes + total_row_bytes + 4; // +4 checksum
+        if needed <= PAGE_SIZE {
+            // --- Fits: in-place insert ---
+            // Take a snapshot of the old page data so we can read from it while
+            // writing to the mutable page. This avoids per-row heap allocation:
+            // one stack-sized copy of 4 KiB instead of N String+Vec pairs.
+            let snapshot = page.data;
 
-        if total_needed <= PAGE_SIZE {
-            // Fits: rebuild the page with all rows
-            let next = page.next_leaf();
-            let prev = page.prev_leaf();
             let page = self.file.write_page(page_no)?;
-            rebuild_leaf(page, &all_rows);
-            page.set_next_leaf(next);
-            page.set_prev_leaf(prev);
+            write_leaf_with_insert(page, &snapshot, num_rows, pos, row_data);
             page.update_checksum();
             Ok(InsertResult::Fit)
         } else {
-            // Split: sort all rows, split in half
-            all_rows.sort_by(|a, b| a.0.cmp(&b.0));
+            // --- Split ---
+            // Snapshot the page, then build two halves directly.
+            let snapshot = page.data;
+            let next_leaf = page.next_leaf();
+            let prev_leaf = page.prev_leaf();
+            let total = num_rows + 1;
+            let mid = total / 2;
 
-            let mid = all_rows.len() / 2;
-            let left_rows = &all_rows[..mid];
-            let right_rows = &all_rows[mid..];
-            let separator = right_rows[0].0.clone();
-
-            // Allocate new page for the right half
+            // Allocate right page first so we have its page_no for linking.
             let new_page_no = self.file.allocate_page()?;
 
-            // Get the old next_leaf before we modify this page
-            let old_next = {
-                let p = self.file.read_page(page_no)?.clone();
-                p.next_leaf()
-            };
+            // Extract separator: the _id of the first row in the right half.
+            // We need to figure out which original row index that corresponds to.
+            let separator = extract_id_at_virtual_pos(&snapshot, num_rows, pos, row_data, mid)?;
 
-            // Rebuild left page
+            // Write left half (indices 0..mid).
             let left_page = self.file.write_page(page_no)?;
-            rebuild_leaf(left_page, left_rows);
+            write_leaf_range(left_page, &snapshot, num_rows, pos, row_data, 0, mid);
             left_page.set_next_leaf(new_page_no);
+            left_page.set_prev_leaf(prev_leaf);
             left_page.update_checksum();
 
-            // Build right page
-            let mut new_page = Page::new_leaf();
-            rebuild_leaf(&mut new_page, right_rows);
-            new_page.set_prev_leaf(page_no);
-            new_page.set_next_leaf(old_next);
-            new_page.update_checksum();
-            self.file.put_page(new_page_no, new_page);
+            // Write right half (indices mid..total).
+            let mut right_page = Page::new_leaf();
+            write_leaf_range(
+                &mut right_page,
+                &snapshot,
+                num_rows,
+                pos,
+                row_data,
+                mid,
+                total,
+            );
+            right_page.set_prev_leaf(page_no);
+            right_page.set_next_leaf(next_leaf);
+            right_page.update_checksum();
+            self.file.put_page(new_page_no, right_page);
 
-            // Update old next page's prev pointer if it exists
-            if old_next != 0 {
-                let next_page = self.file.write_page(old_next)?;
-                next_page.set_prev_leaf(new_page_no);
-                next_page.update_checksum();
+            // Fix up the old next page's prev pointer.
+            if next_leaf != 0 {
+                let np = self.file.write_page(next_leaf)?;
+                np.set_prev_leaf(new_page_no);
+                np.update_checksum();
             }
 
             Ok(InsertResult::Split {
@@ -211,9 +229,7 @@ impl<'a> BTree<'a> {
         let page = self.file.read_page(page_no)?.clone();
         let num_keys = page.num_rows() as usize;
 
-        // Max keys that fit in a branch page
-        // Layout: header(16) + entries * BRANCH_ENTRY_SIZE + last_child(4) + checksum(4)
-        let max_keys = (PAGE_SIZE - PAGE_HEADER_SIZE - 4 - 4) / BRANCH_ENTRY_SIZE;
+        let max_keys = (PAGE_SIZE - PAGE_HEADER_SIZE - 4 - CHECKSUM_SIZE) / BRANCH_ENTRY_SIZE;
 
         if num_keys < max_keys {
             let page = self.file.write_page(page_no)?;
@@ -221,23 +237,16 @@ impl<'a> BTree<'a> {
             page.update_checksum();
             Ok(InsertResult::Fit)
         } else {
-            // Split the branch
             let (children, keys) = collect_branch_flat(&page);
-            // children: [c0, c1, ..., cN] (N+1 children for N keys)
-            // keys: [k0, k1, ..., kN-1]
-            // Insert separator at position child_idx, and new_child after children[child_idx]
-            let mut new_children = children.clone();
-            let mut new_keys = keys.clone();
+            let mut new_children = children;
+            let mut new_keys = keys;
             new_keys.insert(child_idx, separator.to_string());
             new_children.insert(child_idx + 1, new_child);
 
-            // Now split: total keys = new_keys.len()
             let total_keys = new_keys.len();
             let mid = total_keys / 2;
             let split_key = new_keys[mid].clone();
 
-            // Left branch: keys[0..mid], children[0..mid+1]
-            // Right branch: keys[mid+1..], children[mid+1..]
             let left_keys = &new_keys[..mid];
             let left_children = &new_children[..mid + 1];
             let right_keys = &new_keys[mid + 1..];
@@ -265,14 +274,16 @@ impl<'a> BTree<'a> {
 
         if page.is_leaf() {
             let num_rows = page.num_rows() as usize;
-            for i in 0..num_rows {
-                let (start, end) = row_bounds(&page, i, num_rows);
+            if num_rows == 0 {
+                return Ok(None);
+            }
+
+            // Binary search for the target id.
+            let (pos, found) = find_insertion_point(&page, id)?;
+            if found {
+                let (start, end) = row_bounds(&page, pos, num_rows);
                 if start < end && end <= PAGE_SIZE {
-                    let row_bytes = &page.data[start..end];
-                    let row_id = row::extract_id(row_bytes)?;
-                    if row_id == id {
-                        return Ok(Some(row_bytes.to_vec()));
-                    }
+                    return Ok(Some(page.data[start..end].to_vec()));
                 }
             }
             Ok(None)
@@ -286,18 +297,26 @@ impl<'a> BTree<'a> {
         let page = self.file.read_page(page_no)?.clone();
 
         if page.is_leaf() {
-            let mut rows = collect_leaf_rows(&page);
-            let original_len = rows.len();
-            rows.retain(|r| r.0 != id);
-            if rows.len() == original_len {
+            let num_rows = page.num_rows() as usize;
+            if num_rows == 0 {
                 return Ok(false);
             }
-            let next = page.next_leaf();
-            let prev = page.prev_leaf();
+
+            // Binary search for the row to delete.
+            let (pos, found) = find_insertion_point(&page, id)?;
+            if !found {
+                return Ok(false);
+            }
+
+            // Snapshot old data, then rebuild without the deleted row.
+            let snapshot = page.data;
+            let next_leaf = page.next_leaf();
+            let prev_leaf = page.prev_leaf();
+
             let page = self.file.write_page(page_no)?;
-            rebuild_leaf(page, &rows);
-            page.set_next_leaf(next);
-            page.set_prev_leaf(prev);
+            write_leaf_without(page, &snapshot, num_rows, pos);
+            page.set_next_leaf(next_leaf);
+            page.set_prev_leaf(prev_leaf);
             page.update_checksum();
             Ok(true)
         } else {
@@ -312,18 +331,11 @@ enum InsertResult {
     Split { new_page: u32, separator: String },
 }
 
-// --- Leaf page layout ---
-//
-// Rows are stored sequentially after the offset array.
-// Layout:
-//   [header: 16 bytes]
-//   [offset_array: num_rows * 2 bytes] -- each entry is a u16 offset into the page
-//   [row_data: variable] -- rows packed one after another
-//   [... free space ...]
-//   [checksum: 4 bytes at PAGE_SIZE-4]
-//
-// free_space_offset tracks the end of the row data region (next write position).
+// ---------------------------------------------------------------------------
+// Leaf page helpers
+// ---------------------------------------------------------------------------
 
+/// Compute the byte range [start, end) for row `i` in the page data.
 fn row_bounds(page: &Page, i: usize, num_rows: usize) -> (usize, usize) {
     let start = page.row_offset(i as u16) as usize;
     let end = if i + 1 < num_rows {
@@ -334,71 +346,205 @@ fn row_bounds(page: &Page, i: usize, num_rows: usize) -> (usize, usize) {
     (start, end)
 }
 
-fn append_row_to_leaf(page: &mut Page, row_data: &[u8]) {
-    let num_rows = page.num_rows() as usize;
-    let free = page.free_space_offset() as usize;
-    // Ensure we don't write into the offset array area.
-    // After this insert, the offset array will have (num_rows + 1) entries.
-    let offset_array_end = PAGE_HEADER_SIZE + (num_rows + 1) * 2;
-    let write_at = free.max(offset_array_end);
-
-    page.data[write_at..write_at + row_data.len()].copy_from_slice(row_data);
-    page.set_row_offset(num_rows as u16, write_at as u16);
-    page.set_num_rows((num_rows + 1) as u16);
-    page.set_free_space_offset((write_at + row_data.len()) as u16);
+/// Same as row_bounds but operates on a raw data snapshot.
+fn row_bounds_raw(data: &[u8; PAGE_SIZE], i: usize, num_rows: usize) -> (usize, usize) {
+    let start = raw_row_offset(data, i) as usize;
+    let end = if i + 1 < num_rows {
+        raw_row_offset(data, i + 1) as usize
+    } else {
+        raw_free_space_offset(data) as usize
+    };
+    (start, end)
 }
 
-fn collect_leaf_rows(page: &Page) -> Vec<(String, Vec<u8>)> {
+fn raw_row_offset(data: &[u8; PAGE_SIZE], i: usize) -> u16 {
+    let base = PAGE_HEADER_SIZE + i * 2;
+    u16::from_le_bytes([data[base], data[base + 1]])
+}
+
+fn raw_free_space_offset(data: &[u8; PAGE_SIZE]) -> u16 {
+    u16::from_le_bytes([data[6], data[7]])
+}
+
+/// Binary search within a leaf page for the insertion point of `id`.
+/// Returns (index, true) if an exact match is found, or (index, false)
+/// for the position where `id` should be inserted to maintain sort order.
+fn find_insertion_point(page: &Page, id: &str) -> Result<(usize, bool)> {
     let num_rows = page.num_rows() as usize;
-    let mut rows = Vec::with_capacity(num_rows);
-    for i in 0..num_rows {
-        let (start, end) = row_bounds(page, i, num_rows);
-        if start < end && end <= PAGE_SIZE {
-            let data = page.data[start..end].to_vec();
-            if let Ok(id) = row::extract_id(&data) {
-                rows.push((id.to_string(), data));
-            }
+    if num_rows == 0 {
+        return Ok((0, false));
+    }
+    let mut lo = 0usize;
+    let mut hi = num_rows;
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        let (start, end) = row_bounds(page, mid, num_rows);
+        let mid_id = row::extract_id(&page.data[start..end])?;
+        match mid_id.cmp(id) {
+            std::cmp::Ordering::Less => lo = mid + 1,
+            std::cmp::Ordering::Greater => hi = mid,
+            std::cmp::Ordering::Equal => return Ok((mid, true)),
         }
     }
-    rows
+    Ok((lo, false))
 }
 
-fn rebuild_leaf(page: &mut Page, rows: &[(String, Vec<u8>)]) {
-    // Reset the leaf page (keep magic + leaf flag, clear everything else)
+/// Write a leaf page that contains the rows from `snapshot` (which has
+/// `old_count` rows) plus a new row inserted at position `insert_pos`.
+/// No heap allocation: reads from the snapshot, writes into `page`.
+fn write_leaf_with_insert(
+    page: &mut Page,
+    snapshot: &[u8; PAGE_SIZE],
+    old_count: usize,
+    insert_pos: usize,
+    new_row: &[u8],
+) {
+    let total = old_count + 1;
     page.set_flags(PAGE_LEAF);
     page.set_num_rows(0);
     page.set_next_leaf(0);
     page.set_prev_leaf(0);
 
-    // Clear the data area (between header and checksum)
-    for b in page.data[PAGE_HEADER_SIZE..PAGE_SIZE - 4].iter_mut() {
-        *b = 0;
+    // Clear data area.
+    page.data[PAGE_HEADER_SIZE..PAGE_SIZE - CHECKSUM_SIZE].fill(0);
+
+    let data_start = PAGE_HEADER_SIZE + total * 2;
+    let mut write_pos = data_start;
+
+    let mut dst_idx = 0usize;
+    let mut src_idx = 0usize;
+    while dst_idx < total {
+        if dst_idx == insert_pos {
+            // Write the new row.
+            page.data[write_pos..write_pos + new_row.len()].copy_from_slice(new_row);
+            page.set_row_offset(dst_idx as u16, write_pos as u16);
+            write_pos += new_row.len();
+            dst_idx += 1;
+        } else {
+            // Copy existing row from snapshot.
+            let (s, e) = row_bounds_raw(snapshot, src_idx, old_count);
+            let len = e - s;
+            page.data[write_pos..write_pos + len].copy_from_slice(&snapshot[s..e]);
+            page.set_row_offset(dst_idx as u16, write_pos as u16);
+            write_pos += len;
+            src_idx += 1;
+            dst_idx += 1;
+        }
     }
 
-    // Pre-compute offset array size so row data starts after it
-    let offset_array_size = rows.len() * 2;
-    let data_start = PAGE_HEADER_SIZE + offset_array_size;
-    page.set_free_space_offset(data_start as u16);
+    page.set_num_rows(total as u16);
+    page.set_free_space_offset(write_pos as u16);
+}
 
-    for (_, data) in rows {
-        append_row_to_leaf(page, data);
+/// Write a leaf page that contains the rows from `snapshot` except the row at
+/// `skip_pos`. No heap allocation.
+fn write_leaf_without(
+    page: &mut Page,
+    snapshot: &[u8; PAGE_SIZE],
+    old_count: usize,
+    skip_pos: usize,
+) {
+    let total = old_count - 1;
+    page.set_flags(PAGE_LEAF);
+    page.set_num_rows(0);
+    page.set_next_leaf(0);
+    page.set_prev_leaf(0);
+
+    page.data[PAGE_HEADER_SIZE..PAGE_SIZE - CHECKSUM_SIZE].fill(0);
+
+    let data_start = PAGE_HEADER_SIZE + total * 2;
+    let mut write_pos = data_start;
+    let mut dst_idx = 0usize;
+
+    for src_idx in 0..old_count {
+        if src_idx == skip_pos {
+            continue;
+        }
+        let (s, e) = row_bounds_raw(snapshot, src_idx, old_count);
+        let len = e - s;
+        page.data[write_pos..write_pos + len].copy_from_slice(&snapshot[s..e]);
+        page.set_row_offset(dst_idx as u16, write_pos as u16);
+        write_pos += len;
+        dst_idx += 1;
+    }
+
+    page.set_num_rows(total as u16);
+    page.set_free_space_offset(write_pos as u16);
+}
+
+/// Write a subset [range_start..range_end) of the "virtual" row sequence
+/// (the old rows with a new row inserted at `insert_pos`) into `page`.
+fn write_leaf_range(
+    page: &mut Page,
+    snapshot: &[u8; PAGE_SIZE],
+    old_count: usize,
+    insert_pos: usize,
+    new_row: &[u8],
+    range_start: usize,
+    range_end: usize,
+) {
+    let count = range_end - range_start;
+    page.set_flags(PAGE_LEAF);
+    page.set_num_rows(0);
+    page.set_next_leaf(0);
+    page.set_prev_leaf(0);
+
+    page.data[PAGE_HEADER_SIZE..PAGE_SIZE - CHECKSUM_SIZE].fill(0);
+
+    let data_start = PAGE_HEADER_SIZE + count * 2;
+    let mut write_pos = data_start;
+
+    for dst_idx in 0..count {
+        let virtual_idx = range_start + dst_idx;
+        if virtual_idx == insert_pos {
+            // This is the newly inserted row.
+            page.data[write_pos..write_pos + new_row.len()].copy_from_slice(new_row);
+            page.set_row_offset(dst_idx as u16, write_pos as u16);
+            write_pos += new_row.len();
+        } else {
+            // Map virtual index back to original index.
+            let orig_idx = if virtual_idx < insert_pos {
+                virtual_idx
+            } else {
+                virtual_idx - 1
+            };
+            let (s, e) = row_bounds_raw(snapshot, orig_idx, old_count);
+            let len = e - s;
+            page.data[write_pos..write_pos + len].copy_from_slice(&snapshot[s..e]);
+            page.set_row_offset(dst_idx as u16, write_pos as u16);
+            write_pos += len;
+        }
+    }
+
+    page.set_num_rows(count as u16);
+    page.set_free_space_offset(write_pos as u16);
+}
+
+/// Extract the _id of the row at a given position in the virtual sequence
+/// (old rows + new row inserted at `insert_pos`).
+fn extract_id_at_virtual_pos(
+    snapshot: &[u8; PAGE_SIZE],
+    old_count: usize,
+    insert_pos: usize,
+    new_row: &[u8],
+    virtual_pos: usize,
+) -> Result<String> {
+    if virtual_pos == insert_pos {
+        Ok(row::extract_id(new_row)?.to_string())
+    } else {
+        let orig_idx = if virtual_pos < insert_pos {
+            virtual_pos
+        } else {
+            virtual_pos - 1
+        };
+        let (s, e) = row_bounds_raw(snapshot, orig_idx, old_count);
+        Ok(row::extract_id(&snapshot[s..e])?.to_string())
     }
 }
 
-// --- Branch page layout ---
-//
-// Fixed-size entry format for simplicity:
-//   [header: 16 bytes]
-//   [child0: 4 bytes][key0_len: 2 bytes][key0: 36 bytes] = entry 0
-//   [child1: 4 bytes][key1_len: 2 bytes][key1: 36 bytes] = entry 1
-//   ...
-//   [childN: 4 bytes] = last child (just the pointer, no key)
-//   [checksum: 4 bytes]
-//
-// Each entry is BRANCH_ENTRY_SIZE = 42 bytes (4 + 2 + 36).
-// num_rows stores num_keys.
-// Total children = num_keys + 1.
-// The last child pointer is at offset = header + num_keys * 42, occupying just 4 bytes.
+// ---------------------------------------------------------------------------
+// Branch page helpers (unchanged fixed-42-byte entry format)
+// ---------------------------------------------------------------------------
 
 const BRANCH_ENTRY_SIZE: usize = 42; // 4 (child) + 2 (key_len) + 36 (key data)
 
@@ -421,7 +567,6 @@ fn find_child(page: &Page, id: &str) -> (usize, u32) {
             return (i, get_branch_child(page, i));
         }
     }
-    // Return last child
     let last_child_offset = PAGE_HEADER_SIZE + num_keys * BRANCH_ENTRY_SIZE;
     let child = u32::from_le_bytes(
         page.data[last_child_offset..last_child_offset + 4]
@@ -437,7 +582,6 @@ fn write_branch_entry(page: &mut Page, idx: usize, child: u32, key: &str) {
     let key_bytes = key.as_bytes();
     let key_len = key_bytes.len().min(36);
     page.data[offset + 4..offset + 6].copy_from_slice(&(key_len as u16).to_le_bytes());
-    // Clear the key area first
     page.data[offset + 6..offset + 6 + 36].fill(0);
     page.data[offset + 6..offset + 6 + key_len].copy_from_slice(&key_bytes[..key_len]);
 }
@@ -448,7 +592,6 @@ fn set_branch_child(page: &mut Page, idx: usize, child: u32) {
 }
 
 fn insert_branch_entry(page: &mut Page, child_idx: usize, key: &str, new_child: u32) {
-    // Collect flat representation BEFORE any modifications
     let (children, keys) = collect_branch_flat(page);
     let mut new_children = children;
     let mut new_keys = keys;
@@ -458,8 +601,6 @@ fn insert_branch_entry(page: &mut Page, child_idx: usize, key: &str, new_child: 
     page.set_num_rows(new_keys.len() as u16);
 }
 
-/// Collect branch page as flat arrays of children and keys.
-/// Returns (children, keys) where children.len() == keys.len() + 1.
 fn collect_branch_flat(page: &Page) -> (Vec<u32>, Vec<String>) {
     let num_keys = page.num_rows() as usize;
     let mut children = Vec::with_capacity(num_keys + 1);
@@ -472,19 +613,13 @@ fn collect_branch_flat(page: &Page) -> (Vec<u32>, Vec<String>) {
     (children, keys)
 }
 
-/// Rebuild a branch page from flat arrays.
-/// children.len() == keys.len() + 1
 fn rebuild_branch_flat(page: &mut Page, children: &[u32], keys: &[String]) {
     page.set_flags(PAGE_BRANCH);
     page.set_num_rows(keys.len() as u16);
-
-    // Clear data area
-    page.data[PAGE_HEADER_SIZE..PAGE_SIZE - 4].fill(0);
-
+    page.data[PAGE_HEADER_SIZE..PAGE_SIZE - CHECKSUM_SIZE].fill(0);
     for (i, key) in keys.iter().enumerate() {
         write_branch_entry(page, i, children[i], key);
     }
-    // Write last child
     set_branch_child(page, keys.len(), children[keys.len()]);
 }
 
