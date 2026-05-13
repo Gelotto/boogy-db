@@ -97,6 +97,7 @@ impl<'a> BTree<'a> {
         filter_val: &crate::value::Value,
         limit: Option<u32>,
         offset: Option<u32>,
+        stop_after: Option<u64>,
     ) -> Result<(Vec<(u64, Vec<u8>)>, u64)> {
         let first_leaf = self.find_leftmost_leaf(self.root)?;
         let mut total: u64 = 0;
@@ -127,6 +128,11 @@ impl<'a> BTree<'a> {
                     if total > skip && (total - skip) <= take {
                         if let Ok(id) = row::extract_id(data) {
                             results.push((id, data.to_vec()));
+                        }
+                    }
+                    if let Some(max) = stop_after {
+                        if total >= max {
+                            return Ok((results, total));
                         }
                     }
                 }
