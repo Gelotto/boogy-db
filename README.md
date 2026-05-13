@@ -21,13 +21,14 @@ A fast embedded storage engine for Rust, purpose-built for concurrent API worklo
 
 - **Integer-keyed B+ tree** with auto-increment row IDs and fixed 12-byte branch entries for high fanout
 - **Secondary indexes** via composite-key B+ trees with O(log n) lookup and insert
-- **Concurrent readers** that never block each other or writers (lock-free read path via `Arc<Page>` cache)
+- **Concurrent readers** that never block each other or writers (shared `RwLock` read on `Arc<Page>` cache — clone pointer and release)
 - **Per-table write locks** so writes to different tables are fully concurrent
-- **Redo-log WAL** with configurable durability — commits write only to the WAL (one I/O per page), data file flushed on checkpoint
-- **Crash recovery** via WAL redo replay on open
-- **Lazy row decoding** that defers column extraction until access, avoiding allocation on the query hot path
-- **Zero-copy filter evaluation** that compares raw bytes on disk pages without decoding values
-- **Batch bulk operations** that walk the leaf chain once for delete/update instead of per-row tree surgery
+- **Redo-log WAL** with configurable durability — commits write after-images to the WAL only, data file flushed on checkpoint
+- **Crash recovery** via forward WAL replay (redo) on open
+- **Lazy row decoding** — `Row` stores raw bytes; `get(column)` decodes only the requested column via binary search on the offset directory
+- **Zero-copy filter evaluation** — `extract_column_raw` returns a slice into the page; `eval_filter_raw` compares raw bytes without allocating a `Value`
+- **In-place row patching** — `patch_row` splices raw bytes for single-column updates without full decode/encode
+- **Batch bulk operations** — `delete_matching`/`update_matching` walk the leaf chain once, rebuilding each page in a single pass instead of per-row tree surgery
 
 ## Quick Start
 
@@ -238,11 +239,12 @@ boogy-db now beats SQLite on bulk inserts at ALL batch sizes (without index). Bu
 ## Architecture
 
 - **Storage**: Single file per database, 4 KB page-aligned. Page 0 is the system page (table registry). Each table is a separate B+ tree.
-- **Row format**: `[rowid:8][num_cols:2][offset_directory][column_data]`. The offset directory enables O(1) column access by ID via binary search. Updates use `patch_row` to splice raw bytes without full decode.
-- **B+ tree**: u64 integer keys with fixed 12-byte branch entries (`[child:4][key:8]`). Leaf pages store rows inline with a row-offset array. Bulk operations walk the leaf chain for batch page rebuilds.
-- **Indexes**: Each secondary index is a separate B+ tree keyed by composite `(encoded_value, rowid)` bytes. Values are encoded for correct byte-order sorting (integers: big-endian with sign-flip; floats: IEEE 754 with sign normalization; text: null-terminated UTF-8).
-- **Concurrency**: Per-table `RwLock` for table metadata. Page cache uses `RwLock<Vec<Option<Arc<Page>>>>` so readers clone `Arc` pointers without blocking. Writers get exclusive access to a dirty-page overlay via `WriteGuard`. BTreeReader/IndexTreeReader take `&PageFile` for lock-free reads.
-- **WAL**: Redo-log (after-image) design. Commits write new page data to the WAL only — the data file is never modified during commits. On clean shutdown, all cached pages are flushed to the data file and the WAL is truncated. On crash recovery, the WAL is replayed forward to apply committed changes. Configurable durability: `Immediate` (fsync WAL every commit), `Normal` (WAL writes without fsync), `None` (no WAL writes).
+- **Row format**: `[rowid:8][num_cols:2][offset_directory: num_cols × 4 bytes][column_data]`. Each offset directory entry is `[col_id:2][data_offset:2]`, sorted by `col_id` for binary-search column access. `patch_row` splices raw bytes to replace a single column without full decode/encode; `patch_row_multi` chains patches for multi-column updates.
+- **B+ tree**: `BTreeReader` (takes `&PageFile`, read-only) and `BTreeWriter` (takes `&mut WriteGuard`, exclusive). u64 integer keys with fixed 12-byte branch entries (`[child:4][key:8]`). Leaf pages store rows inline with a row-offset array. `scan_filtered` evaluates filters on raw page bytes via `extract_column_raw` + `eval_filter_raw`, falling back to decode only when the raw path doesn't cover the type/op. `delete_matching`/`update_matching` walk the leaf chain once for batch page rebuilds. `multi_get_sorted` batch-fetches clustered rowids via a single leaf-chain walk.
+- **Indexes**: Each secondary index is a separate B+ tree (`IndexTreeReader`/`IndexTreeWriter`) keyed by composite `(encoded_value, rowid)` bytes. Values are encoded for correct byte-order sorting (integers: big-endian with sign-flip; floats: IEEE 754 with sign normalization; text: null-terminated UTF-8). Index lookups use `scan_prefix` to find all rowids for a value, then `multi_get_sorted` to batch-fetch the matching rows.
+- **Concurrency**: Per-table `RwLock` for table metadata. Page cache is `RwLock<Vec<Option<Arc<Page>>>>` — readers take a shared lock, clone the `Arc` pointer, and release immediately. Writers get exclusive access to a `Mutex<WriteState>` dirty-page overlay via `WriteGuard`; `peek_dirty` provides zero-copy reads of dirty pages during tree traversal. `BTreeReader`/`IndexTreeReader` take `&PageFile` and never hold any lock during tree traversal.
+- **Lazy Row**: The public `Row` type stores raw bytes (`Vec<u8>`) and column names (`Arc<Vec<String>>`). `row.get("name")` decodes only the requested column via `extract_column` (binary search on the offset directory). `row.columns()` does full decode only when all columns are needed.
+- **WAL**: Redo-log (after-image) design. `WriteGuard::commit()` publishes dirty pages to the shared cache and returns after-images. The commit path writes these after-images to the WAL — the data file is never modified during commits. On clean shutdown (`Drop`), all cached pages are flushed to the data file and the WAL is truncated. On crash recovery, the WAL is replayed forward to apply committed pages. Configurable durability: `Immediate` (fsync WAL every commit), `Normal` (WAL writes without fsync), `None` (no WAL writes).
 
 ## License
 
