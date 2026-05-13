@@ -637,7 +637,7 @@ fn extract_id_at_virtual_pos(
 }
 
 // ---------------------------------------------------------------------------
-// Branch page helpers (unchanged fixed-42-byte entry format)
+// Branch page helpers (fixed 12-byte entry format: [child:4][key:8])
 // ---------------------------------------------------------------------------
 
 const BRANCH_ENTRY_SIZE: usize = 12; // 4 (child) + 8 (key u64 LE)
