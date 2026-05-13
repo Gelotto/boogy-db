@@ -13,11 +13,35 @@ use crate::table::{IndexMeta, TableMeta};
 use crate::value::{ColumnDef, Type, Value};
 use crate::wal::Wal;
 
-/// A row returned from queries.
+/// A row returned from queries. Wraps raw bytes; decodes columns on demand.
 #[derive(Debug, Clone)]
 pub struct Row {
     pub id: u64,
-    pub columns: Vec<(String, Value)>,
+    data: Vec<u8>,
+    col_names: Arc<Vec<String>>,
+}
+
+impl Row {
+    fn from_raw(bytes: &[u8], col_names: Arc<Vec<String>>) -> Result<Self> {
+        let id = row::extract_id(bytes)?;
+        Ok(Self { id, data: bytes.to_vec(), col_names })
+    }
+
+    /// Get a single column value by name. Decodes only that column.
+    pub fn get(&self, column: &str) -> Option<Value> {
+        let col_id = self.col_names.iter().position(|n| n == column)? as u16;
+        row::extract_column(&self.data, col_id).ok().flatten()
+    }
+
+    /// Decode all columns.
+    pub fn columns(&self) -> Vec<(String, Value)> {
+        match row::decode_row(&self.data) {
+            Ok(decoded) => decoded.columns.into_iter().filter_map(|(col_id, val)| {
+                self.col_names.get(col_id as usize).map(|name| (name.clone(), val))
+            }).collect(),
+            Err(_) => Vec::new(),
+        }
+    }
 }
 
 /// Durability level for write operations.
@@ -765,8 +789,7 @@ impl BoogyDb {
         // 4. Decode outside any file lock.
         match result {
             Some(bytes) => {
-                let decoded = row::decode_row(&bytes)?;
-                Ok(Some(decoded_to_row(decoded, &state.meta)))
+                Ok(Some(Row::from_raw(&bytes, state.meta.col_names.clone())?))
             }
             None => Ok(None),
         }
@@ -962,25 +985,29 @@ impl BoogyDb {
             // Check if we need to apply additional filters beyond the indexed one
             let has_extra_filters = opts.filters.len() > 1;
 
+            let col_names = state.meta.col_names.clone();
             let mut rows = Vec::with_capacity(raw_rows.len());
             for bytes in &raw_rows {
-                let decoded = row::decode_row(bytes)?;
-                let row = decoded_to_row(decoded, &state.meta);
                 if has_extra_filters {
                     let passes = opts.filters.iter().all(|f| {
-                        let col_val = row
-                            .columns
-                            .iter()
-                            .find(|(name, _)| name == &f.column)
-                            .map(|(_, v)| v);
-                        match col_val {
-                            Some(v) => f.matches(v),
-                            None => f.matches(&Value::Null),
+                        if let Some(col_id) = state.meta.col_id(&f.column) {
+                            if let Ok(Some(raw)) = row::extract_column_raw(bytes, col_id) {
+                                if let Some(result) = crate::filter::eval_filter_raw(raw, &f.op, &f.value) {
+                                    return result;
+                                }
+                            }
+                            let col_val = row::extract_column(bytes, col_id).ok().flatten();
+                            let actual = col_val.as_ref().unwrap_or(&Value::Null);
+                            f.matches(actual)
+                        } else {
+                            f.matches(&Value::Null)
                         }
                     });
-                    if passes { rows.push(row); }
+                    if passes {
+                        rows.push(Row::from_raw(bytes, col_names.clone())?);
+                    }
                 } else {
-                    rows.push(row);
+                    rows.push(Row::from_raw(bytes, col_names.clone())?);
                 }
             }
 
@@ -1032,11 +1059,9 @@ impl BoogyDb {
                 };
                 let (raw_rows, count) = tree.scan_filtered(col_id, f.op, &f.value, lim, off, stop)?;
                 drop(file);
+                let col_names = state.meta.col_names.clone();
                 let matching: Vec<Row> = raw_rows.iter()
-                    .map(|(_, bytes)| {
-                        let decoded = row::decode_row(bytes).unwrap();
-                        decoded_to_row(decoded, &state.meta)
-                    })
+                    .map(|(_, bytes)| Row::from_raw(bytes, col_names.clone()).unwrap())
                     .collect();
                 let total = if opts.include_total { Some(count) } else { None };
                 // scan_filtered already handled limit/offset when sort is empty.
@@ -1056,31 +1081,37 @@ impl BoogyDb {
             let all = tree.scan_all()?;
             drop(file);
             let total = if opts.include_total { Some(all.len() as u64) } else { None };
+            let col_names = state.meta.col_names.clone();
             let matching: Vec<Row> = all.iter()
-                .map(|(_, bytes)| {
-                    let decoded = row::decode_row(bytes).unwrap();
-                    decoded_to_row(decoded, &state.meta)
-                })
+                .map(|(_, bytes)| Row::from_raw(bytes, col_names.clone()).unwrap())
                 .collect();
             (matching, total)
         } else {
-            // Multi-filter: scan all, decode, filter
+            // Multi-filter: scan all, raw-byte filter, lazy Row
             let mut file = self.file.lock().unwrap();
             let mut tree = BTree::new(&mut file, state.meta.root_page);
             let all = tree.scan_all()?;
             drop(file);
+            let col_names = state.meta.col_names.clone();
             let mut matching = Vec::new();
             for (_, bytes) in &all {
-                let decoded = row::decode_row(bytes)?;
-                let row = decoded_to_row(decoded, &state.meta);
                 let passes = opts.filters.iter().all(|f| {
-                    let col_val = row.columns.iter().find(|(name, _)| name == &f.column).map(|(_, v)| v);
-                    match col_val {
-                        Some(v) => f.matches(v),
-                        None => f.matches(&Value::Null),
+                    if let Some(col_id) = state.meta.col_id(&f.column) {
+                        if let Ok(Some(raw)) = row::extract_column_raw(bytes, col_id) {
+                            if let Some(result) = crate::filter::eval_filter_raw(raw, &f.op, &f.value) {
+                                return result;
+                            }
+                        }
+                        let col_val = row::extract_column(bytes, col_id).ok().flatten();
+                        let actual = col_val.as_ref().unwrap_or(&Value::Null);
+                        f.matches(actual)
+                    } else {
+                        f.matches(&Value::Null)
                     }
                 });
-                if passes { matching.push(row); }
+                if passes {
+                    matching.push(Row::from_raw(bytes, col_names.clone())?);
+                }
             }
             let total = if opts.include_total { Some(matching.len() as u64) } else { None };
             (matching, total)
@@ -1090,17 +1121,9 @@ impl BoogyDb {
         let mut matching = matching;
         for sort in opts.sort.iter().rev() {
             matching.sort_by(|a, b| {
-                let va = a
-                    .columns
-                    .iter()
-                    .find(|(n, _)| n == &sort.column)
-                    .map(|(_, v)| v);
-                let vb = b
-                    .columns
-                    .iter()
-                    .find(|(n, _)| n == &sort.column)
-                    .map(|(_, v)| v);
-                let ord = match (va, vb) {
+                let va = a.get(&sort.column);
+                let vb = b.get(&sort.column);
+                let ord = match (&va, &vb) {
                     (Some(a), Some(b)) => a.compare(b).unwrap_or(std::cmp::Ordering::Equal),
                     (Some(_), None) => std::cmp::Ordering::Greater,
                     (None, Some(_)) => std::cmp::Ordering::Less,
@@ -1178,7 +1201,7 @@ impl BoogyDb {
             return Ok(0);
         }
 
-        // Multi-filter: scan all, decode, filter
+        // Multi-filter: scan all, raw-byte filter
         let mut file = self.file.lock().unwrap();
         let mut tree = BTree::new(&mut file, state.meta.root_page);
         let all = tree.scan_all()?;
@@ -1186,13 +1209,18 @@ impl BoogyDb {
 
         let mut count = 0u64;
         for (_, bytes) in &all {
-            let decoded = row::decode_row(bytes)?;
-            let row = decoded_to_row(decoded, &state.meta);
             let passes = filters.iter().all(|f| {
-                let col_val = row.columns.iter().find(|(name, _)| name == &f.column).map(|(_, v)| v);
-                match col_val {
-                    Some(v) => f.matches(v),
-                    None => f.matches(&Value::Null),
+                if let Some(col_id) = state.meta.col_id(&f.column) {
+                    if let Ok(Some(raw)) = row::extract_column_raw(bytes, col_id) {
+                        if let Some(result) = crate::filter::eval_filter_raw(raw, &f.op, &f.value) {
+                            return result;
+                        }
+                    }
+                    let col_val = row::extract_column(bytes, col_id).ok().flatten();
+                    let actual = col_val.as_ref().unwrap_or(&Value::Null);
+                    f.matches(actual)
+                } else {
+                    f.matches(&Value::Null)
                 }
             });
             if passes { count += 1; }
@@ -1356,30 +1384,25 @@ impl BoogyDb {
             // Filter and collect matching row IDs + old data + old bytes for index
             let mut to_update: Vec<(u64, HashMap<u16, Value>, Vec<u8>)> = Vec::new();
             for (_, bytes) in &candidates {
-                let decoded = row::decode_row(bytes)?;
-                let rowid = decoded.id;
-                let old_col_map: HashMap<u16, Value> = decoded.columns.into_iter().collect();
-                let row = Row {
-                    id: rowid,
-                    columns: old_col_map.iter().filter_map(|(col_id, val)| {
-                        state.meta.columns.get(*col_id as usize)
-                            .map(|def| (def.name.clone(), val.clone()))
-                    }).collect(),
-                };
-
                 let passes = filters.iter().all(|f| {
-                    let col_val = row
-                        .columns
-                        .iter()
-                        .find(|(name, _)| name == &f.column)
-                        .map(|(_, v)| v);
-                    match col_val {
-                        Some(v) => f.matches(v),
-                        None => f.matches(&Value::Null),
+                    if let Some(col_id) = state.meta.col_id(&f.column) {
+                        if let Ok(Some(raw)) = row::extract_column_raw(bytes, col_id) {
+                            if let Some(result) = crate::filter::eval_filter_raw(raw, &f.op, &f.value) {
+                                return result;
+                            }
+                        }
+                        let col_val = row::extract_column(bytes, col_id).ok().flatten();
+                        let actual = col_val.as_ref().unwrap_or(&Value::Null);
+                        f.matches(actual)
+                    } else {
+                        f.matches(&Value::Null)
                     }
                 });
 
                 if passes {
+                    let decoded = row::decode_row(bytes)?;
+                    let rowid = decoded.id;
+                    let old_col_map: HashMap<u16, Value> = decoded.columns.into_iter().collect();
                     to_update.push((rowid, old_col_map, bytes.clone()));
                 }
             }
@@ -1451,23 +1474,23 @@ impl BoogyDb {
             // Filter and collect matching row IDs + bytes for index removal
             let mut to_delete: Vec<(u64, Vec<u8>)> = Vec::new();
             for (_, bytes) in &candidates {
-                let decoded = row::decode_row(bytes)?;
-                let rowid = decoded.id;
-                let row = decoded_to_row(decoded, &state.meta);
-
                 let passes = filters.iter().all(|f| {
-                    let col_val = row
-                        .columns
-                        .iter()
-                        .find(|(name, _)| name == &f.column)
-                        .map(|(_, v)| v);
-                    match col_val {
-                        Some(v) => f.matches(v),
-                        None => f.matches(&Value::Null),
+                    if let Some(col_id) = state.meta.col_id(&f.column) {
+                        if let Ok(Some(raw)) = row::extract_column_raw(bytes, col_id) {
+                            if let Some(result) = crate::filter::eval_filter_raw(raw, &f.op, &f.value) {
+                                return result;
+                            }
+                        }
+                        let col_val = row::extract_column(bytes, col_id).ok().flatten();
+                        let actual = col_val.as_ref().unwrap_or(&Value::Null);
+                        f.matches(actual)
+                    } else {
+                        f.matches(&Value::Null)
                     }
                 });
 
                 if passes {
+                    let rowid = row::extract_id(bytes)?;
                     to_delete.push((rowid, bytes.clone()));
                 }
             }
@@ -1598,22 +1621,6 @@ impl<'a> TransactionCtx<'a> {
     }
 }
 
-fn decoded_to_row(decoded: row::DecodedRow, meta: &TableMeta) -> Row {
-    let columns: Vec<(String, Value)> = decoded
-        .columns
-        .into_iter()
-        .filter_map(|(col_id, val)| {
-            meta.columns
-                .get(col_id as usize)
-                .map(|def| (def.name.clone(), val))  // move val, don't clone
-        })
-        .collect();
-    Row {
-        id: decoded.id,
-        columns,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1627,7 +1634,7 @@ mod tests {
         db.create_table("users", &[ColumnDef::new("name", Type::Text)]).unwrap();
         let id = db.insert("users", &[("name", Value::Text("alice".into()))]).unwrap();
         let row = db.get("users", id).unwrap().unwrap();
-        assert_eq!(row.columns[0].1, Value::Text("alice".into()));
+        assert_eq!(row.get("name").unwrap(), Value::Text("alice".into()));
     }
 
     #[test]
@@ -1653,7 +1660,7 @@ mod tests {
         db.insert_with_id("t", 100, &[("v", Value::Integer(42))]).unwrap();
         let row = db.get("t", 100).unwrap().unwrap();
         assert_eq!(row.id, 100);
-        assert_eq!(row.columns[0].1, Value::Integer(42));
+        assert_eq!(row.get("v").unwrap(), Value::Integer(42));
         // next auto-id should be past 100
         let id = db.insert("t", &[("v", Value::Integer(99))]).unwrap();
         assert_eq!(id, 101);
@@ -1668,7 +1675,7 @@ mod tests {
         let id = db.insert("users", &[("name", Value::Text("alice".into()))]).unwrap();
         db.update("users", id, &[("name", Value::Text("bob".into()))]).unwrap();
         let row = db.get("users", id).unwrap().unwrap();
-        assert_eq!(row.columns[0].1, Value::Text("bob".into()));
+        assert_eq!(row.get("name").unwrap(), Value::Text("bob".into()));
     }
 
     #[test]
@@ -1748,7 +1755,7 @@ mod tests {
         let result = db.find("t", opts).unwrap();
         assert_eq!(result.total, Some(10));
         assert_eq!(result.rows.len(), 3);
-        assert_eq!(result.rows[0].columns[0].1, Value::Integer(9));
+        assert_eq!(result.rows[0].get("v").unwrap(), Value::Integer(9));
     }
 
     #[test]
@@ -1795,7 +1802,7 @@ mod tests {
                 let db = Arc::clone(&db);
                 thread::spawn(move || {
                     let row = db.get("t", id).unwrap().unwrap();
-                    assert_eq!(row.columns[0].1, Value::Integer(42));
+                    assert_eq!(row.get("v").unwrap(), Value::Integer(42));
                 })
             })
             .collect();
@@ -1889,7 +1896,7 @@ mod tests {
             let result = db.find("posts", opts).unwrap();
             assert_eq!(result.rows.len(), 1);
             assert_eq!(
-                result.rows[0].columns.iter().find(|(n, _)| n == "likes").unwrap().1,
+                result.rows[0].get("likes").unwrap(),
                 Value::Integer(10)
             );
         }
@@ -2046,7 +2053,7 @@ mod tests {
         let result = db.find("t", opts).unwrap();
         assert_eq!(result.total, Some(1));
         assert_eq!(result.rows.len(), 1);
-        assert_eq!(result.rows[0].columns[0].1, Value::Integer(20));
+        assert_eq!(result.rows[0].get("v").unwrap(), Value::Integer(20));
     }
 
     #[test]
