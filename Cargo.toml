@@ -25,3 +25,6 @@ harness = false
 [[bench]]
 name = "indexed_find_profile"
 harness = false
+[[bench]]
+name = "concurrent_ops"
+harness = false
