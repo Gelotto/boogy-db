@@ -203,36 +203,36 @@ Batch insert, update, and delete operations. Bulk insert uses `insert_many` (boo
 
 | Batch Size | boogy (None) | boogy (Normal) | SQLite | |
 |-----------|-------------|---------------|--------|-|
-| 100 | **844K r/s** | **921K r/s** | 547K r/s | 1.68x |
-| 1,000 | **717K r/s** | **741K r/s** | 578K r/s | 1.28x |
-| 10,000 | **666K r/s** | **674K r/s** | 584K r/s | 1.15x |
-| 50,000 | 553K r/s | 552K r/s | **598K r/s** | 0.92x |
+| 100 | **834K r/s** | **926K r/s** | 523K r/s | 1.77x |
+| 1,000 | **738K r/s** | **744K r/s** | 561K r/s | 1.33x |
+| 10,000 | **688K r/s** | **697K r/s** | 576K r/s | 1.21x |
+| 50,000 | 578K r/s | 569K r/s | **572K r/s** | 1.00x |
 
 **Bulk Insert with Index** on one column:
 
 | Batch Size | boogy (None) | boogy (Normal) | SQLite | |
 |-----------|-------------|---------------|--------|-|
-| 100 | **486K r/s** | **464K r/s** | 445K r/s | 1.04x |
-| 1,000 | 337K r/s | 334K r/s | **447K r/s** | 0.75x |
-| 10,000 | 276K r/s | 268K r/s | **409K r/s** | 0.66x |
-| 50,000 | 214K r/s | 211K r/s | **401K r/s** | 0.53x |
+| 100 | **481K r/s** | **436K r/s** | 436K r/s | 1.00x |
+| 1,000 | 318K r/s | 325K r/s | **430K r/s** | 0.76x |
+| 10,000 | 274K r/s | 266K r/s | **401K r/s** | 0.66x |
+| 50,000 | 210K r/s | 208K r/s | **385K r/s** | 0.54x |
 
 **Bulk Update** (`update_where` vs `UPDATE ... WHERE`, 10K-row table):
 
 | Rows Affected | boogy (None) | boogy (Normal) | SQLite | |
 |---|---|---|---|---|
-| ~1,000 | 274K r/s | 219K r/s | **1.04M r/s** | 0.21x |
-| ~2,000 | 269K r/s | 207K r/s | **1.06M r/s** | 0.20x |
+| ~1,000 | 839K r/s | 462K r/s | **1.07M r/s** | 0.43x |
+| ~2,000 | 886K r/s | 408K r/s | **1.04M r/s** | 0.39x |
 
 **Bulk Delete** (`delete_where` vs `DELETE ... WHERE`, 10K-row table):
 
 | Rows Deleted | boogy (None) | boogy (Normal) | SQLite | |
 |---|---|---|---|---|
-| ~1,000 | 670K r/s | 612K r/s | **2.2M r/s** | 0.28x |
-| ~5,000 | 980K r/s | 867K r/s | **6.0M r/s** | 0.14x |
-| ~9,000 | 1.0M r/s | 916K r/s | **7.6M r/s** | 0.12x |
+| ~1,000 | **3.6M r/s** | **2.7M r/s** | 1.5M r/s | 1.79x |
+| ~5,000 | **4.2M r/s** | **3.4M r/s** | **5.8M r/s** | 0.59x |
+| ~9,000 | **9.3M r/s** | **4.8M r/s** | **7.7M r/s** | 0.63x |
 
-boogy-db wins on small-to-medium bulk inserts. SQLite is significantly faster at bulk update and delete because it modifies rows in-place, while boogy-db performs individual B+ tree delete-and-reinsert operations per row. Indexed bulk inserts also favor SQLite at scale due to tighter C-level index maintenance. These are known areas for future optimization.
+boogy-db wins on small-to-medium bulk inserts and now beats SQLite on small-batch bulk deletes (1.79x at ~1,000 rows). Bulk update closed the gap significantly, from 0.21x to 0.43x (Normal durability vs SQLite), though SQLite still leads there due to its in-place row modification. Indexed bulk inserts also favor SQLite at scale due to tighter C-level index maintenance. Bulk update remains the main area for future optimization.
 
 ## Architecture
 
