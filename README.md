@@ -18,6 +18,7 @@ A fast embedded storage engine for Rust, purpose-built for concurrent API worklo
 - [Encryption](#encryption)
 - [Async API](#async-api)
 - [ACID Transactions](#acid-transactions)
+- [Skills & Guides](#skills--guides)
 - [Architecture](#architecture)
 - [License](#license)
 
@@ -415,6 +416,23 @@ When ACID mode is on, standalone operations outside `begin()` are automatically 
 ### How It Works
 
 ACID transactions hold a private dirty page buffer. Each operation briefly acquires the global write lock (microseconds), does the B+ tree mutation in the private buffer, and releases. Tables not touched by the transaction are completely unblocked. `commit()` publishes all pages atomically in one batch. Drop without commit discards the buffer — a zero-cost rollback.
+
+## Skills & Guides
+
+The `skills/` directory contains step-by-step guides for working with boogy-db:
+
+**For application developers** (`skills/consumer/`):
+- [Schema Design](skills/consumer/schema-design.md) — table layout, column types, indexes, migration patterns
+- [Configuration](skills/consumer/configure-database.md) — durability, ACID mode, encryption setup
+- [Query Patterns](skills/consumer/query-patterns.md) — filters, pagination, joins, bulk ops, transactions
+- [Async Usage](skills/consumer/async-usage.md) — tokio integration, sharing across tasks, axum/actix patterns
+- [Error Handling](skills/consumer/error-handling.md) — error variants, matching, recovery patterns
+
+**For boogy-db contributors** (`skills/internal/`):
+- [Adding a Table Method](skills/internal/add-table-method.md) — locking protocol, WriteGuard, index maintenance
+- [Adding a Benchmark](skills/internal/add-benchmark.md) — benchmark structure, SQLite comparison
+- [Optimizing Hot Paths](skills/internal/optimize-hot-path.md) — zero-copy, peek_dirty, leaf-chain walks
+- [Modifying Page Format](skills/internal/modify-page-format.md) — page layout, header, compatibility
 
 ## Architecture
 
