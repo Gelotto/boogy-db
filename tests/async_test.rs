@@ -119,9 +119,31 @@ async fn test_async_begin_commit() {
         .await
         .unwrap();
 
-    let tx = db.begin().await.unwrap();
+    let mut tx = db.begin().await.unwrap();
     tx.insert("a", &[("v", Value::Integer(1))]).await.unwrap();
     tx.commit().await.unwrap();
 
     assert_eq!(db.count("a", &[]).await.unwrap(), 1);
+}
+
+#[tokio::test]
+async fn test_async_acid_commit_and_rollback() {
+    let dir = TempDir::new().unwrap();
+    let db = AsyncBoogyDb::open(dir.path().join("test.boogy")).await.unwrap();
+    db.set_acid(true);
+    db.create_table("t", &[ColumnDef::new("v", Type::Integer)]).await.unwrap();
+
+    // Commit
+    let mut tx = db.begin().await.unwrap();
+    tx.insert("t", &[("v", Value::Integer(1))]).await.unwrap();
+    tx.commit().await.unwrap();
+    assert_eq!(db.count("t", &[]).await.unwrap(), 1);
+
+    // Rollback
+    {
+        let mut tx = db.begin().await.unwrap();
+        tx.insert("t", &[("v", Value::Integer(2))]).await.unwrap();
+        // Drop without commit
+    }
+    assert_eq!(db.count("t", &[]).await.unwrap(), 1); // still 1
 }

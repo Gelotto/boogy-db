@@ -1441,7 +1441,7 @@ fn test_begin_commit_transaction() {
     db.create_table("a", &[ColumnDef::new("v", Type::Integer)]).unwrap();
     db.create_table("b", &[ColumnDef::new("v", Type::Integer)]).unwrap();
 
-    let tx = db.begin().unwrap();
+    let mut tx = db.begin().unwrap();
     tx.insert("a", &[("v", Value::Integer(1))]).unwrap();
     tx.insert("b", &[("v", Value::Integer(2))]).unwrap();
     tx.commit().unwrap();
@@ -1456,7 +1456,7 @@ fn test_begin_drop_without_commit() {
     db.create_table("t", &[ColumnDef::new("v", Type::Integer)]).unwrap();
 
     {
-        let tx = db.begin().unwrap();
+        let mut tx = db.begin().unwrap();
         tx.insert("t", &[("v", Value::Integer(1))]).unwrap();
         // Drop without commit — operations already applied (lazy locking)
     }
@@ -1470,9 +1470,223 @@ fn test_begin_read_within_transaction() {
     let (db, _dir) = create_db();
     db.create_table("t", &[ColumnDef::new("v", Type::Integer)]).unwrap();
 
-    let tx = db.begin().unwrap();
+    let mut tx = db.begin().unwrap();
     let id = tx.insert("t", &[("v", Value::Integer(42))]).unwrap();
     let row = tx.get("t", id).unwrap().unwrap();
     assert_eq!(row.get("v").unwrap(), Value::Integer(42));
     tx.commit().unwrap();
+}
+
+// ===========================================================================
+// ACID transaction tests
+// ===========================================================================
+
+#[test]
+fn test_acid_commit() {
+    let (db, _dir) = create_db();
+    db.set_acid(true);
+    db.create_table("a", &[ColumnDef::new("v", Type::Integer)]).unwrap();
+    db.create_table("b", &[ColumnDef::new("v", Type::Integer)]).unwrap();
+
+    let mut tx = db.begin().unwrap();
+    tx.insert("a", &[("v", Value::Integer(1))]).unwrap();
+    tx.insert("b", &[("v", Value::Integer(2))]).unwrap();
+    tx.commit().unwrap();
+
+    assert_eq!(db.count("a", &[]).unwrap(), 1);
+    assert_eq!(db.count("b", &[]).unwrap(), 1);
+}
+
+#[test]
+fn test_acid_rollback() {
+    let (db, _dir) = create_db();
+    db.set_acid(true);
+    db.create_table("t", &[ColumnDef::new("v", Type::Integer)]).unwrap();
+
+    db.insert("t", &[("v", Value::Integer(1))]).unwrap();
+    assert_eq!(db.count("t", &[]).unwrap(), 1);
+
+    {
+        let mut tx = db.begin().unwrap();
+        tx.insert("t", &[("v", Value::Integer(2))]).unwrap();
+        tx.insert("t", &[("v", Value::Integer(3))]).unwrap();
+        // Drop without commit
+    }
+
+    assert_eq!(db.count("t", &[]).unwrap(), 1); // only the first insert survived
+}
+
+#[test]
+fn test_acid_read_own_writes() {
+    let (db, _dir) = create_db();
+    db.set_acid(true);
+    db.create_table("t", &[ColumnDef::new("v", Type::Integer)]).unwrap();
+
+    let mut tx = db.begin().unwrap();
+    let id = tx.insert("t", &[("v", Value::Integer(42))]).unwrap();
+    let row = tx.get("t", id).unwrap().unwrap();
+    assert_eq!(row.get("v").unwrap(), Value::Integer(42));
+    tx.commit().unwrap();
+}
+
+#[test]
+fn test_acid_auto_wrap_standalone() {
+    let (db, _dir) = create_db();
+    db.set_acid(true);
+    db.create_table("t", &[ColumnDef::new("v", Type::Integer)]).unwrap();
+
+    db.insert("t", &[("v", Value::Integer(1))]).unwrap();
+    db.insert("t", &[("v", Value::Integer(2))]).unwrap();
+    assert_eq!(db.count("t", &[]).unwrap(), 2);
+
+    let row = db.get("t", 1).unwrap().unwrap();
+    assert_eq!(row.get("v").unwrap(), Value::Integer(1));
+}
+
+#[test]
+fn test_acid_multi_table_rollback() {
+    let (db, _dir) = create_db();
+    db.set_acid(true);
+    db.create_table("users", &[ColumnDef::new("name", Type::Text)]).unwrap();
+    db.create_table("posts", &[ColumnDef::new("title", Type::Text)]).unwrap();
+
+    db.insert("users", &[("name", Value::Text("Alice".into()))]).unwrap();
+
+    {
+        let mut tx = db.begin().unwrap();
+        tx.insert("users", &[("name", Value::Text("Bob".into()))]).unwrap();
+        tx.insert("posts", &[("title", Value::Text("Hello".into()))]).unwrap();
+        // Drop — neither Bob nor the post should exist
+    }
+
+    assert_eq!(db.count("users", &[]).unwrap(), 1); // only Alice
+    assert_eq!(db.count("posts", &[]).unwrap(), 0);
+}
+
+#[test]
+fn test_acid_update_and_delete() {
+    let (db, _dir) = create_db();
+    db.set_acid(true);
+    db.create_table("t", &[ColumnDef::new("v", Type::Integer)]).unwrap();
+
+    let id1 = db.insert("t", &[("v", Value::Integer(1))]).unwrap();
+    let id2 = db.insert("t", &[("v", Value::Integer(2))]).unwrap();
+
+    let mut tx = db.begin().unwrap();
+    tx.update("t", id1, &[("v", Value::Integer(10))]).unwrap();
+    tx.delete("t", id2).unwrap();
+    tx.commit().unwrap();
+
+    let row = db.get("t", id1).unwrap().unwrap();
+    assert_eq!(row.get("v").unwrap(), Value::Integer(10));
+    assert!(db.get("t", id2).unwrap().is_none());
+    assert_eq!(db.count("t", &[]).unwrap(), 1);
+}
+
+#[test]
+fn test_acid_rollback_update() {
+    let (db, _dir) = create_db();
+    db.set_acid(true);
+    db.create_table("t", &[ColumnDef::new("v", Type::Integer)]).unwrap();
+
+    let id = db.insert("t", &[("v", Value::Integer(1))]).unwrap();
+
+    {
+        let mut tx = db.begin().unwrap();
+        tx.update("t", id, &[("v", Value::Integer(999))]).unwrap();
+        // Drop — update should be rolled back
+    }
+
+    let row = db.get("t", id).unwrap().unwrap();
+    assert_eq!(row.get("v").unwrap(), Value::Integer(1)); // unchanged
+}
+
+#[test]
+fn test_acid_find_within_transaction() {
+    let (db, _dir) = create_db();
+    db.set_acid(true);
+    db.create_table("t", &[ColumnDef::new("v", Type::Integer)]).unwrap();
+
+    let mut tx = db.begin().unwrap();
+    for i in 0..10 {
+        tx.insert("t", &[("v", Value::Integer(i))]).unwrap();
+    }
+
+    let result = tx.find("t", FindOptions {
+        filters: vec![Filter::gt("v", 5i64)],
+        ..Default::default()
+    }).unwrap();
+    assert_eq!(result.rows.len(), 4); // 6, 7, 8, 9
+
+    let count = tx.count("t", &[]).unwrap();
+    assert_eq!(count, 10);
+
+    tx.commit().unwrap();
+}
+
+#[test]
+fn test_acid_doesnt_block_other_tables() {
+    use std::sync::Arc;
+    use std::thread;
+
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = Arc::new(BoogyDb::open(dir.path().join("test.boogy")).unwrap());
+    db.set_acid(true);
+    db.create_table("a", &[ColumnDef::new("v", Type::Integer)]).unwrap();
+    db.create_table("b", &[ColumnDef::new("v", Type::Integer)]).unwrap();
+
+    let db1 = Arc::clone(&db);
+    let h = thread::spawn(move || {
+        let mut tx = db1.begin().unwrap();
+        for i in 0..100 {
+            tx.insert("a", &[("v", Value::Integer(i))]).unwrap();
+        }
+        tx.commit().unwrap();
+    });
+
+    for i in 0..100 {
+        db.insert("b", &[("v", Value::Integer(i))]).unwrap();
+    }
+
+    h.join().unwrap();
+    assert_eq!(db.count("a", &[]).unwrap(), 100);
+    assert_eq!(db.count("b", &[]).unwrap(), 100);
+}
+
+#[test]
+fn test_acid_insert_many() {
+    let (db, _dir) = create_db();
+    db.set_acid(true);
+    db.create_table("t", &[ColumnDef::new("v", Type::Integer)]).unwrap();
+
+    let mut tx = db.begin().unwrap();
+    let rows: Vec<Vec<(&str, Value)>> = (0..50).map(|i| vec![("v", Value::Integer(i))]).collect();
+    let ids = tx.insert_many("t", &rows).unwrap();
+    assert_eq!(ids.len(), 50);
+    tx.commit().unwrap();
+
+    assert_eq!(db.count("t", &[]).unwrap(), 50);
+}
+
+#[test]
+fn test_acid_persists_across_reopen() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("test.boogy");
+
+    {
+        let db = BoogyDb::open(&path).unwrap();
+        db.set_acid(true);
+        db.set_durability(Durability::Normal);
+        db.create_table("t", &[ColumnDef::new("v", Type::Integer)]).unwrap();
+
+        let mut tx = db.begin().unwrap();
+        tx.insert("t", &[("v", Value::Integer(1))]).unwrap();
+        tx.insert("t", &[("v", Value::Integer(2))]).unwrap();
+        tx.commit().unwrap();
+    }
+
+    {
+        let db = BoogyDb::open(&path).unwrap();
+        assert_eq!(db.count("t", &[]).unwrap(), 2);
+    }
 }

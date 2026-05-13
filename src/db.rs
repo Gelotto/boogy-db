@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::collections::HashMap as StdHashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 
@@ -70,6 +71,7 @@ pub struct BoogyDb {
     tables: RwLock<HashMap<String, Arc<RwLock<TableState>>>>,
     next_table_id: Mutex<u32>,
     durability: std::sync::atomic::AtomicU8,
+    acid: std::sync::atomic::AtomicBool,
     #[allow(dead_code)]
     path: PathBuf,
     table_ciphers: RwLock<HashMap<u32, Arc<crate::crypto::Cipher>>>,
@@ -413,6 +415,7 @@ impl BoogyDb {
             tables: RwLock::new(tables),
             next_table_id: Mutex::new(next_table_id),
             durability: std::sync::atomic::AtomicU8::new(Durability::Normal as u8),
+            acid: std::sync::atomic::AtomicBool::new(false),
             path,
             table_ciphers: RwLock::new(HashMap::new()),
         })
@@ -430,6 +433,17 @@ impl BoogyDb {
             1 => Durability::Normal,
             _ => Durability::None,
         }
+    }
+
+    /// Enable or disable ACID transaction mode. When enabled, standalone
+    /// write operations and `begin()` use the AcidTransaction path.
+    pub fn set_acid(&self, enabled: bool) {
+        self.acid.store(enabled, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Check whether ACID transaction mode is enabled.
+    pub fn is_acid(&self) -> bool {
+        self.acid.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Check that an encrypted table has been unlocked before any operation.
@@ -678,6 +692,12 @@ impl BoogyDb {
 
     /// Insert a row with auto-increment rowid. Returns the assigned rowid.
     pub fn insert(&self, table: &str, data: &[(&str, Value)]) -> Result<u64> {
+        if self.is_acid() {
+            let mut tx = AcidTransaction::new(self);
+            let result = tx.insert(table, data)?;
+            tx.commit()?;
+            return Ok(result);
+        }
         // 1. Read-lock registry, clone Arc.
         let table_state = {
             let tables = self.tables.read().unwrap();
@@ -728,6 +748,12 @@ impl BoogyDb {
 
     /// Insert a row with a caller-supplied rowid.
     pub fn insert_with_id(&self, table: &str, rowid: u64, data: &[(&str, Value)]) -> Result<()> {
+        if self.is_acid() {
+            let mut tx = AcidTransaction::new(self);
+            tx.insert_with_id(table, rowid, data)?;
+            tx.commit()?;
+            return Ok(());
+        }
         // 1. Read-lock registry, clone Arc.
         let table_state = {
             let tables = self.tables.read().unwrap();
@@ -807,6 +833,12 @@ impl BoogyDb {
 
     /// Update a row by rowid. Replaces specified columns.
     pub fn update(&self, table: &str, id: u64, fields: &[(&str, Value)]) -> Result<bool> {
+        if self.is_acid() {
+            let mut tx = AcidTransaction::new(self);
+            let result = tx.update(table, id, fields)?;
+            tx.commit()?;
+            return Ok(result);
+        }
         // 1. Read-lock registry, clone Arc.
         let table_state = {
             let tables = self.tables.read().unwrap();
@@ -875,6 +907,12 @@ impl BoogyDb {
 
     /// Delete a row by rowid.
     pub fn delete(&self, table: &str, id: u64) -> Result<bool> {
+        if self.is_acid() {
+            let mut tx = AcidTransaction::new(self);
+            let result = tx.delete(table, id)?;
+            tx.commit()?;
+            return Ok(result);
+        }
         // 1. Read-lock registry, clone Arc.
         let table_state = {
             let tables = self.tables.read().unwrap();
@@ -1344,6 +1382,12 @@ impl BoogyDb {
         filters: &[Filter],
         fields: &[(&str, Value)],
     ) -> Result<u64> {
+        if self.is_acid() {
+            let mut tx = AcidTransaction::new(self);
+            let result = tx.update_where(table, filters, fields)?;
+            tx.commit()?;
+            return Ok(result);
+        }
         // 1. Read-lock registry, clone Arc.
         let table_state = {
             let tables = self.tables.read().unwrap();
@@ -1459,6 +1503,12 @@ impl BoogyDb {
 
     /// Delete all rows matching filters. Returns number of rows deleted.
     pub fn delete_where(&self, table: &str, filters: &[Filter]) -> Result<u64> {
+        if self.is_acid() {
+            let mut tx = AcidTransaction::new(self);
+            let result = tx.delete_where(table, filters)?;
+            tx.commit()?;
+            return Ok(result);
+        }
         // 1. Read-lock registry, clone Arc.
         let table_state = {
             let tables = self.tables.read().unwrap();
@@ -1531,6 +1581,12 @@ impl BoogyDb {
 
     /// Insert multiple rows in a single transaction. Returns list of assigned rowids.
     pub fn insert_many(&self, table: &str, rows: &[Vec<(&str, Value)>]) -> Result<Vec<u64>> {
+        if self.is_acid() {
+            let mut tx = AcidTransaction::new(self);
+            let result = tx.insert_many(table, rows)?;
+            tx.commit()?;
+            return Ok(result);
+        }
         // 1. Read-lock registry, clone Arc.
         let table_state = {
             let tables = self.tables.read().unwrap();
@@ -1601,13 +1657,17 @@ impl BoogyDb {
     /// lazily, same as the callback-based `transaction()`.
     ///
     /// ```ignore
-    /// let tx = db.begin()?;
+    /// let mut tx = db.begin()?;
     /// tx.insert("users", &[("name", Value::Text("Alice".into()))])?;
     /// tx.insert("posts", &[("title", Value::Text("Hello".into()))])?;
     /// tx.commit()?;
     /// ```
     pub fn begin(&self) -> Result<Transaction<'_>> {
-        Ok(Transaction { db: self, committed: false })
+        if self.is_acid() {
+            Ok(Transaction::Acid(AcidTransaction::new(self)))
+        } else {
+            Ok(Transaction::Light(LightTransaction { db: self, committed: false }))
+        }
     }
 
     /// Final flush for guard-based transactions.
@@ -1818,66 +1878,849 @@ impl<'a> TransactionCtx<'a> {
     }
 }
 
-/// Guard-based transaction. Commits on explicit `.commit()`, rolls back on drop.
+/// Light transaction (non-ACID). Commits on explicit `.commit()`, rolls back on drop.
 /// Each operation locks its table independently (lazy locking, same as `transaction()`).
-pub struct Transaction<'a> {
+pub(crate) struct LightTransaction<'a> {
     db: &'a BoogyDb,
     committed: bool,
 }
 
-impl<'a> Transaction<'a> {
-    /// Commit the transaction. Flushes any pending WAL entries.
-    pub fn commit(mut self) -> Result<()> {
-        self.committed = true;
-        self.db.flush_transaction()
-    }
-
-    pub fn insert(&self, table: &str, data: &[(&str, Value)]) -> Result<u64> {
-        self.db.insert(table, data)
-    }
-
-    pub fn insert_with_id(&self, table: &str, rowid: u64, data: &[(&str, Value)]) -> Result<()> {
-        self.db.insert_with_id(table, rowid, data)
-    }
-
-    pub fn get(&self, table: &str, id: u64) -> Result<Option<Row>> {
-        self.db.get(table, id)
-    }
-
-    pub fn update(&self, table: &str, id: u64, fields: &[(&str, Value)]) -> Result<bool> {
-        self.db.update(table, id, fields)
-    }
-
-    pub fn delete(&self, table: &str, id: u64) -> Result<bool> {
-        self.db.delete(table, id)
-    }
-
-    pub fn find(&self, table: &str, opts: FindOptions) -> Result<FindResult> {
-        self.db.find(table, opts)
-    }
-
-    pub fn count(&self, table: &str, filters: &[Filter]) -> Result<u64> {
-        self.db.count(table, filters)
-    }
-
-    pub fn insert_many(&self, table: &str, rows: &[Vec<(&str, Value)>]) -> Result<Vec<u64>> {
-        self.db.insert_many(table, rows)
-    }
-
-    pub fn update_where(&self, table: &str, filters: &[Filter], fields: &[(&str, Value)]) -> Result<u64> {
-        self.db.update_where(table, filters, fields)
-    }
-
-    pub fn delete_where(&self, table: &str, filters: &[Filter]) -> Result<u64> {
-        self.db.delete_where(table, filters)
-    }
-}
-
-impl Drop for Transaction<'_> {
+impl Drop for LightTransaction<'_> {
     fn drop(&mut self) {
         if !self.committed {
             // Rollback: individual operations already committed their own writes,
             // but we skip the final flush. This matches the existing transaction() behavior.
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// MetaDelta — per-table metadata tracked during an AcidTransaction
+// ---------------------------------------------------------------------------
+
+#[allow(dead_code)]
+struct MetaDelta {
+    root_page: u32,
+    row_count_delta: i64,
+    next_rowid: u64,
+    table_id: u32,
+    cipher: Option<crate::crypto::Cipher>,
+}
+
+// ---------------------------------------------------------------------------
+// AcidTransaction — true ACID: all-or-nothing commit via inject/drain
+// ---------------------------------------------------------------------------
+
+pub struct AcidTransaction<'a> {
+    db: &'a BoogyDb,
+    private_dirty: StdHashMap<u32, Box<Page>>,
+    new_page_count: u32,
+    meta_deltas: StdHashMap<String, MetaDelta>,
+    committed: bool,
+}
+
+impl<'a> AcidTransaction<'a> {
+    fn new(db: &'a BoogyDb) -> Self {
+        Self {
+            db,
+            private_dirty: StdHashMap::new(),
+            new_page_count: 0,
+            meta_deltas: StdHashMap::new(),
+            committed: false,
+        }
+    }
+
+    /// Borrow the WriteGuard with our private dirty pages injected,
+    /// run `f`, then drain dirty pages back into our private buffer.
+    fn with_guard<F, R>(&mut self, f: F) -> Result<R>
+    where
+        F: FnOnce(&mut WriteGuard) -> Result<R>,
+    {
+        let mut guard = self.db.file.begin_write();
+        let pages = std::mem::take(&mut self.private_dirty);
+        guard.inject_dirty(pages);
+        guard.set_new_page_count(self.new_page_count);
+
+        let result = f(&mut guard);
+
+        self.private_dirty = guard.drain_dirty();
+        self.new_page_count = guard.new_page_count();
+        guard.set_new_page_count(0);
+        guard.discard();
+
+        result
+    }
+
+    /// Look up a table, returning the Arc<RwLock<TableState>>.
+    fn table_state(&self, table: &str) -> Result<Arc<RwLock<TableState>>> {
+        let tables = self.db.tables.read().unwrap();
+        tables
+            .get(table)
+            .cloned()
+            .ok_or_else(|| BoogyError::TableNotFound(table.to_string()))
+    }
+
+    /// Get the current root_page for a table, preferring meta_deltas.
+    fn current_root(&self, table: &str, meta: &TableMeta) -> u32 {
+        self.meta_deltas
+            .get(table)
+            .map(|d| d.root_page)
+            .unwrap_or(meta.root_page)
+    }
+
+    /// Get the current next_rowid for a table, preferring meta_deltas.
+    fn current_next_rowid(&self, table: &str, meta: &TableMeta) -> u64 {
+        self.meta_deltas
+            .get(table)
+            .map(|d| d.next_rowid)
+            .unwrap_or(meta.next_rowid)
+    }
+
+    /// Insert a row with auto-increment rowid.
+    pub fn insert(&mut self, table: &str, data: &[(&str, Value)]) -> Result<u64> {
+        let table_state = self.table_state(table)?;
+        let state = table_state.read().unwrap();
+        BoogyDb::check_table_accessible(&state.meta, table)?;
+        BoogyDb::enforce_index_types(&state.meta, data)?;
+
+        let root_page = self.current_root(table, &state.meta);
+        let rowid = self.current_next_rowid(table, &state.meta);
+
+        let col_values: Vec<(u16, &Value)> = data
+            .iter()
+            .filter_map(|(name, val)| state.meta.col_id(name).map(|cid| (cid, val)))
+            .collect();
+        let row_bytes = row::encode_row(rowid, &col_values);
+
+        // Extract index info before entering with_guard
+        let index_info: Vec<(u16, crate::value::Type, u32)> = state
+            .meta
+            .indexes
+            .iter()
+            .filter_map(|idx| {
+                let cid = state.meta.col_name_to_id.get(&idx.column).copied()?;
+                let ct = state.meta.columns.iter().find(|c| c.name == idx.column)?.col_type;
+                // Use delta root if available
+                Some((cid, ct, idx.root_page))
+            })
+            .collect();
+        let index_names: Vec<String> = state.meta.indexes.iter().map(|idx| idx.column.clone()).collect();
+        let table_id = state.meta.table_id;
+        let cipher = state.meta.cipher.clone();
+        drop(state);
+
+        let (new_root, idx_roots) = self.with_guard(|guard| {
+            let mut tree = BTreeWriter::new(guard, root_page);
+            let new_root = tree.insert(rowid, &row_bytes)?;
+
+            let mut idx_roots = Vec::new();
+            for (cid, ct, idx_root) in &index_info {
+                let val = crate::row::extract_column(&row_bytes, *cid)?
+                    .unwrap_or(Value::Null);
+                if let Some(key) = index::encode_index_key(*ct, &val, rowid) {
+                    let mut itree = IndexTreeWriter::new(guard, *idx_root);
+                    let r = itree.insert(&key)?;
+                    idx_roots.push(r);
+                } else {
+                    idx_roots.push(*idx_root);
+                }
+            }
+
+            Ok((new_root, idx_roots))
+        })?;
+
+        // Update meta delta
+        let delta = self.meta_deltas.entry(table.to_string()).or_insert(MetaDelta {
+            root_page,
+            row_count_delta: 0,
+            next_rowid: rowid,
+            table_id,
+            cipher,
+        });
+        delta.root_page = new_root;
+        delta.row_count_delta += 1;
+        delta.next_rowid = rowid + 1;
+
+        // Update index root pages in the table state
+        if !idx_roots.is_empty() {
+            let ts = self.table_state(table)?;
+            let mut st = ts.write().unwrap();
+            for (i, root) in idx_roots.into_iter().enumerate() {
+                if i < st.meta.indexes.len() && i < index_names.len() && st.meta.indexes[i].column == index_names[i] {
+                    st.meta.indexes[i].root_page = root;
+                }
+            }
+        }
+
+        Ok(rowid)
+    }
+
+    /// Insert a row with a caller-supplied rowid.
+    pub fn insert_with_id(&mut self, table: &str, rowid: u64, data: &[(&str, Value)]) -> Result<()> {
+        let table_state = self.table_state(table)?;
+        let state = table_state.read().unwrap();
+        BoogyDb::check_table_accessible(&state.meta, table)?;
+        BoogyDb::enforce_index_types(&state.meta, data)?;
+
+        let root_page = self.current_root(table, &state.meta);
+
+        let col_values: Vec<(u16, &Value)> = data
+            .iter()
+            .filter_map(|(name, val)| state.meta.col_id(name).map(|cid| (cid, val)))
+            .collect();
+        let row_bytes = row::encode_row(rowid, &col_values);
+
+        let index_info: Vec<(u16, crate::value::Type, u32)> = state
+            .meta
+            .indexes
+            .iter()
+            .filter_map(|idx| {
+                let cid = state.meta.col_name_to_id.get(&idx.column).copied()?;
+                let ct = state.meta.columns.iter().find(|c| c.name == idx.column)?.col_type;
+                Some((cid, ct, idx.root_page))
+            })
+            .collect();
+        let index_names: Vec<String> = state.meta.indexes.iter().map(|idx| idx.column.clone()).collect();
+        let table_id = state.meta.table_id;
+        let cipher = state.meta.cipher.clone();
+        let current_next = self.current_next_rowid(table, &state.meta);
+        drop(state);
+
+        let (new_root, idx_roots) = self.with_guard(|guard| {
+            let mut tree = BTreeWriter::new(guard, root_page);
+            let new_root = tree.insert(rowid, &row_bytes)?;
+
+            let mut idx_roots = Vec::new();
+            for (cid, ct, idx_root) in &index_info {
+                let val = crate::row::extract_column(&row_bytes, *cid)?
+                    .unwrap_or(Value::Null);
+                if let Some(key) = index::encode_index_key(*ct, &val, rowid) {
+                    let mut itree = IndexTreeWriter::new(guard, *idx_root);
+                    let r = itree.insert(&key)?;
+                    idx_roots.push(r);
+                } else {
+                    idx_roots.push(*idx_root);
+                }
+            }
+
+            Ok((new_root, idx_roots))
+        })?;
+
+        let new_next = if rowid >= current_next { rowid + 1 } else { current_next };
+
+        let delta = self.meta_deltas.entry(table.to_string()).or_insert(MetaDelta {
+            root_page,
+            row_count_delta: 0,
+            next_rowid: current_next,
+            table_id,
+            cipher,
+        });
+        delta.root_page = new_root;
+        delta.row_count_delta += 1;
+        delta.next_rowid = new_next;
+
+        if !idx_roots.is_empty() {
+            let ts = self.table_state(table)?;
+            let mut st = ts.write().unwrap();
+            for (i, root) in idx_roots.into_iter().enumerate() {
+                if i < st.meta.indexes.len() && i < index_names.len() && st.meta.indexes[i].column == index_names[i] {
+                    st.meta.indexes[i].root_page = root;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Get a row by rowid (sees dirty overlay).
+    pub fn get(&mut self, table: &str, id: u64) -> Result<Option<Row>> {
+        let table_state = self.table_state(table)?;
+        let state = table_state.read().unwrap();
+        BoogyDb::check_table_accessible(&state.meta, table)?;
+
+        let root_page = self.current_root(table, &state.meta);
+        let col_names = state.meta.col_names.clone();
+        drop(state);
+
+        let result = self.with_guard(|guard| {
+            let tree = BTreeWriter::new(guard, root_page);
+            tree.search(id)
+        })?;
+
+        match result {
+            Some(bytes) => Ok(Some(Row::from_raw(&bytes, col_names)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Update a row by rowid.
+    pub fn update(&mut self, table: &str, id: u64, fields: &[(&str, Value)]) -> Result<bool> {
+        let table_state = self.table_state(table)?;
+        let state = table_state.read().unwrap();
+        BoogyDb::check_table_accessible(&state.meta, table)?;
+        BoogyDb::enforce_index_types(&state.meta, fields)?;
+
+        let root_page = self.current_root(table, &state.meta);
+        let table_id = state.meta.table_id;
+        let cipher = state.meta.cipher.clone();
+        let current_next = self.current_next_rowid(table, &state.meta);
+
+        // Extract column info for merge
+        let col_name_to_id = state.meta.col_name_to_id.clone();
+
+        let index_info: Vec<(u16, crate::value::Type, u32)> = state
+            .meta
+            .indexes
+            .iter()
+            .filter_map(|idx| {
+                let cid = state.meta.col_name_to_id.get(&idx.column).copied()?;
+                let ct = state.meta.columns.iter().find(|c| c.name == idx.column)?.col_type;
+                Some((cid, ct, idx.root_page))
+            })
+            .collect();
+        let index_names: Vec<String> = state.meta.indexes.iter().map(|idx| idx.column.clone()).collect();
+        drop(state);
+
+        // Prepare field mappings
+        let field_updates: Vec<(u16, Value)> = fields
+            .iter()
+            .filter_map(|(name, val)| col_name_to_id.get(*name).map(|cid| (*cid, val.clone())))
+            .collect();
+
+        let result = self.with_guard(|guard| {
+            // Read existing row
+            let existing_bytes = {
+                let tree = BTreeWriter::new(guard, root_page);
+                match tree.search(id)? {
+                    Some(bytes) => bytes,
+                    None => return Ok((false, root_page, Vec::new())),
+                }
+            };
+            let existing = row::decode_row(&existing_bytes)?;
+
+            // Merge updates
+            let mut col_map: HashMap<u16, Value> = existing.columns.into_iter().collect();
+            for (col_id, val) in &field_updates {
+                col_map.insert(*col_id, val.clone());
+            }
+            let col_values: Vec<(u16, &Value)> = col_map.iter().map(|(k, v)| (*k, v)).collect();
+            let new_row = row::encode_row(id, &col_values);
+
+            // Remove old index entries
+            let mut idx_roots = Vec::new();
+            for (cid, ct, idx_root) in &index_info {
+                let old_val = crate::row::extract_column(&existing_bytes, *cid)?
+                    .unwrap_or(Value::Null);
+                let mut current_root = *idx_root;
+                if let Some(key) = index::encode_index_key(*ct, &old_val, id) {
+                    let mut itree = IndexTreeWriter::new(guard, current_root);
+                    itree.delete(&key)?;
+                    current_root = itree.root_page();
+                }
+                // Insert new index entries
+                let new_val = crate::row::extract_column(&new_row, *cid)?
+                    .unwrap_or(Value::Null);
+                if let Some(key) = index::encode_index_key(*ct, &new_val, id) {
+                    let mut itree = IndexTreeWriter::new(guard, current_root);
+                    let r = itree.insert(&key)?;
+                    idx_roots.push(r);
+                } else {
+                    idx_roots.push(current_root);
+                }
+            }
+
+            // Delete + re-insert
+            {
+                let mut tree = BTreeWriter::new(guard, root_page);
+                tree.delete(id)?;
+                let new_root = tree.insert(id, &new_row)?;
+                Ok((true, new_root, idx_roots))
+            }
+        })?;
+
+        let (updated, new_root, idx_roots) = result;
+        if !updated {
+            return Ok(false);
+        }
+
+        let delta = self.meta_deltas.entry(table.to_string()).or_insert(MetaDelta {
+            root_page,
+            row_count_delta: 0,
+            next_rowid: current_next,
+            table_id,
+            cipher,
+        });
+        delta.root_page = new_root;
+
+        if !idx_roots.is_empty() {
+            let ts = self.table_state(table)?;
+            let mut st = ts.write().unwrap();
+            for (i, root) in idx_roots.into_iter().enumerate() {
+                if i < st.meta.indexes.len() && i < index_names.len() && st.meta.indexes[i].column == index_names[i] {
+                    st.meta.indexes[i].root_page = root;
+                }
+            }
+        }
+
+        Ok(true)
+    }
+
+    /// Delete a row by rowid.
+    pub fn delete(&mut self, table: &str, id: u64) -> Result<bool> {
+        let table_state = self.table_state(table)?;
+        let state = table_state.read().unwrap();
+        BoogyDb::check_table_accessible(&state.meta, table)?;
+
+        let root_page = self.current_root(table, &state.meta);
+        let table_id = state.meta.table_id;
+        let cipher = state.meta.cipher.clone();
+        let current_next = self.current_next_rowid(table, &state.meta);
+
+        let has_indexes = !state.meta.indexes.is_empty();
+        let index_info: Vec<(u16, crate::value::Type, u32)> = state
+            .meta
+            .indexes
+            .iter()
+            .filter_map(|idx| {
+                let cid = state.meta.col_name_to_id.get(&idx.column).copied()?;
+                let ct = state.meta.columns.iter().find(|c| c.name == idx.column)?.col_type;
+                Some((cid, ct, idx.root_page))
+            })
+            .collect();
+        let index_names: Vec<String> = state.meta.indexes.iter().map(|idx| idx.column.clone()).collect();
+        drop(state);
+
+        let result = self.with_guard(|guard| {
+            // Read the row before deletion for index maintenance
+            let row_bytes_for_index = if has_indexes {
+                let tree = BTreeWriter::new(guard, root_page);
+                tree.search(id)?
+            } else {
+                None
+            };
+
+            let mut tree = BTreeWriter::new(guard, root_page);
+            let deleted = tree.delete(id)?;
+            let new_root = tree.root_page();
+
+            let mut idx_roots = Vec::new();
+            if deleted {
+                if let Some(ref bytes) = row_bytes_for_index {
+                    for (cid, ct, idx_root) in &index_info {
+                        let val = crate::row::extract_column(bytes, *cid)?
+                            .unwrap_or(Value::Null);
+                        if let Some(key) = index::encode_index_key(*ct, &val, id) {
+                            let mut itree = IndexTreeWriter::new(guard, *idx_root);
+                            itree.delete(&key)?;
+                            idx_roots.push(itree.root_page());
+                        } else {
+                            idx_roots.push(*idx_root);
+                        }
+                    }
+                }
+            }
+
+            Ok((deleted, new_root, idx_roots))
+        })?;
+
+        let (deleted, new_root, idx_roots) = result;
+        if !deleted {
+            return Ok(false);
+        }
+
+        let delta = self.meta_deltas.entry(table.to_string()).or_insert(MetaDelta {
+            root_page,
+            row_count_delta: 0,
+            next_rowid: current_next,
+            table_id,
+            cipher,
+        });
+        delta.root_page = new_root;
+        delta.row_count_delta -= 1;
+
+        if !idx_roots.is_empty() {
+            let ts = self.table_state(table)?;
+            let mut st = ts.write().unwrap();
+            for (i, root) in idx_roots.into_iter().enumerate() {
+                if i < st.meta.indexes.len() && i < index_names.len() && st.meta.indexes[i].column == index_names[i] {
+                    st.meta.indexes[i].root_page = root;
+                }
+            }
+        }
+
+        Ok(true)
+    }
+
+    /// Find rows matching filters (scans all rows through dirty overlay, filters in memory).
+    pub fn find(&mut self, table: &str, opts: FindOptions) -> Result<FindResult> {
+        let table_state = self.table_state(table)?;
+        let state = table_state.read().unwrap();
+        BoogyDb::check_table_accessible(&state.meta, table)?;
+
+        let root_page = self.current_root(table, &state.meta);
+        let col_names = state.meta.col_names.clone();
+        let col_name_to_id = state.meta.col_name_to_id.clone();
+        drop(state);
+
+        let all = self.with_guard(|guard| {
+            let tree = BTreeWriter::new(guard, root_page);
+            tree.scan_all_w()
+        })?;
+
+        // Filter in memory
+        let mut matching = Vec::new();
+        for (_, bytes) in &all {
+            let passes = opts.filters.iter().all(|f| {
+                if let Some(col_id) = col_name_to_id.get(&f.column).copied() {
+                    if let Ok(Some(raw)) = row::extract_column_raw(bytes, col_id) {
+                        if let Some(result) = crate::filter::eval_filter_raw(raw, &f.op, &f.value) {
+                            return result;
+                        }
+                    }
+                    let col_val = row::extract_column(bytes, col_id).ok().flatten();
+                    let actual = col_val.as_ref().unwrap_or(&Value::Null);
+                    f.matches(actual)
+                } else {
+                    f.matches(&Value::Null)
+                }
+            });
+            if passes {
+                matching.push(Row::from_raw(bytes, col_names.clone())?);
+            }
+        }
+
+        let total = if opts.include_total { Some(matching.len() as u64) } else { None };
+
+        // Sort
+        for sort in opts.sort.iter().rev() {
+            matching.sort_by(|a, b| {
+                let va = a.get(&sort.column);
+                let vb = b.get(&sort.column);
+                let ord = match (&va, &vb) {
+                    (Some(a), Some(b)) => a.compare(b).unwrap_or(std::cmp::Ordering::Equal),
+                    (Some(_), None) => std::cmp::Ordering::Greater,
+                    (None, Some(_)) => std::cmp::Ordering::Less,
+                    (None, None) => std::cmp::Ordering::Equal,
+                };
+                match sort.dir {
+                    SortDir::Asc => ord,
+                    SortDir::Desc => ord.reverse(),
+                }
+            });
+        }
+
+        // Pagination
+        let skip = opts.offset.unwrap_or(0) as usize;
+        let take = opts.limit.unwrap_or(u32::MAX) as usize;
+        let rows: Vec<Row> = matching.into_iter().skip(skip).take(take).collect();
+
+        Ok(FindResult { rows, total })
+    }
+
+    /// Count rows matching filters (scans all rows through dirty overlay).
+    pub fn count(&mut self, table: &str, filters: &[Filter]) -> Result<u64> {
+        let table_state = self.table_state(table)?;
+        let state = table_state.read().unwrap();
+        BoogyDb::check_table_accessible(&state.meta, table)?;
+
+        let root_page = self.current_root(table, &state.meta);
+
+        if filters.is_empty() {
+            // Use cached count + delta
+            let base_count = state.meta.row_count;
+            let delta_adj = self.meta_deltas
+                .get(table)
+                .map(|d| d.row_count_delta)
+                .unwrap_or(0);
+            return Ok((base_count as i64 + delta_adj) as u64);
+        }
+
+        let col_name_to_id = state.meta.col_name_to_id.clone();
+        drop(state);
+
+        let all = self.with_guard(|guard| {
+            let tree = BTreeWriter::new(guard, root_page);
+            tree.scan_all_w()
+        })?;
+
+        let mut count = 0u64;
+        for (_, bytes) in &all {
+            let passes = filters.iter().all(|f| {
+                if let Some(col_id) = col_name_to_id.get(&f.column).copied() {
+                    if let Ok(Some(raw)) = row::extract_column_raw(bytes, col_id) {
+                        if let Some(result) = crate::filter::eval_filter_raw(raw, &f.op, &f.value) {
+                            return result;
+                        }
+                    }
+                    let col_val = row::extract_column(bytes, col_id).ok().flatten();
+                    let actual = col_val.as_ref().unwrap_or(&Value::Null);
+                    f.matches(actual)
+                } else {
+                    f.matches(&Value::Null)
+                }
+            });
+            if passes {
+                count += 1;
+            }
+        }
+
+        Ok(count)
+    }
+
+    /// Insert multiple rows in a single transaction.
+    pub fn insert_many(&mut self, table: &str, rows: &[Vec<(&str, Value)>]) -> Result<Vec<u64>> {
+        let mut ids = Vec::with_capacity(rows.len());
+        for row_data in rows {
+            let id = self.insert(table, row_data)?;
+            ids.push(id);
+        }
+        Ok(ids)
+    }
+
+    /// Update all rows matching filters.
+    pub fn update_where(
+        &mut self,
+        table: &str,
+        filters: &[Filter],
+        fields: &[(&str, Value)],
+    ) -> Result<u64> {
+        // Find matching row IDs first
+        let table_state = self.table_state(table)?;
+        let state = table_state.read().unwrap();
+        BoogyDb::check_table_accessible(&state.meta, table)?;
+        BoogyDb::enforce_index_types(&state.meta, fields)?;
+
+        let root_page = self.current_root(table, &state.meta);
+        let col_name_to_id = state.meta.col_name_to_id.clone();
+        drop(state);
+
+        let all = self.with_guard(|guard| {
+            let tree = BTreeWriter::new(guard, root_page);
+            tree.scan_all_w()
+        })?;
+
+        let matching_ids: Vec<u64> = all
+            .iter()
+            .filter(|(_, bytes)| {
+                filters.iter().all(|f| {
+                    if let Some(col_id) = col_name_to_id.get(&f.column).copied() {
+                        if let Ok(Some(raw)) = row::extract_column_raw(bytes, col_id) {
+                            if let Some(result) = crate::filter::eval_filter_raw(raw, &f.op, &f.value) {
+                                return result;
+                            }
+                        }
+                        let col_val = row::extract_column(bytes, col_id).ok().flatten();
+                        let actual = col_val.as_ref().unwrap_or(&Value::Null);
+                        f.matches(actual)
+                    } else {
+                        f.matches(&Value::Null)
+                    }
+                })
+            })
+            .map(|(id, _)| *id)
+            .collect();
+
+        let mut count = 0u64;
+        for id in matching_ids {
+            if self.update(table, id, fields)? {
+                count += 1;
+            }
+        }
+        Ok(count)
+    }
+
+    /// Delete all rows matching filters.
+    pub fn delete_where(&mut self, table: &str, filters: &[Filter]) -> Result<u64> {
+        let table_state = self.table_state(table)?;
+        let state = table_state.read().unwrap();
+        BoogyDb::check_table_accessible(&state.meta, table)?;
+
+        let root_page = self.current_root(table, &state.meta);
+        let col_name_to_id = state.meta.col_name_to_id.clone();
+        drop(state);
+
+        let all = self.with_guard(|guard| {
+            let tree = BTreeWriter::new(guard, root_page);
+            tree.scan_all_w()
+        })?;
+
+        let matching_ids: Vec<u64> = all
+            .iter()
+            .filter(|(_, bytes)| {
+                filters.iter().all(|f| {
+                    if let Some(col_id) = col_name_to_id.get(&f.column).copied() {
+                        if let Ok(Some(raw)) = row::extract_column_raw(bytes, col_id) {
+                            if let Some(result) = crate::filter::eval_filter_raw(raw, &f.op, &f.value) {
+                                return result;
+                            }
+                        }
+                        let col_val = row::extract_column(bytes, col_id).ok().flatten();
+                        let actual = col_val.as_ref().unwrap_or(&Value::Null);
+                        f.matches(actual)
+                    } else {
+                        f.matches(&Value::Null)
+                    }
+                })
+            })
+            .map(|(id, _)| *id)
+            .collect();
+
+        let mut count = 0u64;
+        for id in matching_ids {
+            if self.delete(table, id)? {
+                count += 1;
+            }
+        }
+        Ok(count)
+    }
+
+    /// Commit the transaction: publish all dirty pages atomically and apply metadata.
+    pub fn commit(mut self) -> Result<()> {
+        self.committed = true;
+
+        if self.private_dirty.is_empty() && self.meta_deltas.is_empty() {
+            return Ok(()); // nothing to commit
+        }
+
+        let durability = self.db.durability();
+
+        // Publish all dirty pages atomically
+        let mut guard = self.db.file.begin_write();
+        let pages = std::mem::take(&mut self.private_dirty);
+        guard.inject_dirty(pages);
+        guard.set_new_page_count(self.new_page_count);
+        let after_images = guard.commit()?;
+
+        // WAL
+        match durability {
+            Durability::Immediate | Durability::Normal => {
+                let mut wal = self.db.wal.lock().unwrap();
+                for (page_no, data) in &after_images {
+                    wal.append_before_image(0, *page_no, data)?;
+                }
+                if matches!(durability, Durability::Immediate) {
+                    wal.sync()?;
+                }
+            }
+            Durability::None => {}
+        }
+
+        // Apply metadata deltas to actual TableMeta
+        for (table_name, delta) in &self.meta_deltas {
+            if let Some(table_state) = {
+                let tables = self.db.tables.read().unwrap();
+                tables.get(table_name).cloned()
+            } {
+                let mut state = table_state.write().unwrap();
+                state.meta.root_page = delta.root_page;
+                state.meta.row_count = (state.meta.row_count as i64 + delta.row_count_delta) as u64;
+                if delta.next_rowid > state.meta.next_rowid {
+                    state.meta.next_rowid = delta.next_rowid;
+                }
+            }
+        }
+
+        Ok(())
+    }
+}
+
+impl Drop for AcidTransaction<'_> {
+    fn drop(&mut self) {
+        // If not committed, everything is simply dropped.
+        // private_dirty pages discarded, meta_deltas discarded.
+        // Database state is unchanged — clean rollback.
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Transaction — enum wrapping Light and Acid transactions
+// ---------------------------------------------------------------------------
+
+#[allow(private_interfaces)]
+pub enum Transaction<'a> {
+    Light(LightTransaction<'a>),
+    Acid(AcidTransaction<'a>),
+}
+
+impl<'a> Transaction<'a> {
+    /// Commit the transaction.
+    pub fn commit(self) -> Result<()> {
+        match self {
+            Transaction::Light(mut t) => {
+                t.committed = true;
+                t.db.flush_transaction()
+            }
+            Transaction::Acid(t) => t.commit(),
+        }
+    }
+
+    pub fn insert(&mut self, table: &str, data: &[(&str, Value)]) -> Result<u64> {
+        match self {
+            Transaction::Light(t) => t.db.insert(table, data),
+            Transaction::Acid(t) => t.insert(table, data),
+        }
+    }
+
+    pub fn insert_with_id(&mut self, table: &str, rowid: u64, data: &[(&str, Value)]) -> Result<()> {
+        match self {
+            Transaction::Light(t) => t.db.insert_with_id(table, rowid, data),
+            Transaction::Acid(t) => t.insert_with_id(table, rowid, data),
+        }
+    }
+
+    pub fn get(&mut self, table: &str, id: u64) -> Result<Option<Row>> {
+        match self {
+            Transaction::Light(t) => t.db.get(table, id),
+            Transaction::Acid(t) => t.get(table, id),
+        }
+    }
+
+    pub fn update(&mut self, table: &str, id: u64, fields: &[(&str, Value)]) -> Result<bool> {
+        match self {
+            Transaction::Light(t) => t.db.update(table, id, fields),
+            Transaction::Acid(t) => t.update(table, id, fields),
+        }
+    }
+
+    pub fn delete(&mut self, table: &str, id: u64) -> Result<bool> {
+        match self {
+            Transaction::Light(t) => t.db.delete(table, id),
+            Transaction::Acid(t) => t.delete(table, id),
+        }
+    }
+
+    pub fn find(&mut self, table: &str, opts: FindOptions) -> Result<FindResult> {
+        match self {
+            Transaction::Light(t) => t.db.find(table, opts),
+            Transaction::Acid(t) => t.find(table, opts),
+        }
+    }
+
+    pub fn count(&mut self, table: &str, filters: &[Filter]) -> Result<u64> {
+        match self {
+            Transaction::Light(t) => t.db.count(table, filters),
+            Transaction::Acid(t) => t.count(table, filters),
+        }
+    }
+
+    pub fn insert_many(&mut self, table: &str, rows: &[Vec<(&str, Value)>]) -> Result<Vec<u64>> {
+        match self {
+            Transaction::Light(t) => t.db.insert_many(table, rows),
+            Transaction::Acid(t) => t.insert_many(table, rows),
+        }
+    }
+
+    pub fn update_where(&mut self, table: &str, filters: &[Filter], fields: &[(&str, Value)]) -> Result<u64> {
+        match self {
+            Transaction::Light(t) => t.db.update_where(table, filters, fields),
+            Transaction::Acid(t) => t.update_where(table, filters, fields),
+        }
+    }
+
+    pub fn delete_where(&mut self, table: &str, filters: &[Filter]) -> Result<u64> {
+        match self {
+            Transaction::Light(t) => t.db.delete_where(table, filters),
+            Transaction::Acid(t) => t.delete_where(table, filters),
         }
     }
 }

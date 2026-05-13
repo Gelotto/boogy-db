@@ -323,6 +323,37 @@ impl<'a, 'b> BTreeWriter<'a, 'b> {
         self.delete_recursive(self.root, rowid)
     }
 
+    /// Search for a row by rowid through the WriteGuard (sees dirty overlay).
+    pub fn search(&self, rowid: u64) -> Result<Option<Vec<u8>>> {
+        self.search_recursive_w(self.root, rowid)
+    }
+
+    /// Scan all rows through the WriteGuard (sees dirty overlay).
+    pub fn scan_all_w(&self) -> Result<Vec<(u64, Vec<u8>)>> {
+        let first_leaf = self.find_leftmost_leaf_w(self.root)?;
+        let mut results = Vec::new();
+        let mut current = first_leaf;
+        loop {
+            let page = self.guard.read_page_cloned(current)?;
+            let num_rows = page.num_rows() as usize;
+            for i in 0..num_rows {
+                let (start, end) = row_bounds(&page, i, num_rows);
+                if start < end && end <= PAGE_SIZE {
+                    let data = &page.data[start..end];
+                    if let Ok(id) = row::extract_id(data) {
+                        results.push((id, data.to_vec()));
+                    }
+                }
+            }
+            let next = page.next_leaf();
+            if next == 0 {
+                break;
+            }
+            current = next;
+        }
+        Ok(results)
+    }
+
     /// Delete all rows whose raw bytes satisfy `pred`. Walks the leaf chain once
     /// and rebuilds each modified page in a single pass (no per-row delete+reinsert).
     /// Returns the deleted rows as `(rowid, old_row_bytes)` pairs.
@@ -452,6 +483,46 @@ impl<'a, 'b> BTreeWriter<'a, 'b> {
     }
 
     // --- Internal methods ---
+
+    fn search_recursive_w(&self, page_no: u32, rowid: u64) -> Result<Option<Vec<u8>>> {
+        // Zero-copy branch navigation (same pattern as delete_recursive)
+        let (is_leaf, child) = if let Some(p) = self.guard.peek_dirty(page_no) {
+            if p.is_leaf() {
+                (true, 0)
+            } else {
+                let (_, c) = find_child(p, rowid);
+                (false, c)
+            }
+        } else {
+            let arc = self.guard.page_file().read_page(page_no)?;
+            if arc.is_leaf() {
+                (true, 0)
+            } else {
+                let (_, c) = find_child(&arc, rowid);
+                (false, c)
+            }
+        };
+
+        if !is_leaf {
+            return self.search_recursive_w(child, rowid);
+        }
+
+        let page = self.guard.read_page_cloned(page_no)?;
+        let num_rows = page.num_rows() as usize;
+        if num_rows == 0 {
+            return Ok(None);
+        }
+        let (pos, found) = find_insertion_point(&page, rowid)?;
+        if !found {
+            return Ok(None);
+        }
+        let (start, end) = row_bounds(&page, pos, num_rows);
+        if start < end && end <= PAGE_SIZE {
+            Ok(Some(page.data[start..end].to_vec()))
+        } else {
+            Ok(None)
+        }
+    }
 
     /// Navigate branch pages to find the leftmost leaf page.
     fn find_leftmost_leaf_w(&self, page_no: u32) -> Result<u32> {
