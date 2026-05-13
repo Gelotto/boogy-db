@@ -17,7 +17,7 @@ pub mod async_db;
 pub use error::{BoogyError, Result};
 pub use value::{ColumnDef, Type, Value};
 pub use filter::{Filter, FilterOp, FindOptions, FindResult, Sort, SortDir};
-pub use db::{BoogyDb, Durability, Row};
+pub use db::{BoogyDb, Durability, Row, Transaction};
 
 #[cfg(feature = "tokio")]
-pub use async_db::AsyncBoogyDb;
+pub use async_db::{AsyncBoogyDb, AsyncTransaction};

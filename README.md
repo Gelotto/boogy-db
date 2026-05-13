@@ -73,6 +73,11 @@ db.create_index("users", "idx_email", "email")?;
 
 // Count (uses index when available)
 let n = db.count("users", &[Filter::eq("email", "alice@example.com")])?;
+
+// Transactions (guard-based)
+let tx = db.begin()?;
+tx.insert("users", &[("name", Value::Text("Bob".into()))])?;
+tx.commit()?;
 ```
 
 ## API
@@ -95,7 +100,8 @@ let n = db.count("users", &[Filter::eq("email", "alice@example.com")])?;
 | `create_table_encrypted(table, columns, key)` | Create an encrypted table (AES-256-GCM) |
 | `unlock_table(table, key)` | Provide the key for an encrypted table after reopen |
 | `drop_table(table)` | Drop a table |
-| `transaction(fn)` | Multi-table transaction |
+| `transaction(fn)` | Multi-table transaction (callback-based) |
+| `begin()` | Begin a guard-based transaction (alternative to `transaction(fn)`) |
 
 ## Benchmarks
 

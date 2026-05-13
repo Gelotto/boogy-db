@@ -1430,3 +1430,49 @@ fn test_encrypted_table_with_index() {
         .unwrap();
     assert_eq!(count, 10);
 }
+
+// ===========================================================================
+// Guard-based transaction tests
+// ===========================================================================
+
+#[test]
+fn test_begin_commit_transaction() {
+    let (db, _dir) = create_db();
+    db.create_table("a", &[ColumnDef::new("v", Type::Integer)]).unwrap();
+    db.create_table("b", &[ColumnDef::new("v", Type::Integer)]).unwrap();
+
+    let tx = db.begin().unwrap();
+    tx.insert("a", &[("v", Value::Integer(1))]).unwrap();
+    tx.insert("b", &[("v", Value::Integer(2))]).unwrap();
+    tx.commit().unwrap();
+
+    assert_eq!(db.count("a", &[]).unwrap(), 1);
+    assert_eq!(db.count("b", &[]).unwrap(), 1);
+}
+
+#[test]
+fn test_begin_drop_without_commit() {
+    let (db, _dir) = create_db();
+    db.create_table("t", &[ColumnDef::new("v", Type::Integer)]).unwrap();
+
+    {
+        let tx = db.begin().unwrap();
+        tx.insert("t", &[("v", Value::Integer(1))]).unwrap();
+        // Drop without commit — operations already applied (lazy locking)
+    }
+
+    // Data persists because individual ops committed their own writes
+    assert_eq!(db.count("t", &[]).unwrap(), 1);
+}
+
+#[test]
+fn test_begin_read_within_transaction() {
+    let (db, _dir) = create_db();
+    db.create_table("t", &[ColumnDef::new("v", Type::Integer)]).unwrap();
+
+    let tx = db.begin().unwrap();
+    let id = tx.insert("t", &[("v", Value::Integer(42))]).unwrap();
+    let row = tx.get("t", id).unwrap().unwrap();
+    assert_eq!(row.get("v").unwrap(), Value::Integer(42));
+    tx.commit().unwrap();
+}

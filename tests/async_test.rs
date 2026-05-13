@@ -110,3 +110,18 @@ async fn test_async_bulk_ops() {
     assert_eq!(deleted, 50);
     assert_eq!(db.count("t", &[]).await.unwrap(), 50);
 }
+
+#[tokio::test]
+async fn test_async_begin_commit() {
+    let dir = TempDir::new().unwrap();
+    let db = AsyncBoogyDb::open(dir.path().join("test.boogy")).await.unwrap();
+    db.create_table("a", &[ColumnDef::new("v", Type::Integer)])
+        .await
+        .unwrap();
+
+    let tx = db.begin().await.unwrap();
+    tx.insert("a", &[("v", Value::Integer(1))]).await.unwrap();
+    tx.commit().await.unwrap();
+
+    assert_eq!(db.count("a", &[]).await.unwrap(), 1);
+}

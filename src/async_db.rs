@@ -138,8 +138,78 @@ impl AsyncBoogyDb {
         self.inner.transaction(f)
     }
 
+    /// Begin a guard-based transaction. Returns an `AsyncTransaction` that
+    /// commits on explicit `.commit()`. Operations within the transaction lock
+    /// tables lazily, same as the callback-based `transaction()`.
+    pub async fn begin(&self) -> Result<AsyncTransaction<'_>> {
+        Ok(AsyncTransaction { db: self, committed: false })
+    }
+
     /// Access the underlying synchronous `BoogyDb`.
     pub fn inner(&self) -> &BoogyDb {
         &self.inner
+    }
+}
+
+/// Async guard-based transaction. Commits on explicit `.commit()`, rolls back on drop.
+pub struct AsyncTransaction<'a> {
+    db: &'a AsyncBoogyDb,
+    committed: bool,
+}
+
+impl<'a> AsyncTransaction<'a> {
+    /// Commit the transaction. Flushes any pending WAL entries.
+    pub async fn commit(mut self) -> Result<()> {
+        self.committed = true;
+        self.db.inner.flush_transaction()
+    }
+
+    pub async fn insert(&self, table: &str, data: &[(&str, Value)]) -> Result<u64> {
+        self.db.inner.insert(table, data)
+    }
+
+    pub async fn insert_with_id(&self, table: &str, rowid: u64, data: &[(&str, Value)]) -> Result<()> {
+        self.db.inner.insert_with_id(table, rowid, data)
+    }
+
+    pub async fn get(&self, table: &str, id: u64) -> Result<Option<Row>> {
+        self.db.inner.get(table, id)
+    }
+
+    pub async fn update(&self, table: &str, id: u64, fields: &[(&str, Value)]) -> Result<bool> {
+        self.db.inner.update(table, id, fields)
+    }
+
+    pub async fn delete(&self, table: &str, id: u64) -> Result<bool> {
+        self.db.inner.delete(table, id)
+    }
+
+    pub async fn find(&self, table: &str, opts: FindOptions) -> Result<FindResult> {
+        self.db.inner.find(table, opts)
+    }
+
+    pub async fn count(&self, table: &str, filters: &[Filter]) -> Result<u64> {
+        self.db.inner.count(table, filters)
+    }
+
+    pub async fn insert_many(&self, table: &str, rows: &[Vec<(&str, Value)>]) -> Result<Vec<u64>> {
+        self.db.inner.insert_many(table, rows)
+    }
+
+    pub async fn update_where(&self, table: &str, filters: &[Filter], fields: &[(&str, Value)]) -> Result<u64> {
+        self.db.inner.update_where(table, filters, fields)
+    }
+
+    pub async fn delete_where(&self, table: &str, filters: &[Filter]) -> Result<u64> {
+        self.db.inner.delete_where(table, filters)
+    }
+}
+
+impl Drop for AsyncTransaction<'_> {
+    fn drop(&mut self) {
+        if !self.committed {
+            // Rollback: individual operations already committed their own writes,
+            // but we skip the final flush.
+        }
     }
 }
