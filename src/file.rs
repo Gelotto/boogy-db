@@ -325,6 +325,31 @@ impl<'a> WriteGuard<'a> {
         Ok((*self.file.read_page(page_no)?).clone())
     }
 
+    /// Move pages into the dirty overlay from an external buffer.
+    /// Pages already in the overlay are NOT overwritten.
+    pub fn inject_dirty(&mut self, pages: HashMap<u32, Box<Page>>) {
+        for (page_no, page) in pages {
+            if !self.state.dirty.contains_key(&page_no) {
+                self.state.dirty.insert(page_no, page);
+            }
+        }
+    }
+
+    /// Drain all dirty pages out of the overlay, returning them.
+    pub fn drain_dirty(&mut self) -> HashMap<u32, Box<Page>> {
+        std::mem::take(&mut self.state.dirty)
+    }
+
+    /// Get the current new_page_count.
+    pub fn new_page_count(&self) -> u32 {
+        self.state.new_page_count
+    }
+
+    /// Set new_page_count (used by ACID transactions to restore state).
+    pub fn set_new_page_count(&mut self, count: u32) {
+        self.state.new_page_count = count;
+    }
+
     // -- private helpers --
 
     /// Read a page (without going through the public API that returns Arc).
@@ -556,5 +581,37 @@ mod tests {
         // After discard, original is unchanged
         let page = pf.read_page(0).unwrap();
         assert_eq!(page.num_rows(), 1);
+    }
+
+    #[test]
+    fn test_inject_drain_roundtrip() {
+        let tmp = NamedTempFile::new().unwrap();
+        let pf = PageFile::open(tmp.path()).unwrap();
+
+        // Create a page via normal write path
+        let mut guard = pf.begin_write();
+        let pg0 = guard.allocate_page().unwrap();
+        let page = guard.write_page(pg0).unwrap();
+        *page = Page::new_leaf();
+        page.set_num_rows(3);
+        page.update_checksum();
+
+        // Drain dirty pages
+        let drained = guard.drain_dirty();
+        assert!(drained.contains_key(&pg0));
+        assert_eq!(drained[&pg0].num_rows(), 3);
+
+        // Guard should have no dirty pages now
+        guard.discard();
+
+        // Inject into a new guard
+        let mut guard2 = pf.begin_write();
+        guard2.inject_dirty(drained);
+
+        // Should be visible via peek_dirty
+        let peeked = guard2.peek_dirty(pg0).unwrap();
+        assert_eq!(peeked.num_rows(), 3);
+
+        guard2.discard();
     }
 }
