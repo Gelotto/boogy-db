@@ -1,12 +1,12 @@
 use boogy_db::*;
 use std::time::Instant;
 
-fn main() {
-    // Test at different table sizes to see if performance degrades
+fn run_point_ops(durability: Durability) -> Vec<(usize, f64, f64)> {
+    let mut results = Vec::new();
     for seed_size in [100, 1000, 5000, 10000] {
         let dir = tempfile::TempDir::new().unwrap();
         let db = BoogyDb::open(dir.path().join("bench.boogy")).unwrap();
-        db.set_durability(Durability::None);
+        db.set_durability(durability);
         db.create_table("t", &[ColumnDef::new("v", Type::Integer)]).unwrap();
 
         let mut ids: Vec<u64> = Vec::new();
@@ -28,11 +28,25 @@ fn main() {
         }
         let get_us = t.elapsed().as_micros() as f64 / n as f64;
 
-        println!(
-            "seed={:>5}  insert: {:>6.1} us/op ({:>7.0}/s)  get: {:>5.1} us/op ({:>7.0}/s)",
-            seed_size,
-            insert_us, 1_000_000.0 / insert_us,
-            get_us, 1_000_000.0 / get_us,
-        );
+        results.push((seed_size, insert_us, get_us));
+    }
+    results
+}
+
+fn main() {
+    for (label, durability) in [
+        ("Durability::None", Durability::None),
+        ("Durability::Normal", Durability::Normal),
+    ] {
+        println!("=== Point Operations ({label}) ===\n");
+        for (seed_size, insert_us, get_us) in run_point_ops(durability) {
+            println!(
+                "seed={:>5}  insert: {:>6.1} us/op ({:>7.0}/s)  get: {:>5.1} us/op ({:>7.0}/s)",
+                seed_size,
+                insert_us, 1_000_000.0 / insert_us,
+                get_us, 1_000_000.0 / get_us,
+            );
+        }
+        println!();
     }
 }

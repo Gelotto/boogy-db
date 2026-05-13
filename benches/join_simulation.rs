@@ -4,6 +4,7 @@
 //! boogy-db does two calls (get user + find posts). SQLite does a single JOIN query.
 //!
 //! Tests both single-thread and concurrent (4 threads) access patterns.
+//! boogy-db is tested at both Durability::None and Durability::Normal.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -19,46 +20,52 @@ fn main() {
     println!("=== Join Simulation: Fetch User + Latest 5 Posts ===\n");
     println!("Schema: {} users, {} posts each ({} total posts)", NUM_USERS, POSTS_PER_USER, NUM_USERS * POSTS_PER_USER);
     println!("Query: given a random user ID, fetch user row + 5 most recent posts\n");
+    println!("{:<35} {:>14} {:>14} {:>10}",
+        "", "boogy(none)", "boogy(normal)", "sqlite");
 
     // --- boogy-db: without index ---
-    let boogy_no_idx = bench_boogy(false, false, 1, duration);
-    let sqlite_no_idx = bench_sqlite(false, 1, duration);
-    print_row("No index, 1 thread", boogy_no_idx, sqlite_no_idx);
+    let boogy_none = bench_boogy(false, false, 1, duration, Durability::None);
+    let boogy_normal = bench_boogy(false, false, 1, duration, Durability::Normal);
+    let sqlite = bench_sqlite(false, 1, duration);
+    print_row("No index, 1 thread", boogy_none, boogy_normal, sqlite);
 
     // --- boogy-db: with index on author_id ---
-    let boogy_idx = bench_boogy(true, false, 1, duration);
-    let sqlite_idx = bench_sqlite(true, 1, duration);
-    print_row("With index, 1 thread", boogy_idx, sqlite_idx);
+    let boogy_none = bench_boogy(true, false, 1, duration, Durability::None);
+    let boogy_normal = bench_boogy(true, false, 1, duration, Durability::Normal);
+    let sqlite = bench_sqlite(true, 1, duration);
+    print_row("With index, 1 thread", boogy_none, boogy_normal, sqlite);
 
     // --- boogy-db: with index, no sort (any 5 posts) ---
-    let boogy_idx_nosort = bench_boogy(true, true, 1, duration);
-    // SQLite equivalent: SELECT ... WHERE author_id = ? LIMIT 5 (no ORDER BY)
-    let sqlite_idx_nosort = bench_sqlite_nosort(true, 1, duration);
-    print_row("With index, no sort, 1 thread", boogy_idx_nosort, sqlite_idx_nosort);
+    let boogy_none = bench_boogy(true, true, 1, duration, Durability::None);
+    let boogy_normal = bench_boogy(true, true, 1, duration, Durability::Normal);
+    let sqlite = bench_sqlite_nosort(true, 1, duration);
+    print_row("With index, no sort, 1 thread", boogy_none, boogy_normal, sqlite);
 
     println!();
 
     // --- Concurrent (4 threads) ---
-    let boogy_c = bench_boogy(true, false, 4, duration);
-    let sqlite_c = bench_sqlite(true, 4, duration);
-    print_row("With index, 4 threads", boogy_c, sqlite_c);
+    let boogy_none = bench_boogy(true, false, 4, duration, Durability::None);
+    let boogy_normal = bench_boogy(true, false, 4, duration, Durability::Normal);
+    let sqlite = bench_sqlite(true, 4, duration);
+    print_row("With index, 4 threads", boogy_none, boogy_normal, sqlite);
 
-    let boogy_c8 = bench_boogy(true, false, 8, duration);
-    let sqlite_c8 = bench_sqlite(true, 8, duration);
-    print_row("With index, 8 threads", boogy_c8, sqlite_c8);
+    let boogy_none = bench_boogy(true, false, 8, duration, Durability::None);
+    let boogy_normal = bench_boogy(true, false, 8, duration, Durability::Normal);
+    let sqlite = bench_sqlite(true, 8, duration);
+    print_row("With index, 8 threads", boogy_none, boogy_normal, sqlite);
 }
 
-fn print_row(label: &str, boogy: u64, sqlite: u64) {
-    let ratio = boogy as f64 / sqlite as f64;
+fn print_row(label: &str, boogy_none: u64, boogy_normal: u64, sqlite: u64) {
+    let ratio = boogy_none as f64 / sqlite as f64;
     let winner = if ratio > 1.0 { "boogy" } else { "sqlite" };
-    println!("{:<35} {:>10} {:>10}   {:.2}x ({winner})", label,
-        format!("{boogy} q/s"), format!("{sqlite} q/s"), ratio);
+    println!("{:<35} {:>10} q/s {:>10} q/s {:>10} q/s  {:.2}x ({winner})",
+        label, boogy_none, boogy_normal, sqlite, ratio);
 }
 
-fn bench_boogy(with_index: bool, skip_sort: bool, threads: usize, duration: Duration) -> u64 {
+fn bench_boogy(with_index: bool, skip_sort: bool, threads: usize, duration: Duration, durability: Durability) -> u64 {
     let dir = tempfile::TempDir::new().unwrap();
     let db = Arc::new(BoogyDb::open(dir.path().join("bench.boogy")).unwrap());
-    db.set_durability(Durability::None);
+    db.set_durability(durability);
 
     db.create_table("users", &[
         ColumnDef::new("name", Type::Text),

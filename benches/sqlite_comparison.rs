@@ -1,6 +1,7 @@
 //! Benchmark: boogy-db vs SQLite (via rusqlite)
 //! Same social feed workload as SpinStack's store-bench.
 //! Runs two variants: without indexes and with indexes on the filter column.
+//! boogy-db is tested at both Durability::None and Durability::Normal.
 
 use std::time::{Duration, Instant};
 use boogy_db::*;
@@ -14,84 +15,64 @@ fn main() {
     println!("Workload: 30% insert / 30% get / 25% find / 15% count");
     println!("Duration: 5s per engine\n");
 
-    // --- boogy-db (no index) ---
-    let dir = tempfile::TempDir::new().unwrap();
-    let db = BoogyDb::open(dir.path().join("bench.boogy")).unwrap();
-    db.set_durability(Durability::None);
-    db.create_table("notes", &[
-        ColumnDef::new("title", Type::Text),
-        ColumnDef::new("body", Type::Text),
-        ColumnDef::new("owner", Type::Text),
-    ]).unwrap();
+    // --- boogy-db (no index, Durability::None) ---
+    let boogy_none_no_idx = run_boogy_fresh(Durability::None, false, duration);
 
-    let mut boogy_ids: Vec<u64> = Vec::new();
-    for i in 0..1000 {
-        boogy_ids.push(db.insert("notes", &[
-            ("title", Value::Text(format!("note_{i}"))),
-            ("body", Value::Text("body content here".into())),
-            ("owner", Value::Text(format!("user_{}", i % 10))),
-        ]).unwrap());
-    }
-
-    let boogy_no_idx = run_boogy(&db, &mut boogy_ids, duration);
-    drop(db);
-    drop(dir);
+    // --- boogy-db (no index, Durability::Normal) ---
+    let boogy_normal_no_idx = run_boogy_fresh(Durability::Normal, false, duration);
 
     // --- SQLite (no index) ---
-    let sdir = tempfile::TempDir::new().unwrap();
-    let conn = rusqlite::Connection::open(sdir.path().join("bench.db")).unwrap();
-    conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;").unwrap();
-    conn.execute(
-        "CREATE TABLE notes (_id INTEGER PRIMARY KEY, title TEXT, body TEXT, owner TEXT)",
-        [],
-    ).unwrap();
+    let sqlite_no_idx = run_sqlite_fresh(false, duration);
 
-    let mut sqlite_ids: Vec<i64> = Vec::new();
-    conn.execute("BEGIN", []).unwrap();
-    for i in 0..1000i64 {
-        conn.execute(
-            "INSERT INTO notes (_id, title, body, owner) VALUES (?1, ?2, ?3, ?4)",
-            rusqlite::params![i, format!("note_{i}"), "body content here", format!("user_{}", i % 10)],
-        ).unwrap();
-        sqlite_ids.push(i);
-    }
-    conn.execute("COMMIT", []).unwrap();
-
-    let sqlite_no_idx = run_sqlite(&conn, &mut sqlite_ids, duration);
-    drop(conn);
-    drop(sdir);
-
-    print_results("Without Index", &boogy_no_idx, &sqlite_no_idx);
+    print_results("Without Index", &boogy_none_no_idx, &boogy_normal_no_idx, &sqlite_no_idx);
 
     // ======================== WITH INDEX ========================
 
     println!("\n=== With Index (on 'owner') ===\n");
 
-    // --- boogy-db (with index) ---
+    // --- boogy-db (with index, Durability::None) ---
+    let boogy_none_idx = run_boogy_fresh(Durability::None, true, duration);
+
+    // --- boogy-db (with index, Durability::Normal) ---
+    let boogy_normal_idx = run_boogy_fresh(Durability::Normal, true, duration);
+
+    // --- SQLite (with index) ---
+    let sqlite_idx = run_sqlite_fresh(true, duration);
+
+    print_results("With Index", &boogy_none_idx, &boogy_normal_idx, &sqlite_idx);
+}
+
+/// Create a fresh boogy-db, seed it, and run the workload.
+fn run_boogy_fresh(durability: Durability, with_index: bool, duration: Duration) -> Results {
     let dir = tempfile::TempDir::new().unwrap();
     let db = BoogyDb::open(dir.path().join("bench.boogy")).unwrap();
-    db.set_durability(Durability::None);
+    db.set_durability(durability);
     db.create_table("notes", &[
         ColumnDef::new("title", Type::Text),
         ColumnDef::new("body", Type::Text),
         ColumnDef::new("owner", Type::Text),
     ]).unwrap();
-    db.create_index("notes", "idx_owner", "owner").unwrap();
+    if with_index {
+        db.create_index("notes", "idx_owner", "owner").unwrap();
+    }
 
-    let mut boogy_ids: Vec<u64> = Vec::new();
+    let mut ids: Vec<u64> = Vec::new();
     for i in 0..1000 {
-        boogy_ids.push(db.insert("notes", &[
+        ids.push(db.insert("notes", &[
             ("title", Value::Text(format!("note_{i}"))),
             ("body", Value::Text("body content here".into())),
             ("owner", Value::Text(format!("user_{}", i % 10))),
         ]).unwrap());
     }
 
-    let boogy_with_idx = run_boogy(&db, &mut boogy_ids, duration);
+    let result = run_boogy(&db, &mut ids, duration);
     drop(db);
     drop(dir);
+    result
+}
 
-    // --- SQLite (with index) ---
+/// Create a fresh SQLite DB, seed it, and run the workload.
+fn run_sqlite_fresh(with_index: bool, duration: Duration) -> Results {
     let sdir = tempfile::TempDir::new().unwrap();
     let conn = rusqlite::Connection::open(sdir.path().join("bench.db")).unwrap();
     conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;").unwrap();
@@ -99,24 +80,25 @@ fn main() {
         "CREATE TABLE notes (_id INTEGER PRIMARY KEY, title TEXT, body TEXT, owner TEXT)",
         [],
     ).unwrap();
-    conn.execute("CREATE INDEX idx_owner ON notes(owner)", []).unwrap();
+    if with_index {
+        conn.execute("CREATE INDEX idx_owner ON notes(owner)", []).unwrap();
+    }
 
-    let mut sqlite_ids: Vec<i64> = Vec::new();
+    let mut ids: Vec<i64> = Vec::new();
     conn.execute("BEGIN", []).unwrap();
     for i in 0..1000i64 {
         conn.execute(
             "INSERT INTO notes (_id, title, body, owner) VALUES (?1, ?2, ?3, ?4)",
             rusqlite::params![i, format!("note_{i}"), "body content here", format!("user_{}", i % 10)],
         ).unwrap();
-        sqlite_ids.push(i);
+        ids.push(i);
     }
     conn.execute("COMMIT", []).unwrap();
 
-    let sqlite_with_idx = run_sqlite(&conn, &mut sqlite_ids, duration);
+    let result = run_sqlite(&conn, &mut ids, duration);
     drop(conn);
     drop(sdir);
-
-    print_results("With Index", &boogy_with_idx, &sqlite_with_idx);
+    result
 }
 
 struct Results {
@@ -129,22 +111,34 @@ struct Results {
     count_count: u64,
 }
 
-fn print_results(label: &str, boogy: &Results, sqlite: &Results) {
-    let ratio = boogy.ops_sec / sqlite.ops_sec;
-    let winner = if ratio > 1.0 { "boogy" } else { "sqlite" };
-    println!("{:>20} {:>12} {:>12} {:>8}", "", "boogy-db", "sqlite", "ratio");
-    println!("{:>20} {:>12.0} {:>12.0} {:>7.2}x ({winner})", "ops/sec", boogy.ops_sec, sqlite.ops_sec, ratio);
-    println!("{:>20} {:>11} {:>11}", "p50", fmt_us(boogy.p50), fmt_us(sqlite.p50));
-    println!("{:>20} {:>11} {:>11}", "p99", fmt_us(boogy.p99), fmt_us(sqlite.p99));
+fn print_results(_label: &str, boogy_none: &Results, boogy_normal: &Results, sqlite: &Results) {
+    let ratio_none = boogy_none.ops_sec / sqlite.ops_sec;
+    let ratio_normal = boogy_normal.ops_sec / sqlite.ops_sec;
+    println!("{:>20} {:>14} {:>14} {:>12}", "", "boogy(none)", "boogy(normal)", "sqlite");
+    println!("{:>20} {:>14.0} {:>14.0} {:>12.0}", "ops/sec",
+        boogy_none.ops_sec, boogy_normal.ops_sec, sqlite.ops_sec);
+    println!("{:>20} {:>13} {:>13} {:>11}", "p50",
+        fmt_us(boogy_none.p50), fmt_us(boogy_normal.p50), fmt_us(sqlite.p50));
+    println!("{:>20} {:>13} {:>13} {:>11}", "p99",
+        fmt_us(boogy_none.p99), fmt_us(boogy_normal.p99), fmt_us(sqlite.p99));
+    println!("{:>20} {:>13.2}x {:>13.2}x", "vs sqlite", ratio_none, ratio_normal);
     println!();
-    println!("{:>20} {:>11}/s {:>11}/s", "insert",
-        fmt_f(boogy.insert_count as f64 / 5.0), fmt_f(sqlite.insert_count as f64 / 5.0));
-    println!("{:>20} {:>11}/s {:>11}/s", "get",
-        fmt_f(boogy.get_count as f64 / 5.0), fmt_f(sqlite.get_count as f64 / 5.0));
-    println!("{:>20} {:>11}/s {:>11}/s", "find",
-        fmt_f(boogy.find_count as f64 / 5.0), fmt_f(sqlite.find_count as f64 / 5.0));
-    println!("{:>20} {:>11}/s {:>11}/s", "count",
-        fmt_f(boogy.count_count as f64 / 5.0), fmt_f(sqlite.count_count as f64 / 5.0));
+    println!("{:>20} {:>13}/s {:>13}/s {:>11}/s", "insert",
+        fmt_f(boogy_none.insert_count as f64 / 5.0),
+        fmt_f(boogy_normal.insert_count as f64 / 5.0),
+        fmt_f(sqlite.insert_count as f64 / 5.0));
+    println!("{:>20} {:>13}/s {:>13}/s {:>11}/s", "get",
+        fmt_f(boogy_none.get_count as f64 / 5.0),
+        fmt_f(boogy_normal.get_count as f64 / 5.0),
+        fmt_f(sqlite.get_count as f64 / 5.0));
+    println!("{:>20} {:>13}/s {:>13}/s {:>11}/s", "find",
+        fmt_f(boogy_none.find_count as f64 / 5.0),
+        fmt_f(boogy_normal.find_count as f64 / 5.0),
+        fmt_f(sqlite.find_count as f64 / 5.0));
+    println!("{:>20} {:>13}/s {:>13}/s {:>11}/s", "count",
+        fmt_f(boogy_none.count_count as f64 / 5.0),
+        fmt_f(boogy_normal.count_count as f64 / 5.0),
+        fmt_f(sqlite.count_count as f64 / 5.0));
 }
 
 fn run_boogy(db: &BoogyDb, ids: &mut Vec<u64>, duration: Duration) -> Results {

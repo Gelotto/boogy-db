@@ -1,5 +1,6 @@
 //! Benchmark: boogy-db vs SQLite under concurrent load.
 //! Tests 1, 2, 4, 8 threads with the same mixed workload.
+//! boogy-db is tested at both Durability::None and Durability::Normal.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -11,32 +12,38 @@ fn main() {
     println!("=== Concurrent Mixed Workload (no index) ===");
     println!("Workload per thread: 30% insert / 30% get / 25% find / 15% count");
     println!("Duration: 5s\n");
-    println!("{:>8} {:>14} {:>14} {:>8}", "threads", "boogy ops/s", "sqlite ops/s", "ratio");
+    println!("{:>8} {:>14} {:>14} {:>14} {:>8}",
+        "threads", "boogy(none)", "boogy(normal)", "sqlite", "ratio");
 
     for threads in [1, 2, 4, 8] {
-        let boogy = bench_boogy(threads, duration, false);
+        let boogy_none = bench_boogy(threads, duration, false, Durability::None);
+        let boogy_normal = bench_boogy(threads, duration, false, Durability::Normal);
         let sqlite = bench_sqlite(threads, duration, false);
-        let ratio = boogy as f64 / sqlite as f64;
-        let winner = if ratio > 1.0 { "boogy" } else { "sqlite" };
-        println!("{:>8} {:>14} {:>14} {:>7.2}x ({winner})", threads, boogy, sqlite, ratio);
+        let ratio_none = boogy_none as f64 / sqlite as f64;
+        let winner = if ratio_none > 1.0 { "boogy" } else { "sqlite" };
+        println!("{:>8} {:>14} {:>14} {:>14} {:>7.2}x ({winner})",
+            threads, boogy_none, boogy_normal, sqlite, ratio_none);
     }
 
     println!("\n=== Concurrent Mixed Workload (with index) ===\n");
-    println!("{:>8} {:>14} {:>14} {:>8}", "threads", "boogy ops/s", "sqlite ops/s", "ratio");
+    println!("{:>8} {:>14} {:>14} {:>14} {:>8}",
+        "threads", "boogy(none)", "boogy(normal)", "sqlite", "ratio");
 
     for threads in [1, 2, 4, 8] {
-        let boogy = bench_boogy(threads, duration, true);
+        let boogy_none = bench_boogy(threads, duration, true, Durability::None);
+        let boogy_normal = bench_boogy(threads, duration, true, Durability::Normal);
         let sqlite = bench_sqlite(threads, duration, true);
-        let ratio = boogy as f64 / sqlite as f64;
-        let winner = if ratio > 1.0 { "boogy" } else { "sqlite" };
-        println!("{:>8} {:>14} {:>14} {:>7.2}x ({winner})", threads, boogy, sqlite, ratio);
+        let ratio_none = boogy_none as f64 / sqlite as f64;
+        let winner = if ratio_none > 1.0 { "boogy" } else { "sqlite" };
+        println!("{:>8} {:>14} {:>14} {:>14} {:>7.2}x ({winner})",
+            threads, boogy_none, boogy_normal, sqlite, ratio_none);
     }
 }
 
-fn bench_boogy(num_threads: usize, duration: Duration, with_index: bool) -> u64 {
+fn bench_boogy(num_threads: usize, duration: Duration, with_index: bool, durability: Durability) -> u64 {
     let dir = tempfile::TempDir::new().unwrap();
     let db = Arc::new(BoogyDb::open(dir.path().join("bench.boogy")).unwrap());
-    db.set_durability(Durability::None);
+    db.set_durability(durability);
     db.create_table("notes", &[
         ColumnDef::new("title", Type::Text),
         ColumnDef::new("body", Type::Text),

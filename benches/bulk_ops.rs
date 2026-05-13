@@ -2,6 +2,7 @@
 //!
 //! Compares boogy-db's bulk API methods against SQLite's equivalent
 //! batch INSERT, UPDATE ... WHERE, and DELETE ... WHERE statements.
+//! boogy-db is tested at both Durability::None and Durability::Normal.
 
 use std::time::Instant;
 use boogy_db::*;
@@ -11,52 +12,64 @@ fn main() {
 
     // --- Bulk Insert ---
     println!("--- Bulk Insert (single transaction) ---\n");
-    println!("{:>8} {:>14} {:>14} {:>8}", "rows", "boogy-db", "sqlite", "ratio");
+    println!("{:>8} {:>14} {:>14} {:>14} {:>8}",
+        "rows", "boogy(none)", "boogy(normal)", "sqlite", "ratio");
 
     for batch_size in [100, 1_000, 10_000, 50_000] {
-        let boogy = bench_boogy_insert(batch_size);
+        let boogy_none = bench_boogy_insert(batch_size, Durability::None);
+        let boogy_normal = bench_boogy_insert(batch_size, Durability::Normal);
         let sqlite = bench_sqlite_insert(batch_size);
-        let ratio = boogy / sqlite;
+        let ratio = boogy_none / sqlite;
         let winner = if ratio > 1.0 { "boogy" } else { "sqlite" };
-        println!("{:>8} {:>12.0} r/s {:>12.0} r/s {:>6.2}x ({winner})", batch_size, boogy, sqlite, ratio);
+        println!("{:>8} {:>12.0} r/s {:>12.0} r/s {:>12.0} r/s {:>6.2}x ({winner})",
+            batch_size, boogy_none, boogy_normal, sqlite, ratio);
     }
 
     // --- Bulk Update ---
     println!("\n--- Bulk Update (update_where / UPDATE ... WHERE) ---");
     println!("Table: 10,000 rows, 3 columns. Update 1 column on matching rows.\n");
-    println!("{:>12} {:>14} {:>14} {:>8}", "affected", "boogy-db", "sqlite", "ratio");
+    println!("{:>12} {:>14} {:>14} {:>14} {:>8}",
+        "affected", "boogy(none)", "boogy(normal)", "sqlite", "ratio");
 
     for (filter_val, expected_label) in [("cat_0", "~1,000"), ("cat_0", "~1,000"), ("cat_4", "~2,000")] {
-        let boogy = bench_boogy_update(filter_val);
+        let boogy_none = bench_boogy_update(filter_val, Durability::None);
+        let boogy_normal = bench_boogy_update(filter_val, Durability::Normal);
         let sqlite = bench_sqlite_update(filter_val);
-        let ratio = boogy / sqlite;
+        let ratio = boogy_none / sqlite;
         let winner = if ratio > 1.0 { "boogy" } else { "sqlite" };
-        println!("{:>12} {:>12.0} r/s {:>12.0} r/s {:>6.2}x ({winner})", expected_label, boogy, sqlite, ratio);
+        println!("{:>12} {:>12.0} r/s {:>12.0} r/s {:>12.0} r/s {:>6.2}x ({winner})",
+            expected_label, boogy_none, boogy_normal, sqlite, ratio);
     }
 
     // --- Bulk Delete ---
     println!("\n--- Bulk Delete (delete_where / DELETE ... WHERE) ---");
     println!("Table: 10,000 rows. Delete all rows matching a filter.\n");
-    println!("{:>12} {:>14} {:>14} {:>8}", "deleted", "boogy-db", "sqlite", "ratio");
+    println!("{:>12} {:>14} {:>14} {:>14} {:>8}",
+        "deleted", "boogy(none)", "boogy(normal)", "sqlite", "ratio");
 
     for (pct, filter_desc) in [(10, "~1,000"), (50, "~5,000"), (90, "~9,000")] {
-        let boogy = bench_boogy_delete(pct);
+        let boogy_none = bench_boogy_delete(pct, Durability::None);
+        let boogy_normal = bench_boogy_delete(pct, Durability::Normal);
         let sqlite = bench_sqlite_delete(pct);
-        let ratio = boogy / sqlite;
+        let ratio = boogy_none / sqlite;
         let winner = if ratio > 1.0 { "boogy" } else { "sqlite" };
-        println!("{:>12} {:>12.0} r/s {:>12.0} r/s {:>6.2}x ({winner})", filter_desc, boogy, sqlite, ratio);
+        println!("{:>12} {:>12.0} r/s {:>12.0} r/s {:>12.0} r/s {:>6.2}x ({winner})",
+            filter_desc, boogy_none, boogy_normal, sqlite, ratio);
     }
 
     // --- Bulk Insert with Index ---
     println!("\n--- Bulk Insert with Index ---\n");
-    println!("{:>8} {:>14} {:>14} {:>8}", "rows", "boogy-db", "sqlite", "ratio");
+    println!("{:>8} {:>14} {:>14} {:>14} {:>8}",
+        "rows", "boogy(none)", "boogy(normal)", "sqlite", "ratio");
 
     for batch_size in [100, 1_000, 10_000, 50_000] {
-        let boogy = bench_boogy_insert_indexed(batch_size);
+        let boogy_none = bench_boogy_insert_indexed(batch_size, Durability::None);
+        let boogy_normal = bench_boogy_insert_indexed(batch_size, Durability::Normal);
         let sqlite = bench_sqlite_insert_indexed(batch_size);
-        let ratio = boogy / sqlite;
+        let ratio = boogy_none / sqlite;
         let winner = if ratio > 1.0 { "boogy" } else { "sqlite" };
-        println!("{:>8} {:>12.0} r/s {:>12.0} r/s {:>6.2}x ({winner})", batch_size, boogy, sqlite, ratio);
+        println!("{:>8} {:>12.0} r/s {:>12.0} r/s {:>12.0} r/s {:>6.2}x ({winner})",
+            batch_size, boogy_none, boogy_normal, sqlite, ratio);
     }
 }
 
@@ -64,10 +77,10 @@ fn main() {
 // Bulk Insert
 // ---------------------------------------------------------------------------
 
-fn bench_boogy_insert(n: usize) -> f64 {
+fn bench_boogy_insert(n: usize, durability: Durability) -> f64 {
     let dir = tempfile::TempDir::new().unwrap();
     let db = BoogyDb::open(dir.path().join("bench.boogy")).unwrap();
-    db.set_durability(Durability::None);
+    db.set_durability(durability);
     db.create_table("t", &[
         ColumnDef::new("name", Type::Text),
         ColumnDef::new("category", Type::Text),
@@ -112,10 +125,10 @@ fn bench_sqlite_insert(n: usize) -> f64 {
 // Bulk Insert with Index
 // ---------------------------------------------------------------------------
 
-fn bench_boogy_insert_indexed(n: usize) -> f64 {
+fn bench_boogy_insert_indexed(n: usize, durability: Durability) -> f64 {
     let dir = tempfile::TempDir::new().unwrap();
     let db = BoogyDb::open(dir.path().join("bench.boogy")).unwrap();
-    db.set_durability(Durability::None);
+    db.set_durability(durability);
     db.create_table("t", &[
         ColumnDef::new("name", Type::Text),
         ColumnDef::new("category", Type::Text),
@@ -162,10 +175,10 @@ fn bench_sqlite_insert_indexed(n: usize) -> f64 {
 // Bulk Update
 // ---------------------------------------------------------------------------
 
-fn seed_boogy_10k() -> (BoogyDb, tempfile::TempDir) {
+fn seed_boogy_10k(durability: Durability) -> (BoogyDb, tempfile::TempDir) {
     let dir = tempfile::TempDir::new().unwrap();
     let db = BoogyDb::open(dir.path().join("bench.boogy")).unwrap();
-    db.set_durability(Durability::None);
+    db.set_durability(durability);
     db.create_table("t", &[
         ColumnDef::new("category", Type::Text),
         ColumnDef::new("status", Type::Text),
@@ -201,8 +214,8 @@ fn seed_sqlite_10k() -> (rusqlite::Connection, tempfile::TempDir) {
     (conn, dir)
 }
 
-fn bench_boogy_update(filter_val: &str) -> f64 {
-    let (db, _dir) = seed_boogy_10k();
+fn bench_boogy_update(filter_val: &str, durability: Durability) -> f64 {
+    let (db, _dir) = seed_boogy_10k(durability);
 
     let t = Instant::now();
     let updated = db.update_where(
@@ -230,8 +243,8 @@ fn bench_sqlite_update(filter_val: &str) -> f64 {
 // Bulk Delete
 // ---------------------------------------------------------------------------
 
-fn bench_boogy_delete(pct: usize) -> f64 {
-    let (db, _dir) = seed_boogy_10k();
+fn bench_boogy_delete(pct: usize, durability: Durability) -> f64 {
+    let (db, _dir) = seed_boogy_10k(durability);
     // Delete rows where value < threshold (pct% of 10,000)
     let threshold = (10_000 * pct / 100) as i64;
 
