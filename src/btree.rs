@@ -323,7 +323,70 @@ impl<'a, 'b> BTreeWriter<'a, 'b> {
         self.delete_recursive(self.root, rowid)
     }
 
+    /// Delete all rows whose raw bytes satisfy `pred`. Walks the leaf chain once
+    /// and rebuilds each modified page in a single pass (no per-row delete+reinsert).
+    /// Returns the deleted rows as `(rowid, old_row_bytes)` pairs.
+    pub fn delete_matching<F>(&mut self, pred: F) -> Result<Vec<(u64, Vec<u8>)>>
+    where
+        F: Fn(&[u8]) -> bool,
+    {
+        let first_leaf = self.find_leftmost_leaf_w(self.root)?;
+        let mut deleted = Vec::new();
+        let mut current = first_leaf;
+
+        loop {
+            let page = (*self.guard.read_page(current)?).clone();
+            let num_rows = page.num_rows() as usize;
+            let next = page.next_leaf();
+            let prev = page.prev_leaf();
+
+            // Find matching row indices in this page.
+            let mut match_indices = Vec::new();
+            for i in 0..num_rows {
+                let (start, end) = row_bounds_raw(&page.data, i, num_rows);
+                if start >= end || end > PAGE_SIZE {
+                    continue;
+                }
+                let data = &page.data[start..end];
+                if pred(data) {
+                    if let Ok(id) = row::extract_id(data) {
+                        deleted.push((id, data.to_vec()));
+                        match_indices.push(i);
+                    }
+                }
+            }
+
+            // Rebuild the page if any rows were deleted.
+            if !match_indices.is_empty() {
+                let snapshot = page.data;
+                let wp = self.guard.write_page(current)?;
+                write_leaf_without_multiple(wp, &snapshot, num_rows, &match_indices);
+                wp.set_next_leaf(next);
+                wp.set_prev_leaf(prev);
+                wp.update_checksum();
+            }
+
+            if next == 0 {
+                break;
+            }
+            current = next;
+        }
+
+        Ok(deleted)
+    }
+
     // --- Internal methods ---
+
+    /// Navigate branch pages to find the leftmost leaf page.
+    fn find_leftmost_leaf_w(&self, page_no: u32) -> Result<u32> {
+        let page = self.guard.read_page(page_no)?;
+        if page.is_leaf() {
+            Ok(page_no)
+        } else {
+            let child = get_branch_child(&page, 0);
+            self.find_leftmost_leaf_w(child)
+        }
+    }
 
     fn insert_recursive(
         &mut self,
@@ -629,6 +692,44 @@ fn write_leaf_with_insert(
             src_idx += 1;
             dst_idx += 1;
         }
+    }
+
+    page.set_num_rows(total as u16);
+    page.set_free_space_offset(write_pos as u16);
+}
+
+/// Write a leaf page that contains the rows from `snapshot` except the rows at
+/// the given indices (must be sorted ascending). No heap allocation.
+fn write_leaf_without_multiple(
+    page: &mut Page,
+    snapshot: &[u8; PAGE_SIZE],
+    old_count: usize,
+    skip_indices: &[usize],
+) {
+    let total = old_count - skip_indices.len();
+    page.set_flags(PAGE_LEAF);
+    page.set_num_rows(0);
+    page.set_next_leaf(0);
+    page.set_prev_leaf(0);
+
+    page.data[PAGE_HEADER_SIZE..PAGE_SIZE - CHECKSUM_SIZE].fill(0);
+
+    let data_start = PAGE_HEADER_SIZE + total * 2;
+    let mut write_pos = data_start;
+    let mut dst_idx = 0usize;
+    let mut skip_ptr = 0usize;
+
+    for src_idx in 0..old_count {
+        if skip_ptr < skip_indices.len() && skip_indices[skip_ptr] == src_idx {
+            skip_ptr += 1;
+            continue;
+        }
+        let (s, e) = row_bounds_raw(snapshot, src_idx, old_count);
+        let len = e - s;
+        page.data[write_pos..write_pos + len].copy_from_slice(&snapshot[s..e]);
+        page.set_row_offset(dst_idx as u16, write_pos as u16);
+        write_pos += len;
+        dst_idx += 1;
     }
 
     page.set_num_rows(total as u16);
@@ -957,6 +1058,53 @@ mod tests {
         let reader = BTreeReader::new(&pf, root);
         let all = reader.scan_all().unwrap();
         assert_eq!(all.len(), 20);
+    }
+
+    #[test]
+    fn test_delete_matching() {
+        let tmp = NamedTempFile::new().unwrap();
+        let pf = PageFile::open(tmp.path()).unwrap();
+
+        let mut root;
+        {
+            let mut guard = pf.begin_write();
+            root = BTreeWriter::create(&mut guard).unwrap();
+
+            // Insert 100 rows with values 0-9 (cycling).
+            for i in 0..100u64 {
+                let val = (i % 10) as i64;
+                let row = row::encode_row(i, &[(0, &Value::Integer(val))]);
+                let mut tree = BTreeWriter::new(&mut guard, root);
+                root = tree.insert(i, &row).unwrap();
+            }
+            guard.commit(false).unwrap();
+        }
+
+        // Delete all rows with value == 5.
+        {
+            let mut guard = pf.begin_write();
+            let mut tree = BTreeWriter::new(&mut guard, root);
+            let deleted = tree.delete_matching(|data| {
+                if let Ok(Some(val)) = row::extract_column(data, 0) {
+                    val == Value::Integer(5)
+                } else {
+                    false
+                }
+            })
+            .unwrap();
+            assert_eq!(deleted.len(), 10);
+            root = tree.root_page();
+            guard.commit(false).unwrap();
+        }
+
+        // Verify 90 remain and none have value 5.
+        let reader = BTreeReader::new(&pf, root);
+        let all = reader.scan_all().unwrap();
+        assert_eq!(all.len(), 90);
+        for (_, bytes) in &all {
+            let val = row::extract_column(bytes, 0).unwrap().unwrap();
+            assert_ne!(val, Value::Integer(5));
+        }
     }
 
     #[test]
