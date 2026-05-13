@@ -117,10 +117,10 @@ Isolated insert and get operations at various table sizes. Each row has 3 column
 
 | Table Size | Insert (None) | Insert (Normal) | Get |
 |-----------|--------------|----------------|-----|
-| 100 rows | 439K/s (2.3 us) | 217K/s (4.6 us) | 5.3M/s (0.2 us) |
-| 1,000 rows | 449K/s (2.2 us) | 214K/s (4.7 us) | 5.2M/s (0.2 us) |
-| 5,000 rows | 444K/s (2.3 us) | 208K/s (4.8 us) | 4.5M/s (0.2 us) |
-| 10,000 rows | 441K/s (2.3 us) | 212K/s (4.7 us) | 4.0M/s (0.3 us) |
+| 100 rows | 428K/s (2.3 us) | 203K/s (4.9 us) | 5.2M/s (0.2 us) |
+| 1,000 rows | 440K/s (2.3 us) | 199K/s (5.0 us) | 5.2M/s (0.2 us) |
+| 5,000 rows | 441K/s (2.3 us) | 207K/s (4.8 us) | 4.8M/s (0.2 us) |
+| 10,000 rows | 433K/s (2.3 us) | 207K/s (4.8 us) | 3.8M/s (0.3 us) |
 
 Get performance is identical across durability modes (reads don't touch the WAL).
 
@@ -130,31 +130,31 @@ A realistic API workload: 30% inserts, 30% point reads, 25% filtered queries (eq
 
 **Without secondary index** (both engines do full table scans for filtered queries):
 
-| | boogy (None) | boogy (Normal) | SQLite | |
-|-|-------------|---------------|--------|-|
-| **Total ops/sec** | **20,397** | **20,856** | 11,716 | **1.78x** |
+| | boogy (None) | boogy (Normal) | SQLite | ratio (Normal vs SQLite) |
+|-|-------------|---------------|--------|---|
+| **Total ops/sec** | **21,118** | **21,112** | 11,798 | **1.79x** |
 | p50 latency | 2 us | 5 us | 8 us | |
-| p99 latency | 548 us | 524 us | 910 us | |
-| Insert | 6,076/s | 6,217/s | 3,526/s | |
-| Get | 6,135/s | 6,266/s | 3,500/s | |
-| Find (limit 20) | 5,086/s | 5,205/s | 2,917/s | |
-| Count | 3,101/s | 3,168/s | 1,773/s | |
+| p99 latency | 530 us | 521 us | 913 us | |
+| Insert | 6,292/s | 6,290/s | 3,551/s | |
+| Get | 6,346/s | 6,344/s | 3,527/s | |
+| Find (limit 20) | 5,270/s | 5,269/s | 2,936/s | |
+| Count | 3,210/s | 3,210/s | 1,784/s | |
 
-Without indexes, reads dominate the workload and WAL overhead is negligible. boogy-db is ~1.78x faster at both durability levels.
+Without indexes, reads dominate the workload and WAL overhead is negligible. boogy-db is ~1.79x faster at both durability levels.
 
 **With secondary index** on the filter column:
 
-| | boogy (None) | boogy (Normal) | SQLite | |
-|-|-------------|---------------|--------|-|
-| **Total ops/sec** | **92,723** | **82,952** | 39,570 | **2.10x** |
-| p50 latency | 6 us | 6 us | 10 us | |
-| p99 latency | 85 us | 75 us | 203 us | |
-| Insert | 27,665/s | 24,759/s | 11,772/s | |
-| Get | 27,913/s | 24,935/s | 11,877/s | |
-| Find (limit 20) | 23,132/s | 20,683/s | 9,897/s | |
-| Count | 14,012/s | 12,576/s | 6,023/s | |
+| | boogy (None) | boogy (Normal) | SQLite | ratio |
+|-|-------------|---------------|--------|---|
+| **Total ops/sec** | **90,640** | **82,228** | 39,359 | **2.09x** |
+| p50 latency | 6 us | 6 us | 11 us | |
+| p99 latency | 86 us | 81 us | 201 us | |
+| Insert | 27,049/s | 24,544/s | 11,712/s | |
+| Get | 27,291/s | 24,715/s | 11,815/s | |
+| Find (limit 20) | 22,604/s | 20,507/s | 9,841/s | |
+| Count | 13,696/s | 12,462/s | 5,991/s | |
 
-With indexes, Normal durability is 2.10x faster than SQLite. The redo-log WAL keeps the None-to-Normal gap small (~10%) by writing only to the WAL, never to the data file during commits.
+With indexes, Normal durability is 2.09x faster than SQLite. The redo-log WAL keeps the None-to-Normal gap small (~10%) by writing only to the WAL, never to the data file during commits.
 
 ### Mixed Workload (Concurrent)
 
@@ -162,21 +162,21 @@ Same workload distributed across multiple threads hitting the same table simulta
 
 **Without secondary index:**
 
-| Threads | boogy (None) | boogy (Normal) | SQLite | |
-|---------|-------------|---------------|--------|-|
-| 1 | **20,956** | **20,903** | 11,460 | 1.82x |
-| 2 | **22,122** | **21,660** | 15,237 | 1.42x |
-| 4 | **23,570** | **23,654** | 19,285 | 1.23x |
-| 8 | **26,271** | **26,440** | 21,823 | 1.21x |
+| Threads | boogy (None) | boogy (Normal) | SQLite | ratio |
+|---------|-------------|---------------|--------|---|
+| 1 | **21,206** | **21,072** | 11,580 | 1.82x |
+| 2 | **22,029** | **21,855** | 15,301 | 1.43x |
+| 4 | **23,630** | **23,749** | 19,198 | 1.24x |
+| 8 | **26,152** | **25,918** | 21,217 | 1.22x |
 
 **With secondary index:**
 
-| Threads | boogy (None) | boogy (Normal) | SQLite | |
-|---------|-------------|---------------|--------|-|
-| 1 | **95,450** | **85,054** | 39,296 | 2.16x |
-| 2 | **96,317** | **85,686** | 42,101 | 2.04x |
-| 4 | **103,643** | **89,533** | 46,007 | 1.95x |
-| 8 | **109,451** | **90,447** | 48,006 | 1.88x |
+| Threads | boogy (None) | boogy (Normal) | SQLite | ratio |
+|---------|-------------|---------------|--------|---|
+| 1 | **93,815** | **85,013** | 39,157 | 2.17x |
+| 2 | **94,612** | **84,870** | 42,288 | 2.01x |
+| 4 | **101,765** | **88,480** | 46,639 | 1.90x |
+| 8 | **109,207** | **89,601** | 51,073 | 1.75x |
 
 Readers operate on a shared page cache without blocking each other or writers. The ratio column compares Normal (the production-realistic mode) against SQLite.
 
@@ -186,15 +186,15 @@ Simulates a social media app fetching a user profile and their latest 5 posts. T
 
 boogy-db performs this as two separate calls (`get` for the user + `find` with filter/sort/limit for the posts). SQLite performs it as a single `JOIN` query with `ORDER BY`. Both engines have an index on the posts' author column where noted.
 
-| Configuration | boogy (None) | boogy (Normal) | SQLite | |
+| Configuration | boogy (None) | boogy (Normal) | SQLite | ratio |
 |---|---|---|---|---|
-| No index, 1 thread | **2,384 q/s** | **2,389 q/s** | 715 q/s | 3.34x |
-| With index, 1 thread | **65,671 q/s** | **65,543 q/s** | 43,444 q/s | 1.51x |
-| With index, no sort | **456,755 q/s** | **460,988 q/s** | 155,505 q/s | 2.96x |
-| With index, 4 threads | **157,930 q/s** | **161,514 q/s** | 123,131 q/s | 1.31x |
-| With index, 8 threads | **262,223 q/s** | **184,386 q/s** | 124,978 q/s | 1.47x |
+| No index, 1 thread | **2,419 q/s** | **2,397 q/s** | 743 q/s | 3.23x |
+| With index, 1 thread | **66,317 q/s** | **66,682 q/s** | 44,619 q/s | 1.49x |
+| With index, no sort | **467,255 q/s** | **462,829 q/s** | 161,346 q/s | 2.87x |
+| With index, 4 threads | **175,424 q/s** | **160,466 q/s** | 120,091 q/s | 1.34x |
+| With index, 8 threads | **210,254 q/s** | **185,018 q/s** | 120,673 q/s | 1.53x |
 
-The "no sort" row shows performance when fetching any 5 posts without ordering, isolating the cost of application-side sorting. The sorted rows are the realistic case — boogy-db is 1.51x faster despite doing two separate queries and application-side sorting while SQLite uses its native query planner with a single JOIN.
+The "no sort" row shows performance when fetching any 5 posts without ordering, isolating the cost of application-side sorting. The sorted rows are the realistic case — boogy-db is 1.49x faster despite doing two separate queries and application-side sorting while SQLite uses its native query planner with a single JOIN.
 
 ### Bulk Operations
 
@@ -202,38 +202,38 @@ Batch insert, update, and delete operations. Bulk insert uses `insert_many` (boo
 
 **Bulk Insert** (single batch):
 
-| Batch Size | boogy (None) | boogy (Normal) | SQLite | |
-|-----------|-------------|---------------|--------|-|
-| 100 | **820K r/s** | **907K r/s** | 526K r/s | 1.72x |
-| 1,000 | **673K r/s** | **676K r/s** | 557K r/s | 1.21x |
-| 10,000 | **657K r/s** | **650K r/s** | 569K r/s | 1.14x |
-| 50,000 | 547K r/s | 546K r/s | **579K r/s** | 0.94x |
+| Batch Size | boogy (None) | boogy (Normal) | SQLite | ratio |
+|-----------|-------------|---------------|--------|---|
+| 100 | **848K r/s** | **888K r/s** | 493K r/s | 1.80x |
+| 1,000 | **859K r/s** | **839K r/s** | 544K r/s | 1.54x |
+| 10,000 | **781K r/s** | **809K r/s** | 569K r/s | 1.42x |
+| 50,000 | **729K r/s** | **753K r/s** | 547K r/s | 1.38x |
 
 **Bulk Insert with Index** on one column:
 
-| Batch Size | boogy (None) | boogy (Normal) | SQLite | |
-|-----------|-------------|---------------|--------|-|
-| 100 | 434K r/s | **465K r/s** | 443K r/s | 1.05x |
-| 1,000 | 324K r/s | 320K r/s | **437K r/s** | 0.73x |
-| 10,000 | 269K r/s | 262K r/s | **406K r/s** | 0.65x |
-| 50,000 | 208K r/s | 202K r/s | **391K r/s** | 0.52x |
+| Batch Size | boogy (None) | boogy (Normal) | SQLite | ratio |
+|-----------|-------------|---------------|--------|---|
+| 100 | **485K r/s** | **485K r/s** | 444K r/s | 1.09x |
+| 1,000 | 386K r/s | 354K r/s | **435K r/s** | 0.81x |
+| 10,000 | 319K r/s | 309K r/s | **404K r/s** | 0.77x |
+| 50,000 | 260K r/s | 261K r/s | **388K r/s** | 0.67x |
 
 **Bulk Update** (`update_where` vs `UPDATE ... WHERE`, 10K-row table):
 
-| Rows Affected | boogy (None) | boogy (Normal) | SQLite | |
+| Rows Affected | boogy (None) | boogy (Normal) | SQLite | ratio |
 |---|---|---|---|---|
-| ~1,000 | **1.1M r/s** | 705K r/s | **1.03M r/s** | 0.68x |
-| ~2,000 | **1.1M r/s** | 679K r/s | **1.00M r/s** | 0.68x |
+| ~1,000 | **1.02M r/s** | 654K r/s | **1.02M r/s** | 0.64x |
+| ~2,000 | **1.12M r/s** | 620K r/s | **836K r/s** | 0.74x |
 
 **Bulk Delete** (`delete_where` vs `DELETE ... WHERE`, 10K-row table):
 
-| Rows Deleted | boogy (None) | boogy (Normal) | SQLite | |
+| Rows Deleted | boogy (None) | boogy (Normal) | SQLite | ratio |
 |---|---|---|---|---|
-| ~1,000 | **3.4M r/s** | **2.9M r/s** | 2.2M r/s | 1.34x |
-| ~5,000 | **7.4M r/s** | **5.5M r/s** | 5.9M r/s | 0.93x |
-| ~9,000 | **9.0M r/s** | **6.2M r/s** | 7.4M r/s | 0.84x |
+| ~1,000 | **2.9M r/s** | **2.7M r/s** | 2.2M r/s | 1.22x |
+| ~5,000 | **7.1M r/s** | 5.3M r/s | **6.1M r/s** | 0.87x |
+| ~9,000 | **7.9M r/s** | 5.7M r/s | **7.7M r/s** | 0.75x |
 
-boogy-db wins on bulk inserts up to ~50K rows and on small-batch bulk deletes. Bulk update with Normal durability trails SQLite at ~0.68x — the per-page WAL write overhead compounds across the ~25 leaf pages touched. With None durability, bulk update beats SQLite (1.1M vs 1.03M). Indexed bulk inserts favor SQLite at scale due to tighter C-level index maintenance.
+boogy-db now beats SQLite on bulk inserts at ALL batch sizes (without index). Bulk delete wins at small batches. Bulk update and indexed bulk insert remain areas where SQLite leads.
 
 ## Architecture
 
