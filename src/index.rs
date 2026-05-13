@@ -321,14 +321,30 @@ impl<'a, 'b> IndexTreeWriter<'a, 'b> {
     // --- Internal methods ---
 
     fn insert_recursive(&mut self, page_no: u32, key: &[u8]) -> Result<InsertResult> {
-        let page = (*self.guard.read_page(page_no)?).clone();
+        // Check dirty overlay first (zero-copy), then cache (Arc deref without clone).
+        // Only clone at the leaf where we need page data for rebuild.
+        let (is_leaf, child_idx, child_page_no) = if let Some(p) = self.guard.peek_dirty(page_no) {
+            if p.is_leaf() {
+                (true, 0, 0)
+            } else {
+                let (ci, cp) = find_idx_child(p, key);
+                (false, ci, cp)
+            }
+        } else {
+            let arc = self.guard.page_file().read_page(page_no)?;
+            if arc.is_leaf() {
+                (true, 0, 0)
+            } else {
+                let (ci, cp) = find_idx_child(&arc, key);
+                (false, ci, cp)
+            }
+        };
 
-        if page.is_leaf() {
+        if is_leaf {
+            let page = self.guard.read_page_cloned(page_no)?;
             self.insert_into_leaf(page_no, &page, key)
         } else {
-            let (child_idx, child_page_no) = find_idx_child(&page, key);
             let result = self.insert_recursive(child_page_no, key)?;
-
             match result {
                 InsertResult::Fit => Ok(InsertResult::Fit),
                 InsertResult::Split {
@@ -431,7 +447,7 @@ impl<'a, 'b> IndexTreeWriter<'a, 'b> {
         separator: &[u8],
         new_child: u32,
     ) -> Result<InsertResult> {
-        let page = (*self.guard.read_page(page_no)?).clone();
+        let page = self.guard.read_page_cloned(page_no)?;
         let num_keys = page.num_rows() as usize;
 
         let max_keys =
@@ -476,48 +492,65 @@ impl<'a, 'b> IndexTreeWriter<'a, 'b> {
     }
 
     fn delete_recursive(&mut self, page_no: u32, key: &[u8]) -> Result<bool> {
-        let page = (*self.guard.read_page(page_no)?).clone();
-
-        if page.is_leaf() {
-            let num_entries = page.num_rows() as usize;
-            if num_entries == 0 {
-                return Ok(false);
+        // Branch navigation without clone
+        let (is_leaf, child_page_no) = if let Some(p) = self.guard.peek_dirty(page_no) {
+            if p.is_leaf() {
+                (true, 0)
+            } else {
+                let (_, cp) = find_idx_child(p, key);
+                (false, cp)
             }
+        } else {
+            let arc = self.guard.page_file().read_page(page_no)?;
+            if arc.is_leaf() {
+                (true, 0)
+            } else {
+                let (_, cp) = find_idx_child(&arc, key);
+                (false, cp)
+            }
+        };
 
-            // Linear scan for exact key match.
-            let mut found_pos = None;
-            for i in 0..num_entries {
-                if let Some(k) = decode_leaf_entry(&page, i, num_entries) {
-                    if k == key {
-                        found_pos = Some(i);
-                        break;
-                    }
-                    if k > key {
-                        break; // past where it would be
-                    }
+        if !is_leaf {
+            return self.delete_recursive(child_page_no, key);
+        }
+
+        // Leaf — clone for rebuild
+        let page = self.guard.read_page_cloned(page_no)?;
+        let num_entries = page.num_rows() as usize;
+        if num_entries == 0 {
+            return Ok(false);
+        }
+
+        // Linear scan for exact key match.
+        let mut found_pos = None;
+        for i in 0..num_entries {
+            if let Some(k) = decode_leaf_entry(&page, i, num_entries) {
+                if k == key {
+                    found_pos = Some(i);
+                    break;
+                }
+                if k > key {
+                    break; // past where it would be
                 }
             }
-
-            let pos = match found_pos {
-                Some(p) => p,
-                None => return Ok(false),
-            };
-
-            // Rebuild page without the deleted entry.
-            let snapshot = page.data;
-            let next_leaf = page.next_leaf();
-            let prev_leaf = page.prev_leaf();
-
-            let page = self.guard.write_page(page_no)?;
-            write_idx_leaf_without(page, &snapshot, num_entries, pos);
-            page.set_next_leaf(next_leaf);
-            page.set_prev_leaf(prev_leaf);
-            page.update_checksum();
-            Ok(true)
-        } else {
-            let (_, child_page_no) = find_idx_child(&page, key);
-            self.delete_recursive(child_page_no, key)
         }
+
+        let pos = match found_pos {
+            Some(p) => p,
+            None => return Ok(false),
+        };
+
+        // Rebuild page without the deleted entry.
+        let snapshot = page.data;
+        let next_leaf = page.next_leaf();
+        let prev_leaf = page.prev_leaf();
+
+        let page = self.guard.write_page(page_no)?;
+        write_idx_leaf_without(page, &snapshot, num_entries, pos);
+        page.set_next_leaf(next_leaf);
+        page.set_prev_leaf(prev_leaf);
+        page.update_checksum();
+        Ok(true)
     }
 }
 

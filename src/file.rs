@@ -261,6 +261,25 @@ impl<'a> WriteGuard<'a> {
         self.state.new_page_count = 0;
     }
 
+    /// Access the underlying PageFile for read-path fallthrough.
+    pub fn page_file(&self) -> &PageFile {
+        self.file
+    }
+
+    /// Peek at a dirty page by reference (zero-copy). Returns None if not dirty.
+    pub fn peek_dirty(&self, page_no: u32) -> Option<&Page> {
+        self.state.dirty.get(&page_no).map(|p| &**p)
+    }
+
+    /// Read a page as an owned clone without Arc wrapper.
+    /// More efficient than read_page() because it avoids Arc allocation for dirty pages.
+    pub fn read_page_cloned(&self, page_no: u32) -> Result<Page> {
+        if let Some(page) = self.state.dirty.get(&page_no) {
+            return Ok((**page).clone());
+        }
+        Ok((*self.file.read_page(page_no)?).clone())
+    }
+
     // -- private helpers --
 
     /// Read a page (without going through the public API that returns Arc).
