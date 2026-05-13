@@ -31,8 +31,7 @@ fn test_create_table_and_insert() {
 
     let row = db.get("users", id).unwrap().unwrap();
     assert_eq!(row.id, id);
-    let name = row.columns.iter().find(|(n, _)| n == "name").unwrap();
-    assert_eq!(name.1, Value::Text("alice".into()));
+    assert_eq!(row.get("name").unwrap(), Value::Text("alice".into()));
 }
 
 #[test]
@@ -69,8 +68,7 @@ fn test_update() {
         .unwrap();
 
     let row = db.get("users", id).unwrap().unwrap();
-    let age = row.columns.iter().find(|(n, _)| n == "age").unwrap();
-    assert_eq!(age.1, Value::Integer(31));
+    assert_eq!(row.get("age").unwrap(), Value::Integer(31));
 }
 
 #[test]
@@ -157,10 +155,7 @@ fn test_find_with_sort_and_pagination() {
     let values: Vec<i64> = result.rows
         .iter()
         .filter_map(|r| {
-            r.columns
-                .iter()
-                .find(|(n, _)| n == "value")
-                .map(|(_, v)| if let Value::Integer(i) = v { *i } else { -1 })
+            r.get("value").map(|v| if let Value::Integer(i) = v { i } else { -1 })
         })
         .collect();
     assert_eq!(values, vec![7, 6, 5]);
@@ -224,8 +219,7 @@ fn test_many_inserts() {
     // Spot check
     for (i, &id) in ids.iter().enumerate().step_by(50) {
         let row = db.get("data", id).unwrap().unwrap();
-        let val = row.columns.iter().find(|(n, _)| n == "value").unwrap();
-        assert_eq!(val.1, Value::Integer(i as i64));
+        assert_eq!(row.get("value").unwrap(), Value::Integer(i as i64));
     }
 }
 
