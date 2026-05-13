@@ -44,7 +44,7 @@ pub struct BoogyDb {
     wal: Mutex<Wal>,
     tables: RwLock<HashMap<String, Arc<RwLock<TableState>>>>,
     next_table_id: Mutex<u32>,
-    durability: Mutex<Durability>,
+    durability: std::sync::atomic::AtomicU8,
     #[allow(dead_code)]
     path: PathBuf,
 }
@@ -364,19 +364,23 @@ impl BoogyDb {
             wal: Mutex::new(wal),
             tables: RwLock::new(tables),
             next_table_id: Mutex::new(next_table_id),
-            durability: Mutex::new(Durability::Normal),
+            durability: std::sync::atomic::AtomicU8::new(Durability::Normal as u8),
             path,
         })
     }
 
     /// Set the durability level for writes.
     pub fn set_durability(&self, d: Durability) {
-        *self.durability.lock().unwrap() = d;
+        self.durability.store(d as u8, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Get current durability level.
     pub fn durability(&self) -> Durability {
-        *self.durability.lock().unwrap()
+        match self.durability.load(std::sync::atomic::Ordering::Relaxed) {
+            0 => Durability::Immediate,
+            1 => Durability::Normal,
+            _ => Durability::None,
+        }
     }
 
     /// Write before-images from the PageFile to the WAL, then flush.
@@ -649,7 +653,7 @@ impl BoogyDb {
         let (root, table_id) = {
             let mut file = self.file.lock().unwrap();
             let mut wal = self.wal.lock().unwrap();
-            let durability = *self.durability.lock().unwrap();
+            let durability = self.durability();
 
             // Ensure system page exists before any table pages.
             if file.page_count() == 0 {
@@ -684,7 +688,7 @@ impl BoogyDb {
         // Persist registry to system page.
         // Snapshot metadata first (no file lock held), then write.
         let (metas, next_id) = self.snapshot_table_metas();
-        let durability = *self.durability.lock().unwrap();
+        let durability = self.durability();
         {
             let mut file = self.file.lock().unwrap();
             let mut wal = self.wal.lock().unwrap();
@@ -705,7 +709,7 @@ impl BoogyDb {
 
         // Persist updated registry.
         let (metas, next_id) = self.snapshot_table_metas();
-        let durability = *self.durability.lock().unwrap();
+        let durability = self.durability();
         {
             let mut file = self.file.lock().unwrap();
             let mut wal = self.wal.lock().unwrap();
@@ -737,11 +741,10 @@ impl BoogyDb {
             .collect();
         let row_bytes = row::encode_row(&id, &col_values);
 
-        // 4. Brief file lock + WAL lock for B-tree insert + index maintenance.
+        // 4. Brief file lock for B-tree insert + index maintenance.
+        let durability = self.durability();
         let new_root = {
             let mut file = self.file.lock().unwrap();
-            let mut wal = self.wal.lock().unwrap();
-            let durability = *self.durability.lock().unwrap();
             let mut tree = BTree::new(&mut file, state.meta.root_page);
             let new_root = tree.insert(&id, &row_bytes)?;
 
@@ -758,7 +761,12 @@ impl BoogyDb {
                     Self::index_add(&mut file, root, &col_val, &id)?;
             }
 
-            Self::commit_with_wal(&mut file, &mut wal, durability, state.meta.table_id)?;
+            if matches!(durability, Durability::None) {
+                file.take_before_images();
+            } else {
+                let mut wal = self.wal.lock().unwrap();
+                Self::commit_with_wal(&mut file, &mut wal, durability, state.meta.table_id)?;
+            }
             new_root
         };
 
@@ -820,7 +828,7 @@ impl BoogyDb {
         let new_root = {
             let mut file = self.file.lock().unwrap();
             let mut wal = self.wal.lock().unwrap();
-            let durability = *self.durability.lock().unwrap();
+            let durability = self.durability();
             let mut tree = BTree::new(&mut file, state.meta.root_page);
 
             let existing_bytes = match tree.search(id)? {
@@ -894,7 +902,7 @@ impl BoogyDb {
         let deleted = {
             let mut file = self.file.lock().unwrap();
             let mut wal = self.wal.lock().unwrap();
-            let durability = *self.durability.lock().unwrap();
+            let durability = self.durability();
 
             // Read the row first (for index maintenance)
             let row_bytes = if !state.meta.indexes.is_empty() {
@@ -1140,7 +1148,7 @@ impl BoogyDb {
         let idx_root = {
             let mut file = self.file.lock().unwrap();
             let mut wal = self.wal.lock().unwrap();
-            let durability = *self.durability.lock().unwrap();
+            let durability = self.durability();
 
             let idx_root = BTree::create(&mut file)?;
 
@@ -1173,7 +1181,7 @@ impl BoogyDb {
         // 5. Persist registry.
         drop(state);
         let (metas, next_id) = self.snapshot_table_metas();
-        let durability = *self.durability.lock().unwrap();
+        let durability = self.durability();
         {
             let mut file = self.file.lock().unwrap();
             let mut wal = self.wal.lock().unwrap();
@@ -1209,7 +1217,7 @@ impl BoogyDb {
         // 3. Persist registry.
         drop(state);
         let (metas, next_id) = self.snapshot_table_metas();
-        let durability = *self.durability.lock().unwrap();
+        let durability = self.durability();
         {
             let mut file = self.file.lock().unwrap();
             let mut wal = self.wal.lock().unwrap();
@@ -1242,7 +1250,7 @@ impl BoogyDb {
         let updated = {
             let mut file = self.file.lock().unwrap();
             let mut wal = self.wal.lock().unwrap();
-            let durability = *self.durability.lock().unwrap();
+            let durability = self.durability();
 
             // Determine candidates
             let index_candidate = filters.iter().find(|f| {
@@ -1360,7 +1368,7 @@ impl BoogyDb {
         let deleted = {
             let mut file = self.file.lock().unwrap();
             let mut wal = self.wal.lock().unwrap();
-            let durability = *self.durability.lock().unwrap();
+            let durability = self.durability();
 
             // Determine candidates
             let index_candidate = filters.iter().find(|f| {
@@ -1458,7 +1466,7 @@ impl BoogyDb {
         let ids = {
             let mut file = self.file.lock().unwrap();
             let mut wal = self.wal.lock().unwrap();
-            let durability = *self.durability.lock().unwrap();
+            let durability = self.durability();
             let mut ids = Vec::with_capacity(rows.len());
 
             for row_data in rows {
@@ -1507,7 +1515,7 @@ impl BoogyDb {
         // Flush all changes (individual operations already committed via WAL).
         let mut file = self.file.lock().unwrap();
         let mut wal = self.wal.lock().unwrap();
-        let durability = *self.durability.lock().unwrap();
+        let durability = self.durability();
         Self::commit_with_wal(&mut file, &mut wal, durability, 0)?;
         Ok(result)
     }
