@@ -700,16 +700,6 @@ impl BoogyDb {
         }
         state.meta.row_count += 1;
 
-        // 6. Persist registry (root_page / row_count may have changed).
-        drop(state);
-        let (metas, next_id) = self.snapshot_table_metas();
-        let durability = *self.durability.lock().unwrap();
-        {
-            let mut file = self.file.lock().unwrap();
-            let mut wal = self.wal.lock().unwrap();
-            Self::persist_registry_with(&mut file, &mut wal, &metas, next_id, durability)?;
-        }
-
         Ok(id)
     }
 
@@ -815,16 +805,6 @@ impl BoogyDb {
             state.meta.root_page = new_root;
         }
 
-        // 5. Persist registry if root changed.
-        drop(state);
-        let (metas, next_id) = self.snapshot_table_metas();
-        let durability = *self.durability.lock().unwrap();
-        {
-            let mut file = self.file.lock().unwrap();
-            let mut wal = self.wal.lock().unwrap();
-            Self::persist_registry_with(&mut file, &mut wal, &metas, next_id, durability)?;
-        }
-
         Ok(true)
     }
 
@@ -882,17 +862,9 @@ impl BoogyDb {
             deleted
         };
 
-        // 4. Update row count + persist.
+        // 4. Update row count.
         if deleted {
             state.meta.row_count -= 1;
-            drop(state);
-            let (metas, next_id) = self.snapshot_table_metas();
-            let durability = *self.durability.lock().unwrap();
-            {
-                let mut file = self.file.lock().unwrap();
-                let mut wal = self.wal.lock().unwrap();
-                Self::persist_registry_with(&mut file, &mut wal, &metas, next_id, durability)?;
-            }
         }
         Ok(deleted)
     }
@@ -1299,16 +1271,6 @@ impl BoogyDb {
             count
         };
 
-        // 4. Persist registry.
-        drop(state);
-        let (metas, next_id) = self.snapshot_table_metas();
-        let durability = *self.durability.lock().unwrap();
-        {
-            let mut file = self.file.lock().unwrap();
-            let mut wal = self.wal.lock().unwrap();
-            Self::persist_registry_with(&mut file, &mut wal, &metas, next_id, durability)?;
-        }
-
         Ok(updated)
     }
 
@@ -1407,16 +1369,6 @@ impl BoogyDb {
             count
         };
 
-        // 4. Persist registry.
-        drop(state);
-        let (metas, next_id) = self.snapshot_table_metas();
-        let durability = *self.durability.lock().unwrap();
-        {
-            let mut file = self.file.lock().unwrap();
-            let mut wal = self.wal.lock().unwrap();
-            Self::persist_registry_with(&mut file, &mut wal, &metas, next_id, durability)?;
-        }
-
         Ok(deleted)
     }
 
@@ -1474,16 +1426,6 @@ impl BoogyDb {
             ids
         };
 
-        // 4. Persist registry.
-        drop(state);
-        let (metas, next_id) = self.snapshot_table_metas();
-        let durability = *self.durability.lock().unwrap();
-        {
-            let mut file = self.file.lock().unwrap();
-            let mut wal = self.wal.lock().unwrap();
-            Self::persist_registry_with(&mut file, &mut wal, &metas, next_id, durability)?;
-        }
-
         Ok(ids)
     }
 
@@ -1500,6 +1442,17 @@ impl BoogyDb {
         let durability = *self.durability.lock().unwrap();
         Self::commit_with_wal(&mut file, &mut wal, durability, 0)?;
         Ok(result)
+    }
+}
+
+impl Drop for BoogyDb {
+    fn drop(&mut self) {
+        // Persist registry on clean shutdown
+        let (metas, next_id) = self.snapshot_table_metas();
+        let durability = *self.durability.lock().unwrap();
+        if let (Ok(mut file), Ok(mut wal)) = (self.file.lock(), self.wal.lock()) {
+            let _ = Self::persist_registry_with(&mut file, &mut wal, &metas, next_id, durability);
+        }
     }
 }
 
