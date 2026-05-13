@@ -70,6 +70,52 @@ pub fn eval_filter_op(actual: &Value, op: &FilterOp, expected: &Value) -> bool {
     }
 }
 
+/// Evaluate a filter against raw column bytes (type_tag + value_bytes).
+/// Avoids decoding/allocating a Value on the hot path.
+/// Returns None if comparison can't be done in raw mode (falls back to decode).
+pub fn eval_filter_raw(raw: &[u8], op: &FilterOp, expected: &Value) -> Option<bool> {
+    if raw.is_empty() {
+        return None;
+    }
+    let tag = raw[0];
+    match (tag, expected, op) {
+        // Text Eq: compare raw UTF-8 bytes directly — no String allocation
+        (1, Value::Text(s), FilterOp::Eq) => {
+            if raw.len() < 5 { return None; }
+            let len = u32::from_le_bytes(raw[1..5].try_into().unwrap()) as usize;
+            let expected_bytes = s.as_bytes();
+            if len != expected_bytes.len() {
+                Some(false)
+            } else if raw.len() < 5 + len {
+                None
+            } else {
+                Some(&raw[5..5 + len] == expected_bytes)
+            }
+        }
+        // Integer Eq: compare i64 directly — no allocation
+        (2, Value::Integer(expected_i), FilterOp::Eq) => {
+            if raw.len() < 9 { return None; }
+            let actual_i = i64::from_le_bytes(raw[1..9].try_into().unwrap());
+            Some(actual_i == *expected_i)
+        }
+        // Integer comparisons
+        (2, Value::Integer(expected_i), _) => {
+            if raw.len() < 9 { return None; }
+            let actual_i = i64::from_le_bytes(raw[1..9].try_into().unwrap());
+            let ord = actual_i.cmp(expected_i);
+            Some(match op {
+                FilterOp::Eq => ord == std::cmp::Ordering::Equal,
+                FilterOp::Ne => ord != std::cmp::Ordering::Equal,
+                FilterOp::Lt => ord == std::cmp::Ordering::Less,
+                FilterOp::Le => ord != std::cmp::Ordering::Greater,
+                FilterOp::Gt => ord == std::cmp::Ordering::Greater,
+                FilterOp::Ge => ord != std::cmp::Ordering::Less,
+            })
+        }
+        _ => None, // fall back to decode path
+    }
+}
+
 // Convenience Into<Value> impls
 impl From<&str> for Value {
     fn from(s: &str) -> Self { Value::Text(s.to_string()) }

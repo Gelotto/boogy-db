@@ -119,11 +119,22 @@ impl<'a> BTree<'a> {
                 }
                 let data = &page_data[start..end];
 
-                // Extract just the filter column — no full decode
-                let col_val = row::extract_column(data, filter_col_id)?;
-                let actual = col_val.as_ref().unwrap_or(&crate::value::Value::Null);
+                // Try zero-alloc raw comparison first, fall back to decode
+                let matches = if let Ok(Some(raw)) = row::extract_column_raw(data, filter_col_id) {
+                    if let Some(result) = crate::filter::eval_filter_raw(raw, &filter_op, filter_val) {
+                        result
+                    } else {
+                        let col_val = row::extract_column(data, filter_col_id)?;
+                        let actual = col_val.as_ref().unwrap_or(&crate::value::Value::Null);
+                        crate::filter::eval_filter_op(actual, &filter_op, filter_val)
+                    }
+                } else {
+                    let col_val = row::extract_column(data, filter_col_id)?;
+                    let actual = col_val.as_ref().unwrap_or(&crate::value::Value::Null);
+                    crate::filter::eval_filter_op(actual, &filter_op, filter_val)
+                };
 
-                if crate::filter::eval_filter_op(actual, &filter_op, filter_val) {
+                if matches {
                     total += 1;
                     if total > skip && (total - skip) <= take {
                         if let Ok(id) = row::extract_id(data) {
@@ -167,10 +178,21 @@ impl<'a> BTree<'a> {
                     continue;
                 }
                 let data = &page_data[start..end];
-                let col_val = row::extract_column(data, filter_col_id)?;
-                let actual = col_val.as_ref().unwrap_or(&crate::value::Value::Null);
+                let matches = if let Ok(Some(raw)) = row::extract_column_raw(data, filter_col_id) {
+                    if let Some(result) = crate::filter::eval_filter_raw(raw, &filter_op, filter_val) {
+                        result
+                    } else {
+                        let col_val = row::extract_column(data, filter_col_id)?;
+                        let actual = col_val.as_ref().unwrap_or(&crate::value::Value::Null);
+                        crate::filter::eval_filter_op(actual, &filter_op, filter_val)
+                    }
+                } else {
+                    let col_val = row::extract_column(data, filter_col_id)?;
+                    let actual = col_val.as_ref().unwrap_or(&crate::value::Value::Null);
+                    crate::filter::eval_filter_op(actual, &filter_op, filter_val)
+                };
 
-                if crate::filter::eval_filter_op(actual, &filter_op, filter_val) {
+                if matches {
                     count += 1;
                 }
             }
