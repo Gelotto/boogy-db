@@ -21,8 +21,12 @@ pub struct TableMeta {
     pub columns: Vec<ColumnDef>,
     /// Column name -> column ID mapping.
     pub col_name_to_id: HashMap<String, u16>,
-    /// B+ tree root page number.
+    /// B+ tree root page number (string-keyed, UUID -> row data).
     pub root_page: u32,
+    /// Integer B+ tree root page number (u64 rowid -> row data).
+    pub rowid_root_page: u32,
+    /// Next monotonic rowid to assign.
+    pub next_rowid: u64,
     /// Number of rows (maintained by insert/delete).
     pub row_count: u64,
     /// Secondary indexes on this table.
@@ -30,7 +34,7 @@ pub struct TableMeta {
 }
 
 impl TableMeta {
-    pub fn new(name: String, table_id: u32, columns: Vec<ColumnDef>, root_page: u32) -> Self {
+    pub fn new(name: String, table_id: u32, columns: Vec<ColumnDef>, root_page: u32, rowid_root_page: u32) -> Self {
         let col_name_to_id: HashMap<String, u16> = columns
             .iter()
             .enumerate()
@@ -42,6 +46,8 @@ impl TableMeta {
             columns,
             col_name_to_id,
             root_page,
+            rowid_root_page,
+            next_rowid: 0,
             row_count: 0,
             indexes: Vec::new(),
         }
@@ -81,10 +87,11 @@ impl TableRegistry {
         name: String,
         columns: Vec<ColumnDef>,
         root_page: u32,
+        rowid_root_page: u32,
     ) -> &TableMeta {
         let id = self.next_table_id;
         self.next_table_id += 1;
-        let meta = TableMeta::new(name.clone(), id, columns, root_page);
+        let meta = TableMeta::new(name.clone(), id, columns, root_page, rowid_root_page);
         self.tables.insert(name.clone(), meta);
         self.tables.get(&name).unwrap()
     }
