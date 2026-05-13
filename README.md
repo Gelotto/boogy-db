@@ -14,6 +14,7 @@ A fast embedded storage engine for Rust, purpose-built for concurrent API worklo
   - [Mixed Workload (Concurrent)](#mixed-workload-concurrent)
   - [Join Simulation (User + Posts)](#join-simulation-user--posts)
   - [Bulk Operations](#bulk-operations)
+  - [ACID Transactions](#acid-transaction-benchmarks)
 - [Encryption](#encryption)
 - [Async API](#async-api)
 - [ACID Transactions](#acid-transactions)
@@ -251,6 +252,42 @@ Batch insert, update, and delete operations. Bulk insert uses `insert_many` (boo
 
 boogy-db now beats SQLite on bulk inserts at ALL batch sizes (without index). Bulk delete wins at small batches. Bulk update and indexed bulk insert remain areas where SQLite leads.
 
+### ACID Transaction Benchmarks
+
+Compares boogy-db's ACID transactions (`set_acid(true)`) against SQLite's `BEGIN`/`COMMIT`. boogy-db uses `Durability::None`; SQLite uses WAL + `synchronous=NORMAL`. "fast" column shows boogy-db with ACID off (current non-atomic `begin()`/`commit()`).
+
+**Transaction Insert** (N rows per transaction, 10K total rows):
+
+| Rows/Tx | boogy (ACID) | boogy (fast) | SQLite | ratio |
+|---------|-------------|-------------|--------|-------|
+| 1 | **384K r/s** | 434K r/s | 130K r/s | 2.95x |
+| 10 | **616K r/s** | 442K r/s | 436K r/s | 1.41x |
+| 50 | **651K r/s** | 447K r/s | 609K r/s | 1.07x |
+| 100 | **649K r/s** | 441K r/s | 635K r/s | 1.02x |
+| 500 | 565K r/s | 448K r/s | **653K r/s** | 0.86x |
+
+ACID transactions amortize commit overhead across rows. At 10+ rows/tx, boogy-db ACID is faster than the non-ACID fast path because dirty pages accumulate and are published in one batch.
+
+**Mixed Transaction** (1 insert + 2 gets + 1 update per tx, 1K-row table):
+
+| boogy (ACID) | boogy (fast) | SQLite | ratio |
+|-------------|-------------|--------|-------|
+| **110K tx/s** | 166K tx/s | 59K tx/s | **1.87x** |
+
+**Single-Insert Transaction Throughput:**
+
+| boogy (ACID) | boogy (fast) | SQLite | ratio |
+|-------------|-------------|--------|-------|
+| **391K tx/s** | 411K tx/s | 143K tx/s | **2.73x** |
+
+**Rollback Cost** (begin + 10 inserts + drop, no commit):
+
+| boogy (ACID) | boogy (fast) |
+|-------------|-------------|
+| 110K rb/s | 42K rb/s |
+
+ACID rollback is faster than the fast path's "rollback" because ACID discards the private page buffer (cheap), while the fast path's individual commits can't be undone.
+
 ## Encryption
 
 boogy-db supports opt-in AES-256-GCM encryption at the table level. Encrypted tables store ciphertext on disk and in the WAL, while the in-memory page cache always holds plaintext. Unencrypted tables have zero encryption overhead.
@@ -338,22 +375,32 @@ async fn main() -> boogy_db::Result<()> {
 
 ## ACID Transactions
 
-Enable ACID mode for true multi-operation atomicity with rollback:
+boogy-db supports opt-in ACID-compliant transactions. When enabled, multi-operation transactions are truly atomic (all-or-nothing) with full rollback on failure or drop. When disabled (the default), operations commit individually for maximum throughput.
+
+### Enabling ACID Mode
 
 ```rust
+let db = BoogyDb::open("my.boogy")?;
 db.set_acid(true);
+db.set_durability(Durability::Immediate); // fsync for full durability
+```
 
+For full ACID compliance, combine `set_acid(true)` (atomicity + consistency) with `Durability::Immediate` (durability). `Durability::Normal` provides durability against process crashes but not power loss.
+
+### Transactions
+
+```rust
 // Multi-operation transaction — all-or-nothing
 let mut tx = db.begin()?;
 tx.insert("users", &[("name", Value::Text("Alice".into()))])?;
 tx.insert("posts", &[("title", Value::Text("Hello".into()))])?;
-tx.commit()?;  // atomic publish
+tx.commit()?;  // atomic publish — both rows visible at once
 
 // Drop without commit = full rollback
 {
     let mut tx = db.begin()?;
     tx.insert("users", &[("name", Value::Text("Bob".into()))])?;
-    // dropped here — nothing is written
+    // dropped here — nothing is written, database unchanged
 }
 
 // Reads within a transaction see uncommitted writes
@@ -363,9 +410,11 @@ let row = tx.get("users", id)?.unwrap(); // sees Carol
 tx.commit()?;
 ```
 
-When ACID mode is enabled, standalone operations outside `begin()` are automatically wrapped in mini-transactions. When disabled (the default), operations commit individually with zero overhead — one `AtomicBool` check per operation.
+When ACID mode is on, standalone operations outside `begin()` are automatically wrapped in mini-transactions. When off, operations commit individually with zero overhead — one `AtomicBool` check per operation.
 
-ACID transactions hold a private dirty page buffer. The global write lock is acquired briefly per operation (microseconds), not for the transaction duration. Tables not touched by a transaction are completely unblocked.
+### How It Works
+
+ACID transactions hold a private dirty page buffer. Each operation briefly acquires the global write lock (microseconds), does the B+ tree mutation in the private buffer, and releases. Tables not touched by the transaction are completely unblocked. `commit()` publishes all pages atomically in one batch. Drop without commit discards the buffer — a zero-cost rollback.
 
 ## Architecture
 

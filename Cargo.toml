@@ -41,3 +41,6 @@ harness = false
 [[bench]]
 name = "bulk_ops"
 harness = false
+[[bench]]
+name = "acid_ops"
+harness = false
