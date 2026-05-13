@@ -355,14 +355,14 @@ impl BoogyDb {
         validate_path(&path)?;
         let wal_path = path.with_extension("wal");
 
-        // Step 1: Crash recovery -- replay WAL if it has entries.
+        // Step 1: Crash recovery -- replay WAL forward (redo).
         {
             let mut wal = Wal::open(&wal_path)?;
             if wal.entry_count() > 0 {
                 let file = PageFile::open(&path)?;
                 let entries = wal.read_entries()?;
-                // Undo: restore original pages (reverse order for correctness).
-                for entry in entries.iter().rev() {
+                // Redo: apply after-images in forward order.
+                for entry in &entries {
                     let page = Page::from_bytes_unchecked(entry.page_data);
                     file.put_page_direct(entry.page_no, page);
                 }
@@ -405,7 +405,6 @@ impl BoogyDb {
     /// Set the durability level for writes.
     pub fn set_durability(&self, d: Durability) {
         self.durability.store(d as u8, std::sync::atomic::Ordering::Relaxed);
-        self.file.set_capture_before_images(!matches!(d, Durability::None));
     }
 
     /// Get current durability level.
@@ -426,25 +425,24 @@ impl BoogyDb {
         durability: Durability,
         table_id: u32,
     ) -> Result<()> {
+        let after_images = guard.commit()?;
         match durability {
             Durability::Immediate => {
-                let before_images = guard.commit(true)?;
                 let mut wal = wal.lock().unwrap();
-                for (page_no, data) in &before_images {
+                for (page_no, data) in &after_images {
                     wal.append_before_image(table_id, *page_no, data)?;
                 }
                 wal.sync()?;
-                wal.truncate()?;
+                // Do NOT truncate here -- WAL accumulates until checkpoint
             }
             Durability::Normal => {
-                let before_images = guard.commit(true)?;
                 let mut wal = wal.lock().unwrap();
-                for (page_no, data) in &before_images {
+                for (page_no, data) in &after_images {
                     wal.append_before_image(table_id, *page_no, data)?;
                 }
             }
             Durability::None => {
-                guard.commit(false)?; // publish to cache only, no disk flush
+                // No WAL write
             }
         }
         Ok(())
@@ -1556,7 +1554,7 @@ impl Drop for BoogyDb {
             }
             let page = serialize_system_page(&metas, next_id);
             guard.put_page(0, page);
-            let _ = guard.commit(true);
+            let _ = guard.commit();
         }
         let _ = self.file.sync_all();
         if let Ok(mut wal) = self.wal.lock() {
