@@ -119,7 +119,7 @@ async fn test_async_begin_commit() {
         .await
         .unwrap();
 
-    let tx = db.begin().await.unwrap();
+    let mut tx = db.begin().await.unwrap();
     tx.insert("a", &[("v", Value::Integer(1))]).await.unwrap();
     tx.commit().await.unwrap();
 

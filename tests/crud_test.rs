@@ -1441,7 +1441,7 @@ fn test_begin_commit_transaction() {
     db.create_table("a", &[ColumnDef::new("v", Type::Integer)]).unwrap();
     db.create_table("b", &[ColumnDef::new("v", Type::Integer)]).unwrap();
 
-    let tx = db.begin().unwrap();
+    let mut tx = db.begin().unwrap();
     tx.insert("a", &[("v", Value::Integer(1))]).unwrap();
     tx.insert("b", &[("v", Value::Integer(2))]).unwrap();
     tx.commit().unwrap();
@@ -1456,7 +1456,7 @@ fn test_begin_drop_without_commit() {
     db.create_table("t", &[ColumnDef::new("v", Type::Integer)]).unwrap();
 
     {
-        let tx = db.begin().unwrap();
+        let mut tx = db.begin().unwrap();
         tx.insert("t", &[("v", Value::Integer(1))]).unwrap();
         // Drop without commit — operations already applied (lazy locking)
     }
@@ -1470,7 +1470,7 @@ fn test_begin_read_within_transaction() {
     let (db, _dir) = create_db();
     db.create_table("t", &[ColumnDef::new("v", Type::Integer)]).unwrap();
 
-    let tx = db.begin().unwrap();
+    let mut tx = db.begin().unwrap();
     let id = tx.insert("t", &[("v", Value::Integer(42))]).unwrap();
     let row = tx.get("t", id).unwrap().unwrap();
     assert_eq!(row.get("v").unwrap(), Value::Integer(42));
