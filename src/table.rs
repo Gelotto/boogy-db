@@ -2,6 +2,17 @@ use std::collections::HashMap;
 
 use crate::value::ColumnDef;
 
+/// Metadata for a secondary index.
+#[derive(Debug, Clone)]
+pub struct IndexMeta {
+    /// Name of this index (e.g. "idx_author").
+    pub name: String,
+    /// Column name this index covers.
+    pub column: String,
+    /// B+ tree root page number for the index tree.
+    pub root_page: u32,
+}
+
 /// Metadata for a registered table.
 #[derive(Debug, Clone)]
 pub struct TableMeta {
@@ -14,6 +25,8 @@ pub struct TableMeta {
     pub root_page: u32,
     /// Number of rows (maintained by insert/delete).
     pub row_count: u64,
+    /// Secondary indexes on this table.
+    pub indexes: Vec<IndexMeta>,
 }
 
 impl TableMeta {
@@ -30,11 +43,22 @@ impl TableMeta {
             col_name_to_id,
             root_page,
             row_count: 0,
+            indexes: Vec::new(),
         }
     }
 
     pub fn col_id(&self, name: &str) -> Option<u16> {
         self.col_name_to_id.get(name).copied()
+    }
+
+    /// Find index metadata by index name.
+    pub fn find_index(&self, name: &str) -> Option<&IndexMeta> {
+        self.indexes.iter().find(|idx| idx.name == name)
+    }
+
+    /// Find an index on a given column.
+    pub fn find_index_for_column(&self, column: &str) -> Option<&IndexMeta> {
+        self.indexes.iter().find(|idx| idx.column == column)
     }
 }
 

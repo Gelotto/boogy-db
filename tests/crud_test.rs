@@ -301,3 +301,276 @@ fn test_concurrent_different_tables() {
     assert_eq!(db.count("a", &[]).unwrap(), 200);
     assert_eq!(db.count("b", &[]).unwrap(), 200);
 }
+
+// --- Secondary index tests ---
+
+#[test]
+fn test_index_speeds_up_find() {
+    let (db, _dir) = create_db();
+    db.create_table(
+        "posts",
+        &[
+            ColumnDef::new("author", Type::Text),
+            ColumnDef::new("title", Type::Text),
+        ],
+    )
+    .unwrap();
+
+    for i in 0..1000 {
+        db.insert(
+            "posts",
+            &[
+                ("author", Value::Text(format!("user_{}", i % 10))),
+                ("title", Value::Text(format!("post_{i}"))),
+            ],
+        )
+        .unwrap();
+    }
+
+    db.create_index("posts", "idx_author", "author").unwrap();
+
+    let (rows, total) = db
+        .find(
+            "posts",
+            FindOptions {
+                filters: vec![Filter::eq("author", "user_5")],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+    assert_eq!(total, 100);
+    assert_eq!(rows.len(), 100);
+}
+
+#[test]
+fn test_index_maintained_on_insert() {
+    let (db, _dir) = create_db();
+    db.create_table(
+        "t",
+        &[ColumnDef::new("v", Type::Text)],
+    )
+    .unwrap();
+
+    db.create_index("t", "idx_v", "v").unwrap();
+
+    for i in 0..50 {
+        db.insert("t", &[("v", Value::Text(format!("val_{}", i % 5)))]).unwrap();
+    }
+
+    let (rows, total) = db
+        .find(
+            "t",
+            FindOptions {
+                filters: vec![Filter::eq("v", "val_0")],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+    assert_eq!(total, 10);
+    assert_eq!(rows.len(), 10);
+}
+
+#[test]
+fn test_index_maintained_on_update() {
+    let (db, _dir) = create_db();
+    db.create_table(
+        "t",
+        &[ColumnDef::new("v", Type::Text)],
+    )
+    .unwrap();
+
+    let id = db.insert("t", &[("v", Value::Text("old".into()))]).unwrap();
+    db.create_index("t", "idx_v", "v").unwrap();
+
+    db.update("t", &id, &[("v", Value::Text("new".into()))]).unwrap();
+
+    let count_old = db.count("t", &[Filter::eq("v", "old")]).unwrap();
+    let count_new = db.count("t", &[Filter::eq("v", "new")]).unwrap();
+    assert_eq!(count_old, 0);
+    assert_eq!(count_new, 1);
+}
+
+#[test]
+fn test_index_maintained_on_delete() {
+    let (db, _dir) = create_db();
+    db.create_table(
+        "t",
+        &[ColumnDef::new("v", Type::Text)],
+    )
+    .unwrap();
+
+    let id = db.insert("t", &[("v", Value::Text("hello".into()))]).unwrap();
+    db.create_index("t", "idx_v", "v").unwrap();
+
+    let count = db.count("t", &[Filter::eq("v", "hello")]).unwrap();
+    assert_eq!(count, 1);
+
+    db.delete("t", &id).unwrap();
+
+    let count = db.count("t", &[Filter::eq("v", "hello")]).unwrap();
+    assert_eq!(count, 0);
+}
+
+#[test]
+fn test_drop_index() {
+    let (db, _dir) = create_db();
+    db.create_table(
+        "t",
+        &[ColumnDef::new("v", Type::Text)],
+    )
+    .unwrap();
+
+    db.create_index("t", "idx_v", "v").unwrap();
+    db.drop_index("t", "idx_v").unwrap();
+    assert!(db.drop_index("t", "idx_v").is_err());
+}
+
+#[test]
+fn test_index_persists_across_reopen() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("test.boogy");
+    {
+        let db = BoogyDb::open(&path).unwrap();
+        db.create_table(
+            "t",
+            &[ColumnDef::new("v", Type::Text)],
+        )
+        .unwrap();
+        for i in 0..100 {
+            db.insert("t", &[("v", Value::Text(format!("val_{}", i % 5)))]).unwrap();
+        }
+        db.create_index("t", "idx_v", "v").unwrap();
+    }
+    {
+        let db = BoogyDb::open(&path).unwrap();
+        let count = db.count("t", &[Filter::eq("v", "val_2")]).unwrap();
+        assert_eq!(count, 20);
+    }
+}
+
+#[test]
+fn test_duplicate_index_rejected() {
+    let (db, _dir) = create_db();
+    db.create_table("t", &[ColumnDef::new("v", Type::Text)]).unwrap();
+    db.create_index("t", "idx_v", "v").unwrap();
+    assert!(db.create_index("t", "idx_v", "v").is_err());
+}
+
+// --- Path traversal prevention tests ---
+
+#[test]
+fn test_path_traversal_rejected() {
+    assert!(BoogyDb::open("../etc/passwd.boogy").is_err());
+    assert!(BoogyDb::open("/tmp/safe/../../etc/passwd").is_err());
+}
+
+#[test]
+fn test_valid_path_accepted() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("test.boogy");
+    assert!(BoogyDb::open(&path).is_ok());
+}
+
+// --- Bulk operation tests ---
+
+#[test]
+fn test_delete_where() {
+    let (db, _dir) = create_db();
+    db.create_table("t", &[ColumnDef::new("v", Type::Integer)])
+        .unwrap();
+    for i in 0..20 {
+        db.insert("t", &[("v", Value::Integer(i))]).unwrap();
+    }
+    let deleted = db
+        .delete_where("t", &[Filter::lt("v", 10i64)])
+        .unwrap();
+    assert_eq!(deleted, 10);
+    assert_eq!(db.count("t", &[]).unwrap(), 10);
+}
+
+#[test]
+fn test_insert_many() {
+    let (db, _dir) = create_db();
+    db.create_table("t", &[ColumnDef::new("v", Type::Integer)])
+        .unwrap();
+    let rows: Vec<Vec<(&str, Value)>> = (0..100)
+        .map(|i| vec![("v", Value::Integer(i))])
+        .collect();
+    let ids = db.insert_many("t", &rows).unwrap();
+    assert_eq!(ids.len(), 100);
+    assert_eq!(db.count("t", &[]).unwrap(), 100);
+}
+
+#[test]
+fn test_update_where() {
+    let (db, _dir) = create_db();
+    db.create_table(
+        "t",
+        &[
+            ColumnDef::new("category", Type::Text),
+            ColumnDef::new("status", Type::Text),
+        ],
+    )
+    .unwrap();
+    for i in 0..30 {
+        let cat = if i % 3 == 0 { "a" } else { "b" };
+        db.insert(
+            "t",
+            &[
+                ("category", Value::Text(cat.into())),
+                ("status", Value::Text("active".into())),
+            ],
+        )
+        .unwrap();
+    }
+
+    let updated = db
+        .update_where(
+            "t",
+            &[Filter::eq("category", "a")],
+            &[("status", Value::Text("archived".into()))],
+        )
+        .unwrap();
+
+    assert_eq!(updated, 10);
+    let count = db.count("t", &[Filter::eq("status", "archived")]).unwrap();
+    assert_eq!(count, 10);
+}
+
+#[test]
+fn test_insert_many_with_index() {
+    let (db, _dir) = create_db();
+    db.create_table("t", &[ColumnDef::new("v", Type::Text)])
+        .unwrap();
+    db.create_index("t", "idx_v", "v").unwrap();
+
+    let rows: Vec<Vec<(&str, Value)>> = (0..100)
+        .map(|i| vec![("v", Value::Text(format!("val_{}", i % 5)))])
+        .collect();
+    let ids = db.insert_many("t", &rows).unwrap();
+    assert_eq!(ids.len(), 100);
+
+    let count = db.count("t", &[Filter::eq("v", "val_3")]).unwrap();
+    assert_eq!(count, 20);
+}
+
+#[test]
+fn test_delete_where_with_index() {
+    let (db, _dir) = create_db();
+    db.create_table("t", &[ColumnDef::new("v", Type::Text)])
+        .unwrap();
+    db.create_index("t", "idx_v", "v").unwrap();
+
+    for i in 0..50 {
+        db.insert("t", &[("v", Value::Text(format!("val_{}", i % 5)))]).unwrap();
+    }
+
+    let deleted = db
+        .delete_where("t", &[Filter::eq("v", "val_2")])
+        .unwrap();
+    assert_eq!(deleted, 10);
+    assert_eq!(db.count("t", &[]).unwrap(), 40);
+    assert_eq!(db.count("t", &[Filter::eq("v", "val_2")]).unwrap(), 0);
+}

@@ -87,6 +87,70 @@ impl<'a> BTree<'a> {
         Ok(results)
     }
 
+    /// Scan all keys that start with the given prefix.
+    /// Returns (id, row_bytes) pairs for matching entries.
+    pub fn scan_prefix(&mut self, prefix: &str) -> Result<Vec<(String, Vec<u8>)>> {
+        // Find the leaf where the prefix would be inserted.
+        let (leaf_page, start_idx) = self.find_leaf_for_prefix(self.root, prefix)?;
+        let mut results = Vec::new();
+        let mut current = leaf_page;
+        let mut skip = start_idx;
+        loop {
+            let page = self.file.read_page(current)?.clone();
+            let num_rows = page.num_rows() as usize;
+            for i in skip..num_rows {
+                let (start, end) = row_bounds(&page, i, num_rows);
+                if start < end && end <= PAGE_SIZE {
+                    let data = &page.data[start..end];
+                    if let Ok(id) = row::extract_id(data) {
+                        if id.starts_with(prefix) {
+                            results.push((id.to_string(), data.to_vec()));
+                        } else {
+                            // Past the prefix range, done.
+                            return Ok(results);
+                        }
+                    }
+                }
+            }
+            skip = 0;
+            let next = page.next_leaf();
+            if next == 0 {
+                break;
+            }
+            current = next;
+        }
+        Ok(results)
+    }
+
+    /// Find the leaf page and row index where keys >= prefix begin.
+    fn find_leaf_for_prefix(
+        &mut self,
+        page_no: u32,
+        prefix: &str,
+    ) -> Result<(u32, usize)> {
+        let page = self.file.read_page(page_no)?.clone();
+        if page.is_leaf() {
+            let num_rows = page.num_rows() as usize;
+            // Binary search for the first key >= prefix
+            let mut lo = 0usize;
+            let mut hi = num_rows;
+            while lo < hi {
+                let mid = lo + (hi - lo) / 2;
+                let (start, end) = row_bounds(&page, mid, num_rows);
+                let mid_id = row::extract_id(&page.data[start..end])?;
+                if mid_id < prefix {
+                    lo = mid + 1;
+                } else {
+                    hi = mid;
+                }
+            }
+            Ok((page_no, lo))
+        } else {
+            let (_, child_page_no) = find_child(&page, prefix);
+            self.find_leaf_for_prefix(child_page_no, prefix)
+        }
+    }
+
     // --- Internal methods ---
 
     fn find_leftmost_leaf(&mut self, page_no: u32) -> Result<u32> {
@@ -400,12 +464,17 @@ fn write_leaf_with_insert(
     new_row: &[u8],
 ) {
     let total = old_count + 1;
+
+    // Preserve leaf chain pointers from the snapshot before clearing.
+    let saved_next = u32::from_le_bytes(snapshot[8..12].try_into().unwrap());
+    let saved_prev = u32::from_le_bytes(snapshot[12..16].try_into().unwrap());
+
     page.set_flags(PAGE_LEAF);
     page.set_num_rows(0);
-    page.set_next_leaf(0);
-    page.set_prev_leaf(0);
+    page.set_next_leaf(saved_next);
+    page.set_prev_leaf(saved_prev);
 
-    // Clear data area.
+    // Clear data area (after header).
     page.data[PAGE_HEADER_SIZE..PAGE_SIZE - CHECKSUM_SIZE].fill(0);
 
     let data_start = PAGE_HEADER_SIZE + total * 2;

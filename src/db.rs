@@ -5,10 +5,10 @@ use std::sync::{Arc, Mutex, RwLock};
 use crate::btree::BTree;
 use crate::error::{BoogyError, Result};
 use crate::file::PageFile;
-use crate::filter::{FindOptions, SortDir};
+use crate::filter::{Filter, FilterOp, FindOptions, SortDir};
 use crate::page::{Page, PAGE_SYSTEM};
 use crate::row;
-use crate::table::TableMeta;
+use crate::table::{IndexMeta, TableMeta};
 use crate::value::{ColumnDef, Type, Value};
 use crate::wal::Wal;
 
@@ -51,6 +51,7 @@ pub struct BoogyDb {
 
 // System page (page 0) format:
 // [magic: 4 bytes = 0xB00D_5150]
+// [next_table_id: u32]
 // [num_tables: u16]
 // for each table:
 //   [table_id: u32][root_page: u32][row_count: u64]
@@ -58,6 +59,11 @@ pub struct BoogyDb {
 //   [num_columns: u16]
 //   for each column:
 //     [col_name_len: u16][col_name_bytes][type_tag: u8][nullable: u8][unique: u8]
+//   [num_indexes: u16]
+//   for each index:
+//     [idx_name_len: u16][idx_name_bytes]
+//     [idx_col_len: u16][idx_col_bytes]
+//     [idx_root_page: u32]
 
 const SYSTEM_PAGE_MAGIC: u32 = 0xB00D_5150;
 
@@ -143,6 +149,28 @@ fn serialize_system_page(
             data[offset] = if col.unique { 1 } else { 0 };
             offset += 1;
         }
+
+        // Indexes
+        let num_indexes = meta.indexes.len() as u16;
+        data[offset..offset + 2].copy_from_slice(&num_indexes.to_le_bytes());
+        offset += 2;
+
+        for idx in &meta.indexes {
+            let idx_name = idx.name.as_bytes();
+            data[offset..offset + 2].copy_from_slice(&(idx_name.len() as u16).to_le_bytes());
+            offset += 2;
+            data[offset..offset + idx_name.len()].copy_from_slice(idx_name);
+            offset += idx_name.len();
+
+            let idx_col = idx.column.as_bytes();
+            data[offset..offset + 2].copy_from_slice(&(idx_col.len() as u16).to_le_bytes());
+            offset += 2;
+            data[offset..offset + idx_col.len()].copy_from_slice(idx_col);
+            offset += idx_col.len();
+
+            data[offset..offset + 4].copy_from_slice(&idx.root_page.to_le_bytes());
+            offset += 4;
+        }
     }
 
     page.update_checksum();
@@ -223,16 +251,75 @@ fn deserialize_system_page(
 
         let mut meta = TableMeta::new(name, table_id, columns, root_page);
         meta.row_count = row_count;
+
+        // Indexes
+        let num_indexes = u16::from_le_bytes(data[offset..offset + 2].try_into().unwrap()) as usize;
+        offset += 2;
+
+        for _ in 0..num_indexes {
+            let idx_name_len =
+                u16::from_le_bytes(data[offset..offset + 2].try_into().unwrap()) as usize;
+            offset += 2;
+            let idx_name = String::from_utf8(data[offset..offset + idx_name_len].to_vec())
+                .map_err(|_| BoogyError::Corruption("invalid utf8 in index name".into()))?;
+            offset += idx_name_len;
+
+            let idx_col_len =
+                u16::from_le_bytes(data[offset..offset + 2].try_into().unwrap()) as usize;
+            offset += 2;
+            let idx_col = String::from_utf8(data[offset..offset + idx_col_len].to_vec())
+                .map_err(|_| BoogyError::Corruption("invalid utf8 in index column".into()))?;
+            offset += idx_col_len;
+
+            let idx_root_page = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
+            offset += 4;
+
+            meta.indexes.push(IndexMeta {
+                name: idx_name,
+                column: idx_col,
+                root_page: idx_root_page,
+            });
+        }
+
         tables.push(meta);
     }
 
     Ok((tables, next_table_id))
 }
 
+/// Validate that a path does not contain traversal attacks or null bytes.
+fn validate_path(path: &Path) -> Result<()> {
+    let path_str = path.to_str().ok_or_else(|| {
+        BoogyError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "path contains invalid UTF-8",
+        ))
+    })?;
+
+    if path_str.contains('\0') {
+        return Err(BoogyError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "path contains null byte",
+        )));
+    }
+
+    for component in path.components() {
+        if let std::path::Component::ParentDir = component {
+            return Err(BoogyError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "path contains '..' component",
+            )));
+        }
+    }
+
+    Ok(())
+}
+
 impl BoogyDb {
     /// Open or create a database.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
+        validate_path(&path)?;
         let wal_path = path.with_extension("wal");
 
         // Step 1: Crash recovery -- replay WAL if it has entries.
@@ -370,6 +457,116 @@ impl BoogyDb {
         Ok(())
     }
 
+    // --- Index key helpers ---
+
+    /// Serialize a Value into index key bytes.
+    fn value_to_index_key(val: &Value) -> Vec<u8> {
+        let mut buf = Vec::new();
+        match val {
+            Value::Null => buf.push(0),
+            Value::Text(s) => {
+                buf.push(1);
+                buf.extend_from_slice(s.as_bytes());
+            }
+            Value::Integer(i) => {
+                buf.push(2);
+                buf.extend_from_slice(&i.to_le_bytes());
+            }
+            Value::Real(f) => {
+                buf.push(3);
+                buf.extend_from_slice(&f.to_le_bytes());
+            }
+            Value::Blob(b) => {
+                buf.push(4);
+                buf.extend_from_slice(b);
+            }
+            Value::Boolean(b) => {
+                buf.push(5);
+                buf.push(if *b { 1 } else { 0 });
+            }
+        }
+        buf
+    }
+
+    /// Build a composite index key: hash(value) + ":" + row_id.
+    /// The hash is 8 hex chars, separator is 1 char, and the row_id
+    /// (UUID) adds up to 36 chars.  Total: 8+1+36 = 45 chars.
+    /// The first 36 chars stored in branch entries are: 8 hash + ":" + 27 UUID prefix.
+    /// This is sufficient for correct B+ tree routing because the hash
+    /// groups entries by value, and the UUID portion disambiguates within a group.
+    fn index_composite_key(val_hash: &str, row_id: &str) -> String {
+        format!("{val_hash}:{row_id}")
+    }
+
+    /// Build a minimal row-format entry for the index B+ tree.
+    /// The B+ tree requires row::extract_id-compatible format.
+    fn encode_index_entry(composite_key: &str) -> Vec<u8> {
+        // Minimal row: just the _id with no columns.
+        row::encode_row(composite_key, &[])
+    }
+
+    /// Add a row_id to an index for a given column value.
+    fn index_add(
+        file: &mut PageFile,
+        idx_root: u32,
+        col_val: &Value,
+        row_id: &str,
+    ) -> Result<u32> {
+        let key = Self::value_to_index_key(col_val);
+        let val_hash = Self::index_value_hash(&key);
+        let composite = Self::index_composite_key(&val_hash, row_id);
+        let entry = Self::encode_index_entry(&composite);
+        let mut tree = BTree::new(file, idx_root);
+        let new_root = tree.insert(&composite, &entry)?;
+        Ok(new_root)
+    }
+
+    /// Remove a row_id from the index for a given column value.
+    fn index_remove(
+        file: &mut PageFile,
+        idx_root: u32,
+        col_val: &Value,
+        row_id: &str,
+    ) -> Result<u32> {
+        let key = Self::value_to_index_key(col_val);
+        let val_hash = Self::index_value_hash(&key);
+        let composite = Self::index_composite_key(&val_hash, row_id);
+        let mut tree = BTree::new(file, idx_root);
+        tree.delete(&composite)?;
+        Ok(tree.root_page())
+    }
+
+    /// Look up all row_ids for a given column value in the index.
+    /// Uses prefix scan on the hash, then extracts row_ids.
+    fn index_lookup(
+        file: &mut PageFile,
+        idx_root: u32,
+        col_val: &Value,
+    ) -> Result<Vec<String>> {
+        let key = Self::value_to_index_key(col_val);
+        let val_hash = Self::index_value_hash(&key);
+        let prefix = format!("{val_hash}:");
+        let mut tree = BTree::new(file, idx_root);
+        let entries = tree.scan_prefix(&prefix)?;
+
+        let mut ids = Vec::with_capacity(entries.len());
+        for (composite_key, _) in &entries {
+            // The row_id is everything after the prefix
+            if let Some(row_id) = composite_key.strip_prefix(&prefix) {
+                ids.push(row_id.to_string());
+            }
+        }
+        Ok(ids)
+    }
+
+    /// Hash a value's key bytes into a short, fixed-length hex prefix.
+    /// Uses CRC32 for a compact 8-char hex string that fits within
+    /// the 36-byte branch key limit alongside the row_id.
+    fn index_value_hash(key: &[u8]) -> String {
+        let hash = crc32fast::hash(key);
+        format!("{hash:08x}")
+    }
+
     /// Create a new table.
     pub fn create_table(&self, name: &str, columns: &[ColumnDef]) -> Result<()> {
         // Check existence under a read lock first for the common non-conflicting case.
@@ -472,13 +669,27 @@ impl BoogyDb {
             .collect();
         let row_bytes = row::encode_row(&id, &col_values);
 
-        // 4. Brief file lock + WAL lock for B-tree insert.
+        // 4. Brief file lock + WAL lock for B-tree insert + index maintenance.
         let new_root = {
             let mut file = self.file.lock().unwrap();
             let mut wal = self.wal.lock().unwrap();
             let durability = *self.durability.lock().unwrap();
             let mut tree = BTree::new(&mut file, state.meta.root_page);
             let new_root = tree.insert(&id, &row_bytes)?;
+
+            // Update indexes
+            for i in 0..state.meta.indexes.len() {
+                let col_name = state.meta.indexes[i].column.clone();
+                let col_val = data
+                    .iter()
+                    .find(|(name, _)| *name == col_name)
+                    .map(|(_, v)| v.clone())
+                    .unwrap_or(Value::Null);
+                let root = state.meta.indexes[i].root_page;
+                state.meta.indexes[i].root_page =
+                    Self::index_add(&mut file, root, &col_val, &id)?;
+            }
+
             Self::commit_with_wal(&mut file, &mut wal, durability, state.meta.table_id)?;
             new_root
         };
@@ -554,13 +765,17 @@ impl BoogyDb {
             let durability = *self.durability.lock().unwrap();
             let mut tree = BTree::new(&mut file, state.meta.root_page);
 
-            let existing = match tree.search(id)? {
-                Some(bytes) => row::decode_row(&bytes)?,
+            let existing_bytes = match tree.search(id)? {
+                Some(bytes) => bytes,
                 None => return Ok(false),
             };
+            let existing = row::decode_row(&existing_bytes)?;
+
+            // Build old column map for index maintenance
+            let old_col_map: HashMap<u16, Value> = existing.columns.into_iter().collect();
 
             // Merge updates.
-            let mut col_map: HashMap<u16, Value> = existing.columns.into_iter().collect();
+            let mut col_map = old_col_map.clone();
             for (name, val) in fields {
                 if let Some(col_id) = state.meta.col_id(name) {
                     col_map.insert(col_id, val.clone());
@@ -573,6 +788,24 @@ impl BoogyDb {
             // Delete + re-insert.
             tree.delete(id)?;
             let new_root = tree.insert(id, &new_row)?;
+
+            // Update indexes: if indexed column changed, remove old + add new
+            for i in 0..state.meta.indexes.len() {
+                let col_id = state.meta.col_name_to_id
+                    .get(&state.meta.indexes[i].column)
+                    .copied();
+                if let Some(col_id) = col_id {
+                    let old_val = old_col_map.get(&col_id).cloned().unwrap_or(Value::Null);
+                    let new_val = col_map.get(&col_id).cloned().unwrap_or(Value::Null);
+                    if old_val != new_val {
+                        let root = state.meta.indexes[i].root_page;
+                        let root = Self::index_remove(&mut file, root, &old_val, id)?;
+                        let root = Self::index_add(&mut file, root, &new_val, id)?;
+                        state.meta.indexes[i].root_page = root;
+                    }
+                }
+            }
+
             Self::commit_with_wal(&mut file, &mut wal, durability, state.meta.table_id)?;
             new_root
         };
@@ -614,8 +847,37 @@ impl BoogyDb {
             let mut file = self.file.lock().unwrap();
             let mut wal = self.wal.lock().unwrap();
             let durability = *self.durability.lock().unwrap();
+
+            // Read the row first (for index maintenance)
+            let row_bytes = if !state.meta.indexes.is_empty() {
+                let mut tree = BTree::new(&mut file, state.meta.root_page);
+                tree.search(id)?
+            } else {
+                None
+            };
+
             let mut tree = BTree::new(&mut file, state.meta.root_page);
             let deleted = tree.delete(id)?;
+
+            // Update indexes if we actually deleted and have row data
+            if deleted {
+                if let Some(bytes) = row_bytes {
+                    let decoded = row::decode_row(&bytes)?;
+                    let col_map: HashMap<u16, Value> = decoded.columns.into_iter().collect();
+                    for i in 0..state.meta.indexes.len() {
+                        let col_id = state.meta.col_name_to_id
+                            .get(&state.meta.indexes[i].column)
+                            .copied();
+                        if let Some(col_id) = col_id {
+                            let val = col_map.get(&col_id).cloned().unwrap_or(Value::Null);
+                            let root = state.meta.indexes[i].root_page;
+                            state.meta.indexes[i].root_page =
+                                Self::index_remove(&mut file, root, &val, id)?;
+                        }
+                    }
+                }
+            }
+
             Self::commit_with_wal(&mut file, &mut wal, durability, state.meta.table_id)?;
             deleted
         };
@@ -650,16 +912,36 @@ impl BoogyDb {
         // 2. Read-lock the specific table.
         let state = table_state.read().unwrap();
 
-        // 3. Brief file lock for scan.
-        let all = {
+        // 3. Check if any Eq filter can use an index.
+        let index_candidate = opts.filters.iter().find(|f| {
+            f.op == FilterOp::Eq
+                && state.meta.find_index_for_column(&f.column).is_some()
+        });
+
+        // 4. Get candidate rows -- either via index or full scan.
+        let candidates: Vec<(String, Vec<u8>)> = if let Some(idx_filter) = index_candidate {
+            let idx_meta = state.meta.find_index_for_column(&idx_filter.column).unwrap();
+            let mut file = self.file.lock().unwrap();
+            let matching_ids =
+                Self::index_lookup(&mut file, idx_meta.root_page, &idx_filter.value)?;
+
+            let mut rows = Vec::with_capacity(matching_ids.len());
+            for id in &matching_ids {
+                let mut tree = BTree::new(&mut file, state.meta.root_page);
+                if let Some(bytes) = tree.search(id)? {
+                    rows.push((id.clone(), bytes));
+                }
+            }
+            rows
+        } else {
             let mut file = self.file.lock().unwrap();
             let mut tree = BTree::new(&mut file, state.meta.root_page);
             tree.scan_all()?
         };
 
-        // 4. Decode and filter outside any file lock.
+        // 5. Decode and filter outside any file lock.
         let mut matching: Vec<Row> = Vec::new();
-        for (_, bytes) in &all {
+        for (_, bytes) in &candidates {
             let decoded = row::decode_row(bytes)?;
             let row = decoded_to_row(&decoded, &state.meta);
 
@@ -717,7 +999,7 @@ impl BoogyDb {
     }
 
     /// Count rows matching filters.
-    pub fn count(&self, table: &str, filters: &[crate::filter::Filter]) -> Result<u64> {
+    pub fn count(&self, table: &str, filters: &[Filter]) -> Result<u64> {
         // 1. Read-lock registry, clone Arc.
         let table_state = {
             let tables = self.tables.read().unwrap();
@@ -735,8 +1017,28 @@ impl BoogyDb {
             return Ok(state.meta.row_count);
         }
 
-        // 3. Brief file lock for scan.
-        let all = {
+        // Check if any Eq filter can use an index.
+        let index_candidate = filters.iter().find(|f| {
+            f.op == FilterOp::Eq
+                && state.meta.find_index_for_column(&f.column).is_some()
+        });
+
+        // 3. Get candidate rows -- either via index or full scan.
+        let candidates: Vec<(String, Vec<u8>)> = if let Some(idx_filter) = index_candidate {
+            let idx_meta = state.meta.find_index_for_column(&idx_filter.column).unwrap();
+            let mut file = self.file.lock().unwrap();
+            let matching_ids =
+                Self::index_lookup(&mut file, idx_meta.root_page, &idx_filter.value)?;
+
+            let mut rows = Vec::with_capacity(matching_ids.len());
+            for id in &matching_ids {
+                let mut tree = BTree::new(&mut file, state.meta.root_page);
+                if let Some(bytes) = tree.search(id)? {
+                    rows.push((id.clone(), bytes));
+                }
+            }
+            rows
+        } else {
             let mut file = self.file.lock().unwrap();
             let mut tree = BTree::new(&mut file, state.meta.root_page);
             tree.scan_all()?
@@ -744,7 +1046,7 @@ impl BoogyDb {
 
         // 4. Decode and count outside any file lock.
         let mut count = 0u64;
-        for (_, bytes) in &all {
+        for (_, bytes) in &candidates {
             let decoded = row::decode_row(bytes)?;
             let row = decoded_to_row(&decoded, &state.meta);
 
@@ -766,6 +1068,423 @@ impl BoogyDb {
         }
 
         Ok(count)
+    }
+
+    /// Create a secondary index on a table column.
+    pub fn create_index(&self, table: &str, index_name: &str, column: &str) -> Result<()> {
+        // 1. Read-lock registry, clone Arc.
+        let table_state = {
+            let tables = self.tables.read().unwrap();
+            tables
+                .get(table)
+                .ok_or_else(|| BoogyError::TableNotFound(table.to_string()))?
+                .clone()
+        };
+
+        // 2. Write-lock the specific table.
+        let mut state = table_state.write().unwrap();
+
+        // Check index doesn't already exist.
+        if state.meta.find_index(index_name).is_some() {
+            return Err(BoogyError::IndexExists(index_name.to_string()));
+        }
+
+        // Check column exists.
+        if state.meta.col_id(column).is_none() {
+            return Err(BoogyError::SchemaMismatch(format!(
+                "column '{column}' not found in table '{table}'"
+            )));
+        }
+
+        // 3. Create the index B+ tree and populate it from existing rows.
+        let idx_root = {
+            let mut file = self.file.lock().unwrap();
+            let mut wal = self.wal.lock().unwrap();
+            let durability = *self.durability.lock().unwrap();
+
+            let idx_root = BTree::create(&mut file)?;
+
+            // Scan all existing rows and populate the index.
+            let all = {
+                let mut tree = BTree::new(&mut file, state.meta.root_page);
+                tree.scan_all()?
+            };
+
+            let col_id = state.meta.col_id(column).unwrap();
+            let mut current_root = idx_root;
+            for (row_id, bytes) in &all {
+                let col_val = row::extract_column(bytes, col_id)?
+                    .unwrap_or(Value::Null);
+                current_root =
+                    Self::index_add(&mut file, current_root, &col_val, row_id)?;
+            }
+
+            Self::commit_with_wal(&mut file, &mut wal, durability, state.meta.table_id)?;
+            current_root
+        };
+
+        // 4. Register the index in table metadata.
+        state.meta.indexes.push(IndexMeta {
+            name: index_name.to_string(),
+            column: column.to_string(),
+            root_page: idx_root,
+        });
+
+        // 5. Persist registry.
+        drop(state);
+        let (metas, next_id) = self.snapshot_table_metas();
+        let durability = *self.durability.lock().unwrap();
+        {
+            let mut file = self.file.lock().unwrap();
+            let mut wal = self.wal.lock().unwrap();
+            Self::persist_registry_with(&mut file, &mut wal, &metas, next_id, durability)?;
+        }
+
+        Ok(())
+    }
+
+    /// Drop a secondary index.
+    pub fn drop_index(&self, table: &str, index_name: &str) -> Result<()> {
+        // 1. Read-lock registry, clone Arc.
+        let table_state = {
+            let tables = self.tables.read().unwrap();
+            tables
+                .get(table)
+                .ok_or_else(|| BoogyError::TableNotFound(table.to_string()))?
+                .clone()
+        };
+
+        // 2. Write-lock the specific table.
+        let mut state = table_state.write().unwrap();
+
+        // Find and remove the index.
+        let pos = state
+            .meta
+            .indexes
+            .iter()
+            .position(|idx| idx.name == index_name)
+            .ok_or_else(|| BoogyError::IndexNotFound(index_name.to_string()))?;
+        state.meta.indexes.remove(pos);
+
+        // 3. Persist registry.
+        drop(state);
+        let (metas, next_id) = self.snapshot_table_metas();
+        let durability = *self.durability.lock().unwrap();
+        {
+            let mut file = self.file.lock().unwrap();
+            let mut wal = self.wal.lock().unwrap();
+            Self::persist_registry_with(&mut file, &mut wal, &metas, next_id, durability)?;
+        }
+
+        Ok(())
+    }
+
+    /// Update all rows matching filters. Returns number of rows updated.
+    pub fn update_where(
+        &self,
+        table: &str,
+        filters: &[Filter],
+        fields: &[(&str, Value)],
+    ) -> Result<u64> {
+        // 1. Read-lock registry, clone Arc.
+        let table_state = {
+            let tables = self.tables.read().unwrap();
+            tables
+                .get(table)
+                .ok_or_else(|| BoogyError::TableNotFound(table.to_string()))?
+                .clone()
+        };
+
+        // 2. Write-lock the specific table.
+        let mut state = table_state.write().unwrap();
+
+        // 3. Scan/index-lookup to find matching IDs, then apply updates.
+        let updated = {
+            let mut file = self.file.lock().unwrap();
+            let mut wal = self.wal.lock().unwrap();
+            let durability = *self.durability.lock().unwrap();
+
+            // Determine candidates
+            let index_candidate = filters.iter().find(|f| {
+                f.op == FilterOp::Eq
+                    && state.meta.find_index_for_column(&f.column).is_some()
+            });
+
+            let candidates: Vec<(String, Vec<u8>)> = if let Some(idx_filter) = index_candidate {
+                let idx_meta =
+                    state.meta.find_index_for_column(&idx_filter.column).unwrap();
+                let matching_ids =
+                    Self::index_lookup(&mut file, idx_meta.root_page, &idx_filter.value)?;
+                let mut rows = Vec::with_capacity(matching_ids.len());
+                for id in &matching_ids {
+                    let mut tree = BTree::new(&mut file, state.meta.root_page);
+                    if let Some(bytes) = tree.search(id)? {
+                        rows.push((id.clone(), bytes));
+                    }
+                }
+                rows
+            } else {
+                let mut tree = BTree::new(&mut file, state.meta.root_page);
+                tree.scan_all()?
+            };
+
+            // Filter and collect matching row IDs + old data
+            let mut to_update: Vec<(String, HashMap<u16, Value>)> = Vec::new();
+            for (_, bytes) in &candidates {
+                let decoded = row::decode_row(bytes)?;
+                let row = decoded_to_row(&decoded, &state.meta);
+
+                let passes = filters.iter().all(|f| {
+                    let col_val = row
+                        .columns
+                        .iter()
+                        .find(|(name, _)| name == &f.column)
+                        .map(|(_, v)| v);
+                    match col_val {
+                        Some(v) => f.matches(v),
+                        None => f.matches(&Value::Null),
+                    }
+                });
+
+                if passes {
+                    let old_col_map: HashMap<u16, Value> = decoded.columns.into_iter().collect();
+                    to_update.push((decoded.id.clone(), old_col_map));
+                }
+            }
+
+            let count = to_update.len() as u64;
+
+            // Apply updates
+            for (id, old_col_map) in &to_update {
+                let mut col_map = old_col_map.clone();
+                for (name, val) in fields {
+                    if let Some(col_id) = state.meta.col_id(name) {
+                        col_map.insert(col_id, val.clone());
+                    }
+                }
+
+                let col_values: Vec<(u16, &Value)> =
+                    col_map.iter().map(|(k, v)| (*k, v)).collect();
+                let new_row = row::encode_row(id, &col_values);
+
+                let mut tree = BTree::new(&mut file, state.meta.root_page);
+                tree.delete(id)?;
+                let new_root = tree.insert(id, &new_row)?;
+                state.meta.root_page = new_root;
+
+                // Update indexes
+                for i in 0..state.meta.indexes.len() {
+                    let col_id = state.meta.col_name_to_id
+                        .get(&state.meta.indexes[i].column)
+                        .copied();
+                    if let Some(col_id) = col_id {
+                        let old_val =
+                            old_col_map.get(&col_id).cloned().unwrap_or(Value::Null);
+                        let new_val = col_map.get(&col_id).cloned().unwrap_or(Value::Null);
+                        if old_val != new_val {
+                            let root = state.meta.indexes[i].root_page;
+                            let root = Self::index_remove(
+                                &mut file, root, &old_val, id,
+                            )?;
+                            let root = Self::index_add(
+                                &mut file, root, &new_val, id,
+                            )?;
+                            state.meta.indexes[i].root_page = root;
+                        }
+                    }
+                }
+            }
+
+            Self::commit_with_wal(&mut file, &mut wal, durability, state.meta.table_id)?;
+            count
+        };
+
+        // 4. Persist registry.
+        drop(state);
+        let (metas, next_id) = self.snapshot_table_metas();
+        let durability = *self.durability.lock().unwrap();
+        {
+            let mut file = self.file.lock().unwrap();
+            let mut wal = self.wal.lock().unwrap();
+            Self::persist_registry_with(&mut file, &mut wal, &metas, next_id, durability)?;
+        }
+
+        Ok(updated)
+    }
+
+    /// Delete all rows matching filters. Returns number of rows deleted.
+    pub fn delete_where(&self, table: &str, filters: &[Filter]) -> Result<u64> {
+        // 1. Read-lock registry, clone Arc.
+        let table_state = {
+            let tables = self.tables.read().unwrap();
+            tables
+                .get(table)
+                .ok_or_else(|| BoogyError::TableNotFound(table.to_string()))?
+                .clone()
+        };
+
+        // 2. Write-lock the specific table.
+        let mut state = table_state.write().unwrap();
+
+        // 3. Scan/index-lookup to find matching IDs, then delete.
+        let deleted = {
+            let mut file = self.file.lock().unwrap();
+            let mut wal = self.wal.lock().unwrap();
+            let durability = *self.durability.lock().unwrap();
+
+            // Determine candidates
+            let index_candidate = filters.iter().find(|f| {
+                f.op == FilterOp::Eq
+                    && state.meta.find_index_for_column(&f.column).is_some()
+            });
+
+            let candidates: Vec<(String, Vec<u8>)> = if let Some(idx_filter) = index_candidate {
+                let idx_meta =
+                    state.meta.find_index_for_column(&idx_filter.column).unwrap();
+                let matching_ids =
+                    Self::index_lookup(&mut file, idx_meta.root_page, &idx_filter.value)?;
+                let mut rows = Vec::with_capacity(matching_ids.len());
+                for id in &matching_ids {
+                    let mut tree = BTree::new(&mut file, state.meta.root_page);
+                    if let Some(bytes) = tree.search(id)? {
+                        rows.push((id.clone(), bytes));
+                    }
+                }
+                rows
+            } else {
+                let mut tree = BTree::new(&mut file, state.meta.root_page);
+                tree.scan_all()?
+            };
+
+            // Filter and collect matching row IDs + column data for index removal
+            let mut to_delete: Vec<(String, HashMap<u16, Value>)> = Vec::new();
+            for (_, bytes) in &candidates {
+                let decoded = row::decode_row(bytes)?;
+                let row = decoded_to_row(&decoded, &state.meta);
+
+                let passes = filters.iter().all(|f| {
+                    let col_val = row
+                        .columns
+                        .iter()
+                        .find(|(name, _)| name == &f.column)
+                        .map(|(_, v)| v);
+                    match col_val {
+                        Some(v) => f.matches(v),
+                        None => f.matches(&Value::Null),
+                    }
+                });
+
+                if passes {
+                    let col_map: HashMap<u16, Value> = decoded.columns.into_iter().collect();
+                    to_delete.push((decoded.id.clone(), col_map));
+                }
+            }
+
+            let count = to_delete.len() as u64;
+
+            // Delete rows
+            for (id, col_map) in &to_delete {
+                let mut tree = BTree::new(&mut file, state.meta.root_page);
+                tree.delete(id)?;
+                state.meta.root_page = tree.root_page();
+
+                // Update indexes
+                for i in 0..state.meta.indexes.len() {
+                    let col_id = state.meta.col_name_to_id
+                        .get(&state.meta.indexes[i].column)
+                        .copied();
+                    if let Some(col_id) = col_id {
+                        let val = col_map.get(&col_id).cloned().unwrap_or(Value::Null);
+                        let root = state.meta.indexes[i].root_page;
+                        state.meta.indexes[i].root_page =
+                            Self::index_remove(&mut file, root, &val, id)?;
+                    }
+                }
+            }
+
+            state.meta.row_count -= count;
+            Self::commit_with_wal(&mut file, &mut wal, durability, state.meta.table_id)?;
+            count
+        };
+
+        // 4. Persist registry.
+        drop(state);
+        let (metas, next_id) = self.snapshot_table_metas();
+        let durability = *self.durability.lock().unwrap();
+        {
+            let mut file = self.file.lock().unwrap();
+            let mut wal = self.wal.lock().unwrap();
+            Self::persist_registry_with(&mut file, &mut wal, &metas, next_id, durability)?;
+        }
+
+        Ok(deleted)
+    }
+
+    /// Insert multiple rows in a single transaction. Returns list of _ids.
+    pub fn insert_many(&self, table: &str, rows: &[Vec<(&str, Value)>]) -> Result<Vec<String>> {
+        // 1. Read-lock registry, clone Arc.
+        let table_state = {
+            let tables = self.tables.read().unwrap();
+            tables
+                .get(table)
+                .ok_or_else(|| BoogyError::TableNotFound(table.to_string()))?
+                .clone()
+        };
+
+        // 2. Write-lock the specific table.
+        let mut state = table_state.write().unwrap();
+
+        // 3. Insert all rows under a single file lock session.
+        let ids = {
+            let mut file = self.file.lock().unwrap();
+            let mut wal = self.wal.lock().unwrap();
+            let durability = *self.durability.lock().unwrap();
+            let mut ids = Vec::with_capacity(rows.len());
+
+            for row_data in rows {
+                let id = uuid::Uuid::new_v4().to_string();
+                let col_values: Vec<(u16, &Value)> = row_data
+                    .iter()
+                    .filter_map(|(name, val)| state.meta.col_id(name).map(|cid| (cid, val)))
+                    .collect();
+                let row_bytes = row::encode_row(&id, &col_values);
+
+                let mut tree = BTree::new(&mut file, state.meta.root_page);
+                let new_root = tree.insert(&id, &row_bytes)?;
+                state.meta.root_page = new_root;
+
+                // Update indexes
+                for i in 0..state.meta.indexes.len() {
+                    let col_name = state.meta.indexes[i].column.clone();
+                    let col_val = row_data
+                        .iter()
+                        .find(|(name, _)| *name == col_name)
+                        .map(|(_, v)| v.clone())
+                        .unwrap_or(Value::Null);
+                    let root = state.meta.indexes[i].root_page;
+                    state.meta.indexes[i].root_page =
+                        Self::index_add(&mut file, root, &col_val, &id)?;
+                }
+
+                state.meta.row_count += 1;
+                ids.push(id);
+            }
+
+            Self::commit_with_wal(&mut file, &mut wal, durability, state.meta.table_id)?;
+            ids
+        };
+
+        // 4. Persist registry.
+        drop(state);
+        let (metas, next_id) = self.snapshot_table_metas();
+        let durability = *self.durability.lock().unwrap();
+        {
+            let mut file = self.file.lock().unwrap();
+            let mut wal = self.wal.lock().unwrap();
+            Self::persist_registry_with(&mut file, &mut wal, &metas, next_id, durability)?;
+        }
+
+        Ok(ids)
     }
 
     /// Run a multi-table transaction.
@@ -1144,5 +1863,50 @@ mod tests {
             let db = BoogyDb::open(&path).unwrap();
             assert_eq!(db.count("t", &[]).unwrap(), 10);
         }
+    }
+
+    #[test]
+    fn test_index_basic_roundtrip() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.boogy");
+        let db = BoogyDb::open(&path).unwrap();
+        db.create_table("t", &[ColumnDef::new("v", Type::Text)]).unwrap();
+        db.create_index("t", "idx_v", "v").unwrap();
+
+        let _id = db.insert("t", &[("v", Value::Text("hello".into()))]).unwrap();
+
+        // The index should be usable via find
+        let opts = crate::filter::FindOptions {
+            filters: vec![crate::filter::Filter::eq("v", "hello")],
+            ..Default::default()
+        };
+        let (rows, total) = db.find("t", opts).unwrap();
+        assert_eq!(total, 1);
+        assert_eq!(rows.len(), 1);
+
+        // Also via count
+        let count = db.count("t", &[crate::filter::Filter::eq("v", "hello")]).unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn test_scan_all_matches_count() {
+        use crate::btree::BTree;
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.boogy");
+        let db = BoogyDb::open(&path).unwrap();
+        db.create_table("t", &[ColumnDef::new("v", Type::Text)]).unwrap();
+
+        for i in 0..100 {
+            db.insert("t", &[("v", Value::Text(format!("val_{}", i % 10)))]).unwrap();
+        }
+
+        // Verify scan_all matches cached row_count
+        let tables = db.tables.read().unwrap();
+        let state = tables.get("t").unwrap().read().unwrap();
+        let mut file = db.file.lock().unwrap();
+        let mut tree = BTree::new(&mut file, state.meta.root_page);
+        let all = tree.scan_all().unwrap();
+        assert_eq!(all.len(), 100);
     }
 }

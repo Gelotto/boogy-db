@@ -10,6 +10,8 @@ pub enum BoogyError {
     RowNotFound(String),
     DuplicateKey(String),
     SchemaMismatch(String),
+    IndexNotFound(String),
+    IndexExists(String),
     PageFull,
     TransactionConflict,
 }
@@ -24,6 +26,8 @@ impl fmt::Display for BoogyError {
             BoogyError::RowNotFound(id) => write!(f, "row '{id}' not found"),
             BoogyError::DuplicateKey(id) => write!(f, "duplicate key '{id}'"),
             BoogyError::SchemaMismatch(msg) => write!(f, "schema mismatch: {msg}"),
+            BoogyError::IndexNotFound(idx) => write!(f, "index '{idx}' not found"),
+            BoogyError::IndexExists(idx) => write!(f, "index '{idx}' already exists"),
             BoogyError::PageFull => write!(f, "page full"),
             BoogyError::TransactionConflict => write!(f, "transaction conflict"),
         }
