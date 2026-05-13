@@ -13,6 +13,9 @@ pub enum BoogyError {
     TypeMismatch(String),
     IndexNotFound(String),
     IndexExists(String),
+    TableLocked(String),
+    DecryptionFailed(String),
+    InvalidKey(String),
     PageFull,
     TransactionConflict,
 }
@@ -30,6 +33,9 @@ impl fmt::Display for BoogyError {
             BoogyError::TypeMismatch(msg) => write!(f, "type mismatch: {msg}"),
             BoogyError::IndexNotFound(idx) => write!(f, "index '{idx}' not found"),
             BoogyError::IndexExists(idx) => write!(f, "index '{idx}' already exists"),
+            BoogyError::TableLocked(t) => write!(f, "table '{t}' is locked"),
+            BoogyError::DecryptionFailed(msg) => write!(f, "decryption failed: {msg}"),
+            BoogyError::InvalidKey(msg) => write!(f, "invalid key: {msg}"),
             BoogyError::PageFull => write!(f, "page full"),
             BoogyError::TransactionConflict => write!(f, "transaction conflict"),
         }
