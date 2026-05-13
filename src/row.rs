@@ -9,10 +9,10 @@ const TAG_REAL: u8 = 3;
 const TAG_BLOB: u8 = 4;
 const TAG_BOOLEAN: u8 = 5;
 
-/// Encode a row (_id + columns) into compact binary format with offset directory.
+/// Encode a row (rowid + columns) into compact binary format with offset directory.
 ///
 /// Layout:
-///   [id_len:2][id_bytes]
+///   [rowid:8]
 ///   [num_cols:2]
 ///   [offset_directory: num_cols × 4 bytes]
 ///     for each column (sorted by col_id): [col_id:2][data_offset:2]
@@ -20,11 +20,9 @@ const TAG_BOOLEAN: u8 = 5;
 ///     for each column: [type_tag:1][value_bytes]
 ///
 /// The offset directory enables O(1) column access via binary search on col_id.
-pub fn encode_row(id: &str, columns: &[(u16, &Value)]) -> Vec<u8> {
+pub fn encode_row(rowid: u64, columns: &[(u16, &Value)]) -> Vec<u8> {
     let mut buf = Vec::with_capacity(64);
-    let id_bytes = id.as_bytes();
-    buf.extend_from_slice(&(id_bytes.len() as u16).to_le_bytes());
-    buf.extend_from_slice(id_bytes);
+    buf.extend_from_slice(&rowid.to_le_bytes());
     buf.extend_from_slice(&(columns.len() as u16).to_le_bytes());
 
     // Sort columns by col_id for binary search
@@ -80,9 +78,9 @@ fn encode_value(buf: &mut Vec<u8>, val: &Value) {
     }
 }
 
-/// Decoded row: the _id and all column values.
+/// Decoded row: the rowid and all column values.
 pub struct DecodedRow {
-    pub id: String,
+    pub id: u64,
     pub columns: Vec<(u16, Value)>,
 }
 
@@ -90,14 +88,10 @@ pub struct DecodedRow {
 pub fn decode_row(data: &[u8]) -> Result<DecodedRow> {
     let mut offset = 0;
 
-    // _id
-    ensure_bytes(data, offset, 2)?;
-    let id_len = u16::from_le_bytes(data[offset..offset + 2].try_into().unwrap()) as usize;
-    offset += 2;
-    ensure_bytes(data, offset, id_len)?;
-    let id = String::from_utf8(data[offset..offset + id_len].to_vec())
-        .map_err(|_| BoogyError::Corruption("invalid utf8 in _id".into()))?;
-    offset += id_len;
+    // rowid
+    ensure_bytes(data, offset, 8)?;
+    let id = u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap());
+    offset += 8;
 
     // num columns
     ensure_bytes(data, offset, 2)?;
@@ -126,23 +120,19 @@ pub fn decode_row(data: &[u8]) -> Result<DecodedRow> {
     Ok(DecodedRow { id, columns })
 }
 
-/// Extract just the _id from row bytes without decoding columns.
-pub fn extract_id(data: &[u8]) -> Result<&str> {
-    ensure_bytes(data, 0, 2)?;
-    let id_len = u16::from_le_bytes(data[0..2].try_into().unwrap()) as usize;
-    ensure_bytes(data, 2, id_len)?;
-    std::str::from_utf8(&data[2..2 + id_len])
-        .map_err(|_| BoogyError::Corruption("invalid utf8 in _id".into()))
+/// Extract just the rowid from row bytes without decoding columns.
+pub fn extract_id(data: &[u8]) -> Result<u64> {
+    ensure_bytes(data, 0, 8)?;
+    Ok(u64::from_le_bytes(data[0..8].try_into().unwrap()))
 }
 
 /// Extract a single column value by column ID in O(1) via binary search on the offset directory.
 pub fn extract_column(data: &[u8], target_col_id: u16) -> Result<Option<Value>> {
     let mut offset = 0;
 
-    // Skip _id
-    ensure_bytes(data, offset, 2)?;
-    let id_len = u16::from_le_bytes(data[offset..offset + 2].try_into().unwrap()) as usize;
-    offset += 2 + id_len;
+    // Skip rowid (fixed 8 bytes)
+    ensure_bytes(data, offset, 8)?;
+    offset += 8;
 
     // num columns
     ensure_bytes(data, offset, 2)?;
@@ -243,9 +233,9 @@ mod tests {
             (3, &v3),
             (4, &v4),
         ];
-        let encoded = encode_row("row_1", &cols);
+        let encoded = encode_row(1, &cols);
         let decoded = decode_row(&encoded).unwrap();
-        assert_eq!(decoded.id, "row_1");
+        assert_eq!(decoded.id, 1);
         assert_eq!(decoded.columns.len(), 5);
         assert_eq!(decoded.columns[0], (0, Value::Text("alice".into())));
         assert_eq!(decoded.columns[1], (1, Value::Integer(42)));
@@ -255,8 +245,8 @@ mod tests {
 
     #[test]
     fn test_extract_id() {
-        let encoded = encode_row("my_uuid", &[(0, &Value::Integer(1))]);
-        assert_eq!(extract_id(&encoded).unwrap(), "my_uuid");
+        let encoded = encode_row(42, &[(0, &Value::Integer(1))]);
+        assert_eq!(extract_id(&encoded).unwrap(), 42);
     }
 
     #[test]
@@ -269,7 +259,7 @@ mod tests {
             (1, &v1),
             (2, &v2),
         ];
-        let encoded = encode_row("id1", &cols);
+        let encoded = encode_row(1, &cols);
 
         assert_eq!(extract_column(&encoded, 1).unwrap(), Some(Value::Integer(42)));
         assert_eq!(extract_column(&encoded, 2).unwrap(), Some(Value::Boolean(false)));
@@ -281,7 +271,7 @@ mod tests {
         // Test with many columns to verify binary search works
         let values: Vec<Value> = (0..20).map(|i| Value::Integer(i * 100)).collect();
         let cols: Vec<(u16, &Value)> = values.iter().enumerate().map(|(i, v)| (i as u16, v)).collect();
-        let encoded = encode_row("test", &cols);
+        let encoded = encode_row(99, &cols);
 
         // Access last column directly — should be O(1) via binary search
         assert_eq!(extract_column(&encoded, 19).unwrap(), Some(Value::Integer(1900)));
@@ -295,7 +285,7 @@ mod tests {
         let blob_data = vec![0xFF, 0x00, 0xAB, 0xCD];
         let v0 = Value::Blob(blob_data.clone());
         let cols = vec![(0u16, &v0)];
-        let encoded = encode_row("blob_row", &cols);
+        let encoded = encode_row(7, &cols);
         let decoded = decode_row(&encoded).unwrap();
         assert_eq!(decoded.columns[0].1, Value::Blob(blob_data));
     }
@@ -304,7 +294,7 @@ mod tests {
     fn test_empty_string() {
         let v0 = Value::Text(String::new());
         let cols = vec![(0u16, &v0)];
-        let encoded = encode_row("empty", &cols);
+        let encoded = encode_row(8, &cols);
         let decoded = decode_row(&encoded).unwrap();
         assert_eq!(decoded.columns[0].1, Value::Text(String::new()));
     }
@@ -316,7 +306,7 @@ mod tests {
         let v2 = Value::Integer(300);
         // Encode out of order
         let cols = vec![(2u16, &v2), (0, &v0), (1, &v1)];
-        let encoded = encode_row("test", &cols);
+        let encoded = encode_row(10, &cols);
         // Decode should return sorted by col_id
         let decoded = decode_row(&encoded).unwrap();
         assert_eq!(decoded.columns[0], (0, Value::Integer(100)));
