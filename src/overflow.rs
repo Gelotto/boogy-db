@@ -3,25 +3,29 @@ use crate::page::{Page, PAGE_HEADER_SIZE, PAGE_SIZE};
 /// Maximum payload bytes per overflow page (page minus header minus checksum).
 pub const OVERFLOW_PAYLOAD_MAX: usize = PAGE_SIZE - PAGE_HEADER_SIZE - 4;
 
-/// Sentinel byte at the end of an inline row to signal overflow.
-pub const OVERFLOW_MARKER: u8 = 0xFF;
+/// Two-byte magic at the start of an overflow trailer to signal overflow.
+/// Using two bytes ([0xFF, 0xFE]) avoids false positives from normal column
+/// data that happens to end with a single 0xFF byte.
+pub const OVERFLOW_MAGIC: [u8; 2] = [0xFF, 0xFE];
 
 /// Size of the overflow trailer appended to inline row data:
-/// [marker:1][first_page:4][remaining_len:4] = 9 bytes.
-pub const OVERFLOW_TRAILER_SIZE: usize = 9;
+/// [magic:2][first_page:4][remaining_len:4] = 10 bytes.
+pub const OVERFLOW_TRAILER_SIZE: usize = 10;
 
 /// Returns `true` if `row_bytes` ends with an overflow trailer.
 ///
 /// Checks that the row is at least `OVERFLOW_TRAILER_SIZE` bytes and that the
-/// byte at `len - OVERFLOW_TRAILER_SIZE` is the `OVERFLOW_MARKER`.
+/// two bytes at the start of the trailer position match `OVERFLOW_MAGIC`.
 pub fn has_overflow(row_bytes: &[u8]) -> bool {
     if row_bytes.len() < OVERFLOW_TRAILER_SIZE {
         return false;
     }
-    row_bytes[row_bytes.len() - OVERFLOW_TRAILER_SIZE] == OVERFLOW_MARKER
+    let trailer_start = row_bytes.len() - OVERFLOW_TRAILER_SIZE;
+    row_bytes[trailer_start] == OVERFLOW_MAGIC[0]
+        && row_bytes[trailer_start + 1] == OVERFLOW_MAGIC[1]
 }
 
-/// Decode the overflow trailer from the last 9 bytes of `row_bytes`.
+/// Decode the overflow trailer from the last 10 bytes of `row_bytes`.
 ///
 /// Returns `(inline_len, first_page, remaining_len)` where:
 /// - `inline_len` is the number of row bytes before the trailer
@@ -34,14 +38,14 @@ pub fn has_overflow(row_bytes: &[u8]) -> bool {
 pub fn decode_overflow_trailer(row_bytes: &[u8]) -> (usize, u32, u32) {
     assert!(row_bytes.len() >= OVERFLOW_TRAILER_SIZE);
     let trailer_start = row_bytes.len() - OVERFLOW_TRAILER_SIZE;
-    // skip the marker byte
+    // skip the 2-byte magic
     let first_page = u32::from_le_bytes(
-        row_bytes[trailer_start + 1..trailer_start + 5]
+        row_bytes[trailer_start + 2..trailer_start + 6]
             .try_into()
             .unwrap(),
     );
     let remaining_len = u32::from_le_bytes(
-        row_bytes[trailer_start + 5..trailer_start + 9]
+        row_bytes[trailer_start + 6..trailer_start + 10]
             .try_into()
             .unwrap(),
     );
@@ -50,9 +54,9 @@ pub fn decode_overflow_trailer(row_bytes: &[u8]) -> (usize, u32, u32) {
 
 /// Append an overflow trailer to `buf`.
 ///
-/// Writes `[OVERFLOW_MARKER, first_page (LE), remaining_len (LE)]`.
+/// Writes `[OVERFLOW_MAGIC (2 bytes), first_page (LE), remaining_len (LE)]`.
 pub fn append_overflow_trailer(buf: &mut Vec<u8>, first_page: u32, remaining_len: u32) {
-    buf.push(OVERFLOW_MARKER);
+    buf.extend_from_slice(&OVERFLOW_MAGIC);
     buf.extend_from_slice(&first_page.to_le_bytes());
     buf.extend_from_slice(&remaining_len.to_le_bytes());
 }
@@ -102,7 +106,7 @@ mod tests {
 
     #[test]
     fn has_overflow_too_short() {
-        let buf = vec![OVERFLOW_MARKER; 5]; // shorter than OVERFLOW_TRAILER_SIZE
+        let buf = vec![0xFF; 5]; // shorter than OVERFLOW_TRAILER_SIZE
         assert!(!has_overflow(&buf));
     }
 
