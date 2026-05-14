@@ -324,7 +324,7 @@ impl<'a, 'b> IndexTreeWriter<'a, 'b> {
 
     /// Insert a key. Returns the (possibly new) root page number.
     pub fn insert(&mut self, key: &[u8]) -> Result<u32> {
-        let result = self.insert_recursive(self.root, key)?;
+        let result = self.insert_recursive(self.root, key, 0)?;
         match result {
             InsertResult::Fit => Ok(self.root),
             InsertResult::Split {
@@ -346,12 +346,17 @@ impl<'a, 'b> IndexTreeWriter<'a, 'b> {
 
     /// Delete a key. Returns true if the key existed.
     pub fn delete(&mut self, key: &[u8]) -> Result<bool> {
-        self.delete_recursive(self.root, key)
+        self.delete_recursive(self.root, key, 0)
     }
 
     // --- Internal methods ---
 
-    fn insert_recursive(&mut self, page_no: u32, key: &[u8]) -> Result<InsertResult> {
+    fn insert_recursive(&mut self, page_no: u32, key: &[u8], depth: usize) -> Result<InsertResult> {
+        if depth >= MAX_TREE_DEPTH {
+            return Err(crate::error::BoogyError::Corruption(
+                "index B+ tree depth exceeds maximum in insert_recursive".into(),
+            ));
+        }
         // Check dirty overlay first (zero-copy), then cache (Arc deref without clone).
         // Only clone at the leaf where we need page data for rebuild.
         let (is_leaf, child_idx, child_page_no) = if let Some(p) = self.guard.peek_dirty(page_no) {
@@ -375,7 +380,7 @@ impl<'a, 'b> IndexTreeWriter<'a, 'b> {
             let page = self.guard.read_page_cloned(page_no)?;
             self.insert_into_leaf(page_no, &page, key)
         } else {
-            let result = self.insert_recursive(child_page_no, key)?;
+            let result = self.insert_recursive(child_page_no, key, depth + 1)?;
             match result {
                 InsertResult::Fit => Ok(InsertResult::Fit),
                 InsertResult::Split {
@@ -522,7 +527,12 @@ impl<'a, 'b> IndexTreeWriter<'a, 'b> {
         }
     }
 
-    fn delete_recursive(&mut self, page_no: u32, key: &[u8]) -> Result<bool> {
+    fn delete_recursive(&mut self, page_no: u32, key: &[u8], depth: usize) -> Result<bool> {
+        if depth >= MAX_TREE_DEPTH {
+            return Err(crate::error::BoogyError::Corruption(
+                "index B+ tree depth exceeds maximum in delete_recursive".into(),
+            ));
+        }
         // Branch navigation without clone
         let (is_leaf, child_page_no) = if let Some(p) = self.guard.peek_dirty(page_no) {
             if p.is_leaf() {
@@ -542,7 +552,7 @@ impl<'a, 'b> IndexTreeWriter<'a, 'b> {
         };
 
         if !is_leaf {
-            return self.delete_recursive(child_page_no, key);
+            return self.delete_recursive(child_page_no, key, depth + 1);
         }
 
         // Leaf — clone for rebuild

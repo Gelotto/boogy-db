@@ -1678,14 +1678,20 @@ impl BoogyDb {
         }
 
         // 4. Insert all rows under a single WriteGuard.
+        // Track metadata changes separately so they are only applied after
+        // commit_write succeeds. If commit fails, metadata is unchanged.
         let durability = self.durability();
+        let starting_rowid = state.meta.next_rowid;
+        let starting_root = state.meta.root_page;
         let ids = {
             let mut guard = self.file.begin_write();
             let mut ids = Vec::with_capacity(rows.len());
+            let mut current_root = starting_root;
+            let mut next_rowid = starting_rowid;
 
             for row_data in rows {
-                let rowid = state.meta.next_rowid;
-                state.meta.next_rowid += 1;
+                let rowid = next_rowid;
+                next_rowid += 1;
 
                 let col_values: Vec<(u16, &Value)> = row_data
                     .iter()
@@ -1697,19 +1703,24 @@ impl BoogyDb {
                     return Err(BoogyError::RowTooLarge(row_bytes.len()));
                 }
 
-                let mut tree = BTreeWriter::new(&mut guard, state.meta.root_page);
+                let mut tree = BTreeWriter::new(&mut guard, current_root);
                 let new_root = tree.insert(rowid, &row_bytes)?;
-                state.meta.root_page = new_root;
+                current_root = new_root;
 
                 if !state.meta.indexes.is_empty() {
                     Self::index_update_row(&mut guard, &mut state.meta, rowid, &row_bytes, false)?;
                 }
 
-                state.meta.row_count += 1;
                 ids.push(rowid);
             }
 
             Self::commit_write(guard, &self.file, &self.wal, durability, state.meta.table_id, state.meta.cipher.as_ref())?;
+
+            // Commit succeeded -- now update metadata.
+            let count = ids.len() as u64;
+            state.meta.root_page = current_root;
+            state.meta.next_rowid = next_rowid;
+            state.meta.row_count += count;
             ids
         };
 
