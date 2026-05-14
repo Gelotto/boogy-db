@@ -125,15 +125,15 @@ impl PageFile {
     /// Write a page directly to cache and disk. Used during crash recovery
     /// in `open()` to restore WAL before-images without going through the
     /// normal write path.
-    pub fn put_page_direct(&self, page_no: u32, page: Page) {
+    pub fn put_page_direct(&self, page_no: u32, page: Page) -> Result<()> {
         let np = self.num_pages.load(Ordering::Relaxed);
 
         // Write to disk.
         {
             let mut disk = self.disk.lock().unwrap();
             let offset = page_no as u64 * PAGE_SIZE as u64;
-            let _ = disk.seek(SeekFrom::Start(offset));
-            let _ = disk.write_all(&page.data);
+            disk.seek(SeekFrom::Start(offset))?;
+            disk.write_all(&page.data)?;
         }
 
         // Update page count if this extends the file.
@@ -148,6 +148,7 @@ impl PageFile {
             cache.push(None);
         }
         cache[page_no as usize] = Some(arc);
+        Ok(())
     }
 
     /// Read raw page bytes from disk without caching or parsing.

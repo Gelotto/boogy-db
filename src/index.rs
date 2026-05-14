@@ -134,6 +134,9 @@ fn encode_f64_sortable(val: f64) -> [u8; 8] {
 /// Checksum occupies the last 4 bytes of each page.
 const CHECKSUM_SIZE: usize = 4;
 
+/// Maximum B+ tree depth (same as btree.rs).
+const MAX_TREE_DEPTH: usize = 64;
+
 /// Branch entry: [child:4][key_len:2][key_data:36] = 42 bytes.
 const IDX_BRANCH_ENTRY_SIZE: usize = 42;
 const IDX_BRANCH_KEY_MAX: usize = 36;
@@ -155,11 +158,19 @@ impl<'a> IndexTreeReader<'a> {
     /// Return all keys that start with `prefix`, in sorted order.
     pub fn scan_prefix(&self, prefix: &[u8]) -> Result<Vec<Vec<u8>>> {
         let first_leaf = self.find_leaf_for_key(self.root, prefix)?;
+        let max_pages = self.file.page_count();
+        let mut pages_visited = 0u32;
         let mut results = Vec::new();
         let mut current = first_leaf;
         let mut found_start = false;
 
         loop {
+            pages_visited += 1;
+            if pages_visited > max_pages {
+                return Err(crate::error::BoogyError::Corruption(
+                    "index leaf chain cycle detected in scan_prefix".into(),
+                ));
+            }
             let page = self.file.read_page(current)?;
             let num_entries = page.num_rows() as usize;
 
@@ -189,11 +200,19 @@ impl<'a> IndexTreeReader<'a> {
     /// Count entries whose key starts with `prefix` without collecting them.
     pub fn count_prefix(&self, prefix: &[u8]) -> Result<u64> {
         let first_leaf = self.find_leaf_for_key(self.root, prefix)?;
+        let max_pages = self.file.page_count();
+        let mut pages_visited = 0u32;
         let mut count = 0u64;
         let mut current = first_leaf;
         let mut found_start = false;
 
         loop {
+            pages_visited += 1;
+            if pages_visited > max_pages {
+                return Err(crate::error::BoogyError::Corruption(
+                    "index leaf chain cycle detected in count_prefix".into(),
+                ));
+            }
             let page = self.file.read_page(current)?;
             let num_entries = page.num_rows() as usize;
 
@@ -220,11 +239,19 @@ impl<'a> IndexTreeReader<'a> {
     /// Same as scan_prefix but stops after collecting `max` keys.
     pub fn scan_prefix_limit(&self, prefix: &[u8], max: usize) -> Result<Vec<Vec<u8>>> {
         let first_leaf = self.find_leaf_for_key(self.root, prefix)?;
+        let max_pages = self.file.page_count();
+        let mut pages_visited = 0u32;
         let mut results = Vec::with_capacity(max.min(256));
         let mut current = first_leaf;
         let mut found_start = false;
 
         loop {
+            pages_visited += 1;
+            if pages_visited > max_pages {
+                return Err(crate::error::BoogyError::Corruption(
+                    "index leaf chain cycle detected in scan_prefix_limit".into(),
+                ));
+            }
             let page = self.file.read_page(current)?;
             let num_entries = page.num_rows() as usize;
 
@@ -254,14 +281,18 @@ impl<'a> IndexTreeReader<'a> {
     // --- Internal methods ---
 
     /// Navigate the B+ tree to find the leaf page containing (or nearest to) `key`.
-    fn find_leaf_for_key(&self, page_no: u32, key: &[u8]) -> Result<u32> {
-        let page = self.file.read_page(page_no)?;
-        if page.is_leaf() {
-            Ok(page_no)
-        } else {
+    fn find_leaf_for_key(&self, mut page_no: u32, key: &[u8]) -> Result<u32> {
+        for _ in 0..MAX_TREE_DEPTH {
+            let page = self.file.read_page(page_no)?;
+            if page.is_leaf() {
+                return Ok(page_no);
+            }
             let (_, child) = find_idx_child(&page, key);
-            self.find_leaf_for_key(child, key)
+            page_no = child;
         }
+        Err(crate::error::BoogyError::Corruption(
+            "index B+ tree depth exceeds maximum in find_leaf_for_key".into(),
+        ))
     }
 }
 

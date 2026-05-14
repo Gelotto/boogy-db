@@ -6,18 +6,41 @@ use crate::row;
 /// Checksum occupies the last 4 bytes of each page.
 const CHECKSUM_SIZE: usize = 4;
 
+/// Maximum B+ tree depth. A tree with 4KB pages and u64 keys needs at most
+/// ~20 levels to store 2^64 entries. 64 is a generous upper bound.
+const MAX_TREE_DEPTH: usize = 64;
+
+/// Hard cap on reassembled row size to prevent OOM from corrupted `remaining` field.
+const MAX_REASSEMBLE_SIZE: usize = 64 * 1024 * 1024; // 64 MB
+
 /// Reassemble a row that may have overflow pages (via PageFile for Reader).
 fn reassemble_row_reader(row_bytes: &[u8], file: &PageFile) -> Result<Vec<u8>> {
     if !crate::overflow::has_overflow(row_bytes) {
         return Ok(row_bytes.to_vec());
     }
     let (inline_len, first_page, remaining) = crate::overflow::decode_overflow_trailer(row_bytes);
-    let mut full = Vec::with_capacity(inline_len + remaining as usize);
+    let total = inline_len + remaining as usize;
+    if total > MAX_REASSEMBLE_SIZE {
+        return Err(BoogyError::Corruption(format!(
+            "overflow row claims {total} bytes, exceeds {MAX_REASSEMBLE_SIZE} byte safety limit"
+        )));
+    }
+    let mut full = Vec::with_capacity(total);
     full.extend_from_slice(&row_bytes[..inline_len]);
+
+    // Guard against corrupted overflow chains that form a cycle.
+    let max_iterations = remaining as usize / crate::overflow::OVERFLOW_PAYLOAD_MAX + 2;
+    let mut iterations = 0usize;
 
     let mut current = first_page;
     let mut left = remaining as usize;
     while current != 0 && left > 0 {
+        iterations += 1;
+        if iterations > max_iterations {
+            return Err(BoogyError::Corruption(
+                "overflow chain cycle detected".into(),
+            ));
+        }
         let page = file.read_page(current)?;
         let payload = crate::overflow::read_overflow_payload(&page);
         let take = payload.len().min(left);
@@ -34,12 +57,28 @@ fn reassemble_row_writer(row_bytes: &[u8], guard: &WriteGuard) -> Result<Vec<u8>
         return Ok(row_bytes.to_vec());
     }
     let (inline_len, first_page, remaining) = crate::overflow::decode_overflow_trailer(row_bytes);
-    let mut full = Vec::with_capacity(inline_len + remaining as usize);
+    let total = inline_len + remaining as usize;
+    if total > MAX_REASSEMBLE_SIZE {
+        return Err(BoogyError::Corruption(format!(
+            "overflow row claims {total} bytes, exceeds {MAX_REASSEMBLE_SIZE} byte safety limit"
+        )));
+    }
+    let mut full = Vec::with_capacity(total);
     full.extend_from_slice(&row_bytes[..inline_len]);
+
+    // Guard against corrupted overflow chains that form a cycle.
+    let max_iterations = remaining as usize / crate::overflow::OVERFLOW_PAYLOAD_MAX + 2;
+    let mut iterations = 0usize;
 
     let mut current = first_page;
     let mut left = remaining as usize;
     while current != 0 && left > 0 {
+        iterations += 1;
+        if iterations > max_iterations {
+            return Err(BoogyError::Corruption(
+                "overflow chain cycle detected".into(),
+            ));
+        }
         let page_arc = guard.read_page(current)?;
         let payload = crate::overflow::read_overflow_payload(&page_arc);
         let take = payload.len().min(left);
@@ -76,9 +115,17 @@ impl<'a> BTreeReader<'a> {
     /// Iterate all rows in key order. Returns (rowid, row_bytes) pairs.
     pub fn scan_all(&self) -> Result<Vec<(u64, Vec<u8>)>> {
         let first_leaf = self.find_leftmost_leaf(self.root)?;
+        let max_pages = self.file.page_count();
+        let mut pages_visited = 0u32;
         let mut results = Vec::new();
         let mut current = first_leaf;
         loop {
+            pages_visited += 1;
+            if pages_visited > max_pages {
+                return Err(BoogyError::Corruption(
+                    "leaf chain cycle detected in scan_all".into(),
+                ));
+            }
             let page = self.file.read_page(current)?;
             let num_rows = page.num_rows() as usize;
             for i in 0..num_rows {
@@ -109,11 +156,19 @@ impl<'a> BTreeReader<'a> {
         }
         // Find the leaf containing the smallest rowid
         let leaf = self.find_leaf_for_rowid(self.root, rowids[0])?;
+        let max_pages = self.file.page_count();
+        let mut pages_visited = 0u32;
         let mut results = Vec::with_capacity(rowids.len());
         let mut rid_idx = 0;
         let mut current = leaf;
 
         while rid_idx < rowids.len() {
+            pages_visited += 1;
+            if pages_visited > max_pages {
+                return Err(BoogyError::Corruption(
+                    "leaf chain cycle detected in multi_get_sorted".into(),
+                ));
+            }
             let page = self.file.read_page(current)?;
             let num_rows = page.num_rows() as usize;
             for i in 0..num_rows {
@@ -161,6 +216,8 @@ impl<'a> BTreeReader<'a> {
         stop_after: Option<u64>,
     ) -> Result<(Vec<(u64, Vec<u8>)>, u64)> {
         let first_leaf = self.find_leftmost_leaf(self.root)?;
+        let max_pages = self.file.page_count();
+        let mut pages_visited = 0u32;
         let mut total: u64 = 0;
         let mut results = Vec::new();
         let skip = offset.unwrap_or(0) as u64;
@@ -168,6 +225,12 @@ impl<'a> BTreeReader<'a> {
         let mut current = first_leaf;
 
         loop {
+            pages_visited += 1;
+            if pages_visited > max_pages {
+                return Err(BoogyError::Corruption(
+                    "leaf chain cycle detected in scan_filtered".into(),
+                ));
+            }
             let arc = self.file.read_page(current)?;
             let page_data = &arc.data;
             let num_rows = arc.num_rows() as usize;
@@ -180,25 +243,44 @@ impl<'a> BTreeReader<'a> {
                 }
                 let data = &page_data[start..end];
 
-                // Try zero-alloc raw comparison first, fall back to decode
-                let matches = if let Ok(Some(raw)) = row::extract_column_raw(data, filter_col_id) {
-                    if let Some(result) = crate::filter::eval_filter_raw(raw, &filter_op, filter_val) {
-                        result
+                // For overflow rows, the inline bytes may not contain the
+                // filter column. Try inline first; if extraction fails and
+                // the row has overflow, reassemble and retry.
+                let (matches, full_row) = {
+                    let inline_match = if let Ok(Some(raw)) = row::extract_column_raw(data, filter_col_id) {
+                        if let Some(result) = crate::filter::eval_filter_raw(raw, &filter_op, filter_val) {
+                            Some(result)
+                        } else {
+                            let col_val = row::extract_column(data, filter_col_id)?;
+                            let actual = col_val.as_ref().unwrap_or(&crate::value::Value::Null);
+                            Some(crate::filter::eval_filter_op(actual, &filter_op, filter_val))
+                        }
+                    } else if crate::overflow::has_overflow(data) {
+                        // Column might be in the overflow portion — reassemble and retry
+                        None
                     } else {
-                        let col_val = row::extract_column(data, filter_col_id)?;
+                        Some(false) // column not found, no overflow
+                    };
+
+                    if let Some(m) = inline_match {
+                        (m, None)
+                    } else {
+                        // Reassemble and evaluate on full row
+                        let full = reassemble_row_reader(data, self.file)?;
+                        let col_val = row::extract_column(&full, filter_col_id)?;
                         let actual = col_val.as_ref().unwrap_or(&crate::value::Value::Null);
-                        crate::filter::eval_filter_op(actual, &filter_op, filter_val)
+                        let m = crate::filter::eval_filter_op(actual, &filter_op, filter_val);
+                        (m, Some(full))
                     }
-                } else {
-                    let col_val = row::extract_column(data, filter_col_id)?;
-                    let actual = col_val.as_ref().unwrap_or(&crate::value::Value::Null);
-                    crate::filter::eval_filter_op(actual, &filter_op, filter_val)
                 };
 
                 if matches {
                     total += 1;
                     if total > skip && (total - skip) <= take {
-                        let full = reassemble_row_reader(data, self.file)?;
+                        let full = full_row.map_or_else(
+                            || reassemble_row_reader(data, self.file),
+                            Ok,
+                        )?;
                         let id = row::extract_id(&full)?;
                         results.push((id, full));
                     }
@@ -225,10 +307,18 @@ impl<'a> BTreeReader<'a> {
         filter_val: &crate::value::Value,
     ) -> Result<u64> {
         let first_leaf = self.find_leftmost_leaf(self.root)?;
+        let max_pages = self.file.page_count();
+        let mut pages_visited = 0u32;
         let mut count: u64 = 0;
         let mut current = first_leaf;
 
         loop {
+            pages_visited += 1;
+            if pages_visited > max_pages {
+                return Err(BoogyError::Corruption(
+                    "leaf chain cycle detected in count_filtered".into(),
+                ));
+            }
             let arc = self.file.read_page(current)?;
             let page_data = &arc.data;
             let num_rows = arc.num_rows() as usize;
@@ -248,10 +338,14 @@ impl<'a> BTreeReader<'a> {
                         let actual = col_val.as_ref().unwrap_or(&crate::value::Value::Null);
                         crate::filter::eval_filter_op(actual, &filter_op, filter_val)
                     }
-                } else {
-                    let col_val = row::extract_column(data, filter_col_id)?;
+                } else if crate::overflow::has_overflow(data) {
+                    // Column may be in the overflow portion — reassemble and retry
+                    let full = reassemble_row_reader(data, self.file)?;
+                    let col_val = row::extract_column(&full, filter_col_id)?;
                     let actual = col_val.as_ref().unwrap_or(&crate::value::Value::Null);
                     crate::filter::eval_filter_op(actual, &filter_op, filter_val)
+                } else {
+                    false // column not found, no overflow
                 };
 
                 if matches {
@@ -268,50 +362,58 @@ impl<'a> BTreeReader<'a> {
 
     // --- Internal methods ---
 
-    fn find_leftmost_leaf(&self, page_no: u32) -> Result<u32> {
-        let page = self.file.read_page(page_no)?;
-        if page.is_leaf() {
-            Ok(page_no)
-        } else {
-            let child = get_branch_child(&page, 0);
-            self.find_leftmost_leaf(child)
+    fn find_leftmost_leaf(&self, mut page_no: u32) -> Result<u32> {
+        for _ in 0..MAX_TREE_DEPTH {
+            let page = self.file.read_page(page_no)?;
+            if page.is_leaf() {
+                return Ok(page_no);
+            }
+            page_no = get_branch_child(&page, 0);
         }
+        Err(BoogyError::Corruption(
+            "B+ tree depth exceeds maximum in find_leftmost_leaf".into(),
+        ))
     }
 
-    fn search_recursive(&self, page_no: u32, rowid: u64) -> Result<Option<Vec<u8>>> {
-        let page = self.file.read_page(page_no)?;
-
-        if page.is_leaf() {
-            let num_rows = page.num_rows() as usize;
-            if num_rows == 0 {
+    fn search_recursive(&self, mut page_no: u32, rowid: u64) -> Result<Option<Vec<u8>>> {
+        for _ in 0..MAX_TREE_DEPTH {
+            let page = self.file.read_page(page_no)?;
+            if page.is_leaf() {
+                let num_rows = page.num_rows() as usize;
+                if num_rows == 0 {
+                    return Ok(None);
+                }
+                let (pos, found) = find_insertion_point(&page, rowid)?;
+                if found {
+                    let (start, end) = row_bounds(&page, pos, num_rows);
+                    if start < end && end <= PAGE_SIZE {
+                        let raw = &page.data[start..end];
+                        return Ok(Some(reassemble_row_reader(raw, self.file)?));
+                    }
+                }
                 return Ok(None);
             }
-
-            // Binary search for the target rowid.
-            let (pos, found) = find_insertion_point(&page, rowid)?;
-            if found {
-                let (start, end) = row_bounds(&page, pos, num_rows);
-                if start < end && end <= PAGE_SIZE {
-                    let raw = &page.data[start..end];
-                    return Ok(Some(reassemble_row_reader(raw, self.file)?));
-                }
-            }
-            Ok(None)
-        } else {
             let (_, child_page_no) = find_child(&page, rowid);
-            self.search_recursive(child_page_no, rowid)
+            page_no = child_page_no;
         }
+        Err(BoogyError::Corruption(
+            "B+ tree depth exceeds maximum in search".into(),
+        ))
     }
 
     /// Find the leaf page containing (or that would contain) the given rowid.
-    fn find_leaf_for_rowid(&self, page_no: u32, rowid: u64) -> Result<u32> {
-        let page = self.file.read_page(page_no)?;
-        if page.is_leaf() {
-            Ok(page_no)
-        } else {
+    fn find_leaf_for_rowid(&self, mut page_no: u32, rowid: u64) -> Result<u32> {
+        for _ in 0..MAX_TREE_DEPTH {
+            let page = self.file.read_page(page_no)?;
+            if page.is_leaf() {
+                return Ok(page_no);
+            }
             let (_, child) = find_child(&page, rowid);
-            self.find_leaf_for_rowid(child, rowid)
+            page_no = child;
         }
+        Err(BoogyError::Corruption(
+            "B+ tree depth exceeds maximum in find_leaf_for_rowid".into(),
+        ))
     }
 }
 
@@ -343,7 +445,7 @@ impl<'a, 'b> BTreeWriter<'a, 'b> {
 
     /// Insert a row. Returns the (possibly new) root page number.
     pub fn insert(&mut self, rowid: u64, row_data: &[u8]) -> Result<u32> {
-        let result = self.insert_recursive(self.root, rowid, row_data)?;
+        let result = self.insert_recursive(self.root, rowid, row_data, 0)?;
         match result {
             InsertResult::Fit => Ok(self.root),
             InsertResult::Split {
@@ -365,7 +467,7 @@ impl<'a, 'b> BTreeWriter<'a, 'b> {
 
     /// Delete a row by rowid. Returns true if the row existed.
     pub fn delete(&mut self, rowid: u64) -> Result<bool> {
-        self.delete_recursive(self.root, rowid)
+        self.delete_recursive(self.root, rowid, 0)
     }
 
     /// Search for a row by rowid through the WriteGuard (sees dirty overlay).
@@ -376,9 +478,17 @@ impl<'a, 'b> BTreeWriter<'a, 'b> {
     /// Scan all rows through the WriteGuard (sees dirty overlay).
     pub fn scan_all_w(&self) -> Result<Vec<(u64, Vec<u8>)>> {
         let first_leaf = self.find_leftmost_leaf_w(self.root)?;
+        let max_pages = self.guard.page_file().page_count() + self.guard.new_page_count();
+        let mut pages_visited = 0u32;
         let mut results = Vec::new();
         let mut current = first_leaf;
         loop {
+            pages_visited += 1;
+            if pages_visited > max_pages {
+                return Err(BoogyError::Corruption(
+                    "leaf chain cycle detected in scan_all_w".into(),
+                ));
+            }
             let page = self.guard.read_page_cloned(current)?;
             let num_rows = page.num_rows() as usize;
             for i in 0..num_rows {
@@ -407,10 +517,18 @@ impl<'a, 'b> BTreeWriter<'a, 'b> {
         F: Fn(&[u8]) -> bool,
     {
         let first_leaf = self.find_leftmost_leaf_w(self.root)?;
+        let max_pages = self.guard.page_file().page_count() + self.guard.new_page_count();
+        let mut pages_visited = 0u32;
         let mut deleted = Vec::new();
         let mut current = first_leaf;
 
         loop {
+            pages_visited += 1;
+            if pages_visited > max_pages {
+                return Err(BoogyError::Corruption(
+                    "leaf chain cycle detected in delete_matching".into(),
+                ));
+            }
             let page = self.guard.read_page_cloned(current)?;
             let num_rows = page.num_rows() as usize;
             let next = page.next_leaf();
@@ -469,11 +587,19 @@ impl<'a, 'b> BTreeWriter<'a, 'b> {
         U: Fn(&[u8]) -> Vec<u8>,
     {
         let first_leaf = self.find_leftmost_leaf_w(self.root)?;
+        let max_pages = self.guard.page_file().page_count() + self.guard.new_page_count();
+        let mut pages_visited = 0u32;
         let mut updated = Vec::new();
         let mut overflow = Vec::new();
         let mut current = first_leaf;
 
         loop {
+            pages_visited += 1;
+            if pages_visited > max_pages {
+                return Err(BoogyError::Corruption(
+                    "leaf chain cycle detected in update_matching".into(),
+                ));
+            }
             let page = self.guard.read_page_cloned(current)?;
             let num_rows = page.num_rows() as usize;
             let next = page.next_leaf();
@@ -531,61 +657,71 @@ impl<'a, 'b> BTreeWriter<'a, 'b> {
 
     // --- Internal methods ---
 
-    fn search_recursive_w(&self, page_no: u32, rowid: u64) -> Result<Option<Vec<u8>>> {
-        // Zero-copy branch navigation (same pattern as delete_recursive)
-        let (is_leaf, child) = if let Some(p) = self.guard.peek_dirty(page_no) {
-            if p.is_leaf() {
-                (true, 0)
+    fn search_recursive_w(&self, mut page_no: u32, rowid: u64) -> Result<Option<Vec<u8>>> {
+        for _ in 0..MAX_TREE_DEPTH {
+            // Zero-copy branch navigation
+            let (is_leaf, child) = if let Some(p) = self.guard.peek_dirty(page_no) {
+                if p.is_leaf() {
+                    (true, 0)
+                } else {
+                    let (_, c) = find_child(p, rowid);
+                    (false, c)
+                }
             } else {
-                let (_, c) = find_child(p, rowid);
-                (false, c)
+                let arc = self.guard.page_file().read_page(page_no)?;
+                if arc.is_leaf() {
+                    (true, 0)
+                } else {
+                    let (_, c) = find_child(&arc, rowid);
+                    (false, c)
+                }
+            };
+
+            if !is_leaf {
+                page_no = child;
+                continue;
             }
-        } else {
-            let arc = self.guard.page_file().read_page(page_no)?;
-            if arc.is_leaf() {
-                (true, 0)
+
+            let page = self.guard.read_page_cloned(page_no)?;
+            let num_rows = page.num_rows() as usize;
+            if num_rows == 0 {
+                return Ok(None);
+            }
+            let (pos, found) = find_insertion_point(&page, rowid)?;
+            if !found {
+                return Ok(None);
+            }
+            let (start, end) = row_bounds(&page, pos, num_rows);
+            if start < end && end <= PAGE_SIZE {
+                return Ok(Some(reassemble_row_writer(&page.data[start..end], self.guard)?));
             } else {
-                let (_, c) = find_child(&arc, rowid);
-                (false, c)
+                return Ok(None);
             }
-        };
-
-        if !is_leaf {
-            return self.search_recursive_w(child, rowid);
         }
-
-        let page = self.guard.read_page_cloned(page_no)?;
-        let num_rows = page.num_rows() as usize;
-        if num_rows == 0 {
-            return Ok(None);
-        }
-        let (pos, found) = find_insertion_point(&page, rowid)?;
-        if !found {
-            return Ok(None);
-        }
-        let (start, end) = row_bounds(&page, pos, num_rows);
-        if start < end && end <= PAGE_SIZE {
-            Ok(Some(reassemble_row_writer(&page.data[start..end], self.guard)?))
-        } else {
-            Ok(None)
-        }
+        Err(BoogyError::Corruption(
+            "B+ tree depth exceeds maximum in search_recursive_w".into(),
+        ))
     }
 
     /// Navigate branch pages to find the leftmost leaf page.
-    fn find_leftmost_leaf_w(&self, page_no: u32) -> Result<u32> {
-        if let Some(p) = self.guard.peek_dirty(page_no) {
-            if p.is_leaf() {
+    fn find_leftmost_leaf_w(&self, mut page_no: u32) -> Result<u32> {
+        for _ in 0..MAX_TREE_DEPTH {
+            if let Some(p) = self.guard.peek_dirty(page_no) {
+                if p.is_leaf() {
+                    return Ok(page_no);
+                }
+                page_no = get_branch_child(p, 0);
+                continue;
+            }
+            let arc = self.guard.page_file().read_page(page_no)?;
+            if arc.is_leaf() {
                 return Ok(page_no);
             }
-            let child = get_branch_child(p, 0);
-            return self.find_leftmost_leaf_w(child);
+            page_no = get_branch_child(&arc, 0);
         }
-        let arc = self.guard.page_file().read_page(page_no)?;
-        if arc.is_leaf() {
-            return Ok(page_no);
-        }
-        let child = get_branch_child(&arc, 0);
-        self.find_leftmost_leaf_w(child)
+        Err(BoogyError::Corruption(
+            "B+ tree depth exceeds maximum in find_leftmost_leaf_w".into(),
+        ))
     }
 
     fn insert_recursive(
@@ -593,7 +729,13 @@ impl<'a, 'b> BTreeWriter<'a, 'b> {
         page_no: u32,
         rowid: u64,
         row_data: &[u8],
+        depth: usize,
     ) -> Result<InsertResult> {
+        if depth >= MAX_TREE_DEPTH {
+            return Err(BoogyError::Corruption(
+                "B+ tree depth exceeds maximum in insert_recursive".into(),
+            ));
+        }
         // Check dirty overlay first (zero-copy), then cache (Arc deref without clone).
         // Only clone at the leaf where we need page data for rebuild.
         let (is_leaf, child_idx, child_page_no) = if let Some(p) = self.guard.peek_dirty(page_no) {
@@ -617,7 +759,7 @@ impl<'a, 'b> BTreeWriter<'a, 'b> {
             let page = self.guard.read_page_cloned(page_no)?;
             self.insert_into_leaf(page_no, &page, rowid, row_data)
         } else {
-            let result = self.insert_recursive(child_page_no, rowid, row_data)?;
+            let result = self.insert_recursive(child_page_no, rowid, row_data, depth + 1)?;
             match result {
                 InsertResult::Fit => Ok(InsertResult::Fit),
                 InsertResult::Split {
@@ -854,7 +996,12 @@ impl<'a, 'b> BTreeWriter<'a, 'b> {
         }
     }
 
-    fn delete_recursive(&mut self, page_no: u32, rowid: u64) -> Result<bool> {
+    fn delete_recursive(&mut self, page_no: u32, rowid: u64, depth: usize) -> Result<bool> {
+        if depth >= MAX_TREE_DEPTH {
+            return Err(BoogyError::Corruption(
+                "B+ tree depth exceeds maximum in delete_recursive".into(),
+            ));
+        }
         // Branch navigation without clone
         let (is_leaf, child_page_no) = if let Some(p) = self.guard.peek_dirty(page_no) {
             if p.is_leaf() {
@@ -874,7 +1021,7 @@ impl<'a, 'b> BTreeWriter<'a, 'b> {
         };
 
         if !is_leaf {
-            return self.delete_recursive(child_page_no, rowid);
+            return self.delete_recursive(child_page_no, rowid, depth + 1);
         }
 
         // Leaf — clone for rebuild

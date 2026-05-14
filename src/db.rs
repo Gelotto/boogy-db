@@ -117,60 +117,74 @@ fn tag_to_type(tag: u8) -> Result<Type> {
     }
 }
 
+/// Maximum usable payload in a system page (page size minus header and checksum).
+const SYSTEM_PAGE_PAYLOAD: usize = PAGE_SIZE - 4; // 4-byte checksum at end
+
+/// Check that writing `needed` bytes at `offset` won't overflow the system page.
+fn check_sys_page_bounds(offset: usize, needed: usize) -> Result<()> {
+    if offset + needed > SYSTEM_PAGE_PAYLOAD {
+        return Err(BoogyError::Corruption(
+            "system page overflow: metadata exceeds 4KB page".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Serialize the table registry into a system page.
 /// Takes pre-collected metadata to avoid needing per-table locks.
 fn serialize_system_page(
     metas: &[TableMeta],
     next_table_id: u32,
-) -> Page {
+) -> Result<Page> {
     let mut page = Page::new_system();
     let data = &mut page.data;
 
     let mut offset = 16; // after page header
 
     // System page magic
+    check_sys_page_bounds(offset, 4)?;
     data[offset..offset + 4].copy_from_slice(&SYSTEM_PAGE_MAGIC.to_le_bytes());
     offset += 4;
 
     // next_table_id
+    check_sys_page_bounds(offset, 4)?;
     data[offset..offset + 4].copy_from_slice(&next_table_id.to_le_bytes());
     offset += 4;
 
     // num_tables
+    check_sys_page_bounds(offset, 2)?;
     let num_tables = metas.len() as u16;
     data[offset..offset + 2].copy_from_slice(&num_tables.to_le_bytes());
     offset += 2;
 
     for meta in metas {
-        // table_id
+        // table_id + root_page + row_count + next_rowid = 4+4+8+8 = 24
+        check_sys_page_bounds(offset, 24)?;
         data[offset..offset + 4].copy_from_slice(&meta.table_id.to_le_bytes());
         offset += 4;
-
-        // root_page
         data[offset..offset + 4].copy_from_slice(&meta.root_page.to_le_bytes());
         offset += 4;
-
-        // row_count
         data[offset..offset + 8].copy_from_slice(&meta.row_count.to_le_bytes());
         offset += 8;
-
-        // next_rowid
         data[offset..offset + 8].copy_from_slice(&meta.next_rowid.to_le_bytes());
         offset += 8;
 
         // name
         let name_bytes = meta.name.as_bytes();
+        check_sys_page_bounds(offset, 2 + name_bytes.len())?;
         data[offset..offset + 2].copy_from_slice(&(name_bytes.len() as u16).to_le_bytes());
         offset += 2;
         data[offset..offset + name_bytes.len()].copy_from_slice(name_bytes);
         offset += name_bytes.len();
 
         // columns
+        check_sys_page_bounds(offset, 2)?;
         data[offset..offset + 2].copy_from_slice(&(meta.columns.len() as u16).to_le_bytes());
         offset += 2;
 
         for col in &meta.columns {
             let col_name = col.name.as_bytes();
+            check_sys_page_bounds(offset, 2 + col_name.len() + 3)?;
             data[offset..offset + 2].copy_from_slice(&(col_name.len() as u16).to_le_bytes());
             offset += 2;
             data[offset..offset + col_name.len()].copy_from_slice(col_name);
@@ -185,17 +199,20 @@ fn serialize_system_page(
 
         // Indexes
         let num_indexes = meta.indexes.len() as u16;
+        check_sys_page_bounds(offset, 2)?;
         data[offset..offset + 2].copy_from_slice(&num_indexes.to_le_bytes());
         offset += 2;
 
         for idx in &meta.indexes {
             let idx_name = idx.name.as_bytes();
+            check_sys_page_bounds(offset, 2 + idx_name.len())?;
             data[offset..offset + 2].copy_from_slice(&(idx_name.len() as u16).to_le_bytes());
             offset += 2;
             data[offset..offset + idx_name.len()].copy_from_slice(idx_name);
             offset += idx_name.len();
 
             let idx_col = idx.column.as_bytes();
+            check_sys_page_bounds(offset, 2 + idx_col.len() + 4)?;
             data[offset..offset + 2].copy_from_slice(&(idx_col.len() as u16).to_le_bytes());
             offset += 2;
             data[offset..offset + idx_col.len()].copy_from_slice(idx_col);
@@ -206,12 +223,13 @@ fn serialize_system_page(
         }
 
         // encrypted flag
+        check_sys_page_bounds(offset, 1)?;
         data[offset] = if meta.encrypted { 1 } else { 0 };
         offset += 1;
     }
 
     page.update_checksum();
-    page
+    Ok(page)
 }
 
 /// Deserialize the table registry from a system page.
@@ -242,6 +260,9 @@ fn deserialize_system_page(
     let mut tables = Vec::with_capacity(num_tables);
 
     for _ in 0..num_tables {
+        if offset + 24 > SYSTEM_PAGE_PAYLOAD {
+            return Err(BoogyError::Corruption("system page truncated in table header".into()));
+        }
         let table_id = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
         offset += 4;
 
@@ -254,21 +275,36 @@ fn deserialize_system_page(
         let next_rowid = u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap());
         offset += 8;
 
+        if offset + 2 > SYSTEM_PAGE_PAYLOAD {
+            return Err(BoogyError::Corruption("system page truncated at table name length".into()));
+        }
         let name_len = u16::from_le_bytes(data[offset..offset + 2].try_into().unwrap()) as usize;
         offset += 2;
+        if offset + name_len > SYSTEM_PAGE_PAYLOAD {
+            return Err(BoogyError::Corruption("system page truncated at table name".into()));
+        }
         let name = String::from_utf8(data[offset..offset + name_len].to_vec())
             .map_err(|_| BoogyError::Corruption("invalid utf8 in table name".into()))?;
         offset += name_len;
 
+        if offset + 2 > SYSTEM_PAGE_PAYLOAD {
+            return Err(BoogyError::Corruption("system page truncated at column count".into()));
+        }
         let num_columns =
             u16::from_le_bytes(data[offset..offset + 2].try_into().unwrap()) as usize;
         offset += 2;
 
         let mut columns = Vec::with_capacity(num_columns);
         for _ in 0..num_columns {
+            if offset + 2 > SYSTEM_PAGE_PAYLOAD {
+                return Err(BoogyError::Corruption("system page truncated at column name length".into()));
+            }
             let col_name_len =
                 u16::from_le_bytes(data[offset..offset + 2].try_into().unwrap()) as usize;
             offset += 2;
+            if offset + col_name_len + 3 > SYSTEM_PAGE_PAYLOAD {
+                return Err(BoogyError::Corruption("system page truncated at column data".into()));
+            }
             let col_name = String::from_utf8(data[offset..offset + col_name_len].to_vec())
                 .map_err(|_| BoogyError::Corruption("invalid utf8 in column name".into()))?;
             offset += col_name_len;
@@ -294,20 +330,35 @@ fn deserialize_system_page(
         meta.next_rowid = next_rowid;
 
         // Indexes
+        if offset + 2 > SYSTEM_PAGE_PAYLOAD {
+            return Err(BoogyError::Corruption("system page truncated at index count".into()));
+        }
         let num_indexes = u16::from_le_bytes(data[offset..offset + 2].try_into().unwrap()) as usize;
         offset += 2;
 
         for _ in 0..num_indexes {
+            if offset + 2 > SYSTEM_PAGE_PAYLOAD {
+                return Err(BoogyError::Corruption("system page truncated at index name length".into()));
+            }
             let idx_name_len =
                 u16::from_le_bytes(data[offset..offset + 2].try_into().unwrap()) as usize;
             offset += 2;
+            if offset + idx_name_len > SYSTEM_PAGE_PAYLOAD {
+                return Err(BoogyError::Corruption("system page truncated at index name".into()));
+            }
             let idx_name = String::from_utf8(data[offset..offset + idx_name_len].to_vec())
                 .map_err(|_| BoogyError::Corruption("invalid utf8 in index name".into()))?;
             offset += idx_name_len;
 
+            if offset + 2 > SYSTEM_PAGE_PAYLOAD {
+                return Err(BoogyError::Corruption("system page truncated at index column length".into()));
+            }
             let idx_col_len =
                 u16::from_le_bytes(data[offset..offset + 2].try_into().unwrap()) as usize;
             offset += 2;
+            if offset + idx_col_len + 4 > SYSTEM_PAGE_PAYLOAD {
+                return Err(BoogyError::Corruption("system page truncated at index column".into()));
+            }
             let idx_col = String::from_utf8(data[offset..offset + idx_col_len].to_vec())
                 .map_err(|_| BoogyError::Corruption("invalid utf8 in index column".into()))?;
             offset += idx_col_len;
@@ -323,7 +374,7 @@ fn deserialize_system_page(
         }
 
         // encrypted flag
-        let encrypted = if offset < PAGE_SIZE - 4 {
+        let encrypted = if offset < SYSTEM_PAGE_PAYLOAD {
             let e = data[offset] != 0;
             offset += 1;
             e
@@ -382,7 +433,7 @@ impl BoogyDb {
                 // Redo: apply after-images in forward order.
                 for entry in &entries {
                     let page = Page::from_bytes_unchecked(entry.page_data);
-                    file.put_page_direct(entry.page_no, page);
+                    file.put_page_direct(entry.page_no, page)?;
                 }
                 file.sync_all()?;
                 wal.truncate()?;
@@ -547,7 +598,7 @@ impl BoogyDb {
             guard.allocate_page()?;
         }
 
-        let page = serialize_system_page(metas, next_table_id);
+        let page = serialize_system_page(metas, next_table_id)?;
         guard.put_page(0, page);
 
         Self::commit_write(guard, file, wal, durability, 0, None)?;
@@ -1869,8 +1920,9 @@ impl Drop for BoogyDb {
             if self.file.page_count() == 0 {
                 let _ = guard.allocate_page();
             }
-            let page = serialize_system_page(&metas, next_id);
-            guard.put_page(0, page);
+            if let Ok(page) = serialize_system_page(&metas, next_id) {
+                guard.put_page(0, page);
+            }
             let _ = guard.commit();
         }
         let _ = self.file.sync_all();
@@ -1903,8 +1955,10 @@ impl<'a> TransactionCtx<'a> {
     }
 }
 
-/// Light transaction (non-ACID). Commits on explicit `.commit()`, rolls back on drop.
-/// Each operation locks its table independently (lazy locking, same as `transaction()`).
+/// Light transaction (non-ACID). Each operation commits independently as it
+/// executes. `commit()` performs a final metadata flush. Drop is a no-op
+/// because individual operations were already committed. For true all-or-nothing
+/// rollback semantics, use ACID mode (`db.set_acid(true)`) instead.
 pub(crate) struct LightTransaction<'a> {
     db: &'a BoogyDb,
     committed: bool,
@@ -1912,10 +1966,9 @@ pub(crate) struct LightTransaction<'a> {
 
 impl Drop for LightTransaction<'_> {
     fn drop(&mut self) {
-        if !self.committed {
-            // Rollback: individual operations already committed their own writes,
-            // but we skip the final flush. This matches the existing transaction() behavior.
-        }
+        // No-op: individual operations were already committed. There is nothing
+        // to roll back. ACID mode (`AcidTransaction`) must be used for true
+        // rollback semantics.
     }
 }
 
@@ -1923,13 +1976,15 @@ impl Drop for LightTransaction<'_> {
 // MetaDelta — per-table metadata tracked during an AcidTransaction
 // ---------------------------------------------------------------------------
 
-#[allow(dead_code)]
 struct MetaDelta {
     root_page: u32,
     row_count_delta: i64,
     next_rowid: u64,
     table_id: u32,
     cipher: Option<crate::crypto::Cipher>,
+    /// Tracked index root pages: (index_column, root_page).
+    /// Updated during operations; applied on commit.
+    index_roots: Vec<(String, u32)>,
 }
 
 // ---------------------------------------------------------------------------
@@ -2001,6 +2056,18 @@ impl<'a> AcidTransaction<'a> {
             .unwrap_or(meta.next_rowid)
     }
 
+    /// Get the current index root page for a column, preferring meta_deltas.
+    fn current_index_root(&self, table: &str, column: &str, original_root: u32) -> u32 {
+        if let Some(delta) = self.meta_deltas.get(table) {
+            for (col, root) in &delta.index_roots {
+                if col == column {
+                    return *root;
+                }
+            }
+        }
+        original_root
+    }
+
     /// Insert a row with auto-increment rowid.
     pub fn insert(&mut self, table: &str, data: &[(&str, Value)]) -> Result<u64> {
         let table_state = self.table_state(table)?;
@@ -2021,19 +2088,20 @@ impl<'a> AcidTransaction<'a> {
             return Err(BoogyError::RowTooLarge(row_bytes.len()));
         }
 
-        // Extract index info before entering with_guard
-        let index_info: Vec<(u16, crate::value::Type, u32)> = state
+        // Extract index info before entering with_guard.
+        // Use delta roots when available so subsequent operations within the
+        // same transaction see the correct index tree.
+        let index_info: Vec<(String, u16, crate::value::Type, u32)> = state
             .meta
             .indexes
             .iter()
             .filter_map(|idx| {
                 let cid = state.meta.col_name_to_id.get(&idx.column).copied()?;
                 let ct = state.meta.columns.iter().find(|c| c.name == idx.column)?.col_type;
-                // Use delta root if available
-                Some((cid, ct, idx.root_page))
+                let root = self.current_index_root(table, &idx.column, idx.root_page);
+                Some((idx.column.clone(), cid, ct, root))
             })
             .collect();
-        let index_names: Vec<String> = state.meta.indexes.iter().map(|idx| idx.column.clone()).collect();
         let table_id = state.meta.table_id;
         let cipher = state.meta.cipher.clone();
         drop(state);
@@ -2043,43 +2111,34 @@ impl<'a> AcidTransaction<'a> {
             let new_root = tree.insert(rowid, &row_bytes)?;
 
             let mut idx_roots = Vec::new();
-            for (cid, ct, idx_root) in &index_info {
+            for (col, cid, ct, idx_root) in &index_info {
                 let val = crate::row::extract_column(&row_bytes, *cid)?
                     .unwrap_or(Value::Null);
                 if let Some(key) = index::encode_index_key(*ct, &val, rowid) {
                     let mut itree = IndexTreeWriter::new(guard, *idx_root);
                     let r = itree.insert(&key)?;
-                    idx_roots.push(r);
+                    idx_roots.push((col.clone(), r));
                 } else {
-                    idx_roots.push(*idx_root);
+                    idx_roots.push((col.clone(), *idx_root));
                 }
             }
 
             Ok((new_root, idx_roots))
         })?;
 
-        // Update meta delta
+        // Update meta delta -- store index roots in the delta, NOT in st.meta.
         let delta = self.meta_deltas.entry(table.to_string()).or_insert(MetaDelta {
             root_page,
             row_count_delta: 0,
             next_rowid: rowid,
             table_id,
             cipher,
+            index_roots: Vec::new(),
         });
         delta.root_page = new_root;
         delta.row_count_delta += 1;
         delta.next_rowid = rowid + 1;
-
-        // Update index root pages in the table state
-        if !idx_roots.is_empty() {
-            let ts = self.table_state(table)?;
-            let mut st = ts.write().unwrap();
-            for (i, root) in idx_roots.into_iter().enumerate() {
-                if i < st.meta.indexes.len() && i < index_names.len() && st.meta.indexes[i].column == index_names[i] {
-                    st.meta.indexes[i].root_page = root;
-                }
-            }
-        }
+        delta.index_roots = idx_roots;
 
         Ok(rowid)
     }
@@ -2103,17 +2162,17 @@ impl<'a> AcidTransaction<'a> {
             return Err(BoogyError::RowTooLarge(row_bytes.len()));
         }
 
-        let index_info: Vec<(u16, crate::value::Type, u32)> = state
+        let index_info: Vec<(String, u16, crate::value::Type, u32)> = state
             .meta
             .indexes
             .iter()
             .filter_map(|idx| {
                 let cid = state.meta.col_name_to_id.get(&idx.column).copied()?;
                 let ct = state.meta.columns.iter().find(|c| c.name == idx.column)?.col_type;
-                Some((cid, ct, idx.root_page))
+                let root = self.current_index_root(table, &idx.column, idx.root_page);
+                Some((idx.column.clone(), cid, ct, root))
             })
             .collect();
-        let index_names: Vec<String> = state.meta.indexes.iter().map(|idx| idx.column.clone()).collect();
         let table_id = state.meta.table_id;
         let cipher = state.meta.cipher.clone();
         let current_next = self.current_next_rowid(table, &state.meta);
@@ -2124,15 +2183,15 @@ impl<'a> AcidTransaction<'a> {
             let new_root = tree.insert(rowid, &row_bytes)?;
 
             let mut idx_roots = Vec::new();
-            for (cid, ct, idx_root) in &index_info {
+            for (col, cid, ct, idx_root) in &index_info {
                 let val = crate::row::extract_column(&row_bytes, *cid)?
                     .unwrap_or(Value::Null);
                 if let Some(key) = index::encode_index_key(*ct, &val, rowid) {
                     let mut itree = IndexTreeWriter::new(guard, *idx_root);
                     let r = itree.insert(&key)?;
-                    idx_roots.push(r);
+                    idx_roots.push((col.clone(), r));
                 } else {
-                    idx_roots.push(*idx_root);
+                    idx_roots.push((col.clone(), *idx_root));
                 }
             }
 
@@ -2147,20 +2206,12 @@ impl<'a> AcidTransaction<'a> {
             next_rowid: current_next,
             table_id,
             cipher,
+            index_roots: Vec::new(),
         });
         delta.root_page = new_root;
         delta.row_count_delta += 1;
         delta.next_rowid = new_next;
-
-        if !idx_roots.is_empty() {
-            let ts = self.table_state(table)?;
-            let mut st = ts.write().unwrap();
-            for (i, root) in idx_roots.into_iter().enumerate() {
-                if i < st.meta.indexes.len() && i < index_names.len() && st.meta.indexes[i].column == index_names[i] {
-                    st.meta.indexes[i].root_page = root;
-                }
-            }
-        }
+        delta.index_roots = idx_roots;
 
         Ok(())
     }
@@ -2201,17 +2252,17 @@ impl<'a> AcidTransaction<'a> {
         // Extract column info for merge
         let col_name_to_id = state.meta.col_name_to_id.clone();
 
-        let index_info: Vec<(u16, crate::value::Type, u32)> = state
+        let index_info: Vec<(String, u16, crate::value::Type, u32)> = state
             .meta
             .indexes
             .iter()
             .filter_map(|idx| {
                 let cid = state.meta.col_name_to_id.get(&idx.column).copied()?;
                 let ct = state.meta.columns.iter().find(|c| c.name == idx.column)?.col_type;
-                Some((cid, ct, idx.root_page))
+                let root = self.current_index_root(table, &idx.column, idx.root_page);
+                Some((idx.column.clone(), cid, ct, root))
             })
             .collect();
-        let index_names: Vec<String> = state.meta.indexes.iter().map(|idx| idx.column.clone()).collect();
         drop(state);
 
         // Prepare field mappings
@@ -2241,7 +2292,7 @@ impl<'a> AcidTransaction<'a> {
 
             // Remove old index entries
             let mut idx_roots = Vec::new();
-            for (cid, ct, idx_root) in &index_info {
+            for (col, cid, ct, idx_root) in &index_info {
                 let old_val = crate::row::extract_column(&existing_bytes, *cid)?
                     .unwrap_or(Value::Null);
                 let mut current_root = *idx_root;
@@ -2256,9 +2307,9 @@ impl<'a> AcidTransaction<'a> {
                 if let Some(key) = index::encode_index_key(*ct, &new_val, id) {
                     let mut itree = IndexTreeWriter::new(guard, current_root);
                     let r = itree.insert(&key)?;
-                    idx_roots.push(r);
+                    idx_roots.push((col.clone(), r));
                 } else {
-                    idx_roots.push(current_root);
+                    idx_roots.push((col.clone(), current_root));
                 }
             }
 
@@ -2282,18 +2333,10 @@ impl<'a> AcidTransaction<'a> {
             next_rowid: current_next,
             table_id,
             cipher,
+            index_roots: Vec::new(),
         });
         delta.root_page = new_root;
-
-        if !idx_roots.is_empty() {
-            let ts = self.table_state(table)?;
-            let mut st = ts.write().unwrap();
-            for (i, root) in idx_roots.into_iter().enumerate() {
-                if i < st.meta.indexes.len() && i < index_names.len() && st.meta.indexes[i].column == index_names[i] {
-                    st.meta.indexes[i].root_page = root;
-                }
-            }
-        }
+        delta.index_roots = idx_roots;
 
         Ok(true)
     }
@@ -2310,17 +2353,17 @@ impl<'a> AcidTransaction<'a> {
         let current_next = self.current_next_rowid(table, &state.meta);
 
         let has_indexes = !state.meta.indexes.is_empty();
-        let index_info: Vec<(u16, crate::value::Type, u32)> = state
+        let index_info: Vec<(String, u16, crate::value::Type, u32)> = state
             .meta
             .indexes
             .iter()
             .filter_map(|idx| {
                 let cid = state.meta.col_name_to_id.get(&idx.column).copied()?;
                 let ct = state.meta.columns.iter().find(|c| c.name == idx.column)?.col_type;
-                Some((cid, ct, idx.root_page))
+                let root = self.current_index_root(table, &idx.column, idx.root_page);
+                Some((idx.column.clone(), cid, ct, root))
             })
             .collect();
-        let index_names: Vec<String> = state.meta.indexes.iter().map(|idx| idx.column.clone()).collect();
         drop(state);
 
         let result = self.with_guard(|guard| {
@@ -2339,15 +2382,15 @@ impl<'a> AcidTransaction<'a> {
             let mut idx_roots = Vec::new();
             if deleted {
                 if let Some(ref bytes) = row_bytes_for_index {
-                    for (cid, ct, idx_root) in &index_info {
+                    for (col, cid, ct, idx_root) in &index_info {
                         let val = crate::row::extract_column(bytes, *cid)?
                             .unwrap_or(Value::Null);
                         if let Some(key) = index::encode_index_key(*ct, &val, id) {
                             let mut itree = IndexTreeWriter::new(guard, *idx_root);
                             itree.delete(&key)?;
-                            idx_roots.push(itree.root_page());
+                            idx_roots.push((col.clone(), itree.root_page()));
                         } else {
-                            idx_roots.push(*idx_root);
+                            idx_roots.push((col.clone(), *idx_root));
                         }
                     }
                 }
@@ -2367,19 +2410,11 @@ impl<'a> AcidTransaction<'a> {
             next_rowid: current_next,
             table_id,
             cipher,
+            index_roots: Vec::new(),
         });
         delta.root_page = new_root;
         delta.row_count_delta -= 1;
-
-        if !idx_roots.is_empty() {
-            let ts = self.table_state(table)?;
-            let mut st = ts.write().unwrap();
-            for (i, root) in idx_roots.into_iter().enumerate() {
-                if i < st.meta.indexes.len() && i < index_names.len() && st.meta.indexes[i].column == index_names[i] {
-                    st.meta.indexes[i].root_page = root;
-                }
-            }
-        }
+        delta.index_roots = idx_roots;
 
         Ok(true)
     }
@@ -2624,12 +2659,46 @@ impl<'a> AcidTransaction<'a> {
         guard.set_new_page_count(self.new_page_count);
         let after_images = guard.commit()?;
 
+        // Build a page -> (table_id, cipher) mapping so WAL entries are
+        // written with the correct table_id and encrypted when needed.
+        // Also register page ciphers for sync_all.
+        let mut page_table_map: StdHashMap<u32, (u32, Option<&crate::crypto::Cipher>)> = StdHashMap::new();
+        for delta in self.meta_deltas.values() {
+            let cipher_ref = delta.cipher.as_ref();
+            for (page_no, _) in &after_images {
+                // Associate each dirty page with this table's id and cipher.
+                // In a multi-table transaction, pages may belong to different
+                // tables; we conservatively apply the delta whose pages were
+                // created during its operations. Since we cannot cheaply track
+                // page ownership, we map every page to the first delta that
+                // claims it. Pages from different tables are disjoint in
+                // practice because each table has its own B+ tree.
+                page_table_map.entry(*page_no)
+                    .or_insert((delta.table_id, cipher_ref));
+            }
+            // Register page ciphers for encrypted tables so sync_all encrypts them.
+            if let Some(c) = cipher_ref {
+                let arc = Arc::new(c.clone());
+                for (page_no, _) in &after_images {
+                    self.db.file.register_page_cipher(*page_no, Arc::clone(&arc));
+                }
+            }
+        }
+
         // WAL
         match durability {
             Durability::Immediate | Durability::Normal => {
                 let mut wal = self.db.wal.lock().unwrap();
                 for (page_no, data) in &after_images {
-                    wal.append_before_image(0, *page_no, data)?;
+                    let (table_id, cipher) = page_table_map.get(page_no)
+                        .copied()
+                        .unwrap_or((0, None));
+                    let write_data = if let Some(c) = cipher {
+                        c.encrypt_page(&data[..crate::crypto::ENCRYPTED_PAYLOAD_SIZE])?
+                    } else {
+                        *data
+                    };
+                    wal.append_before_image(table_id, *page_no, &write_data)?;
                 }
                 if matches!(durability, Durability::Immediate) {
                     wal.sync()?;
@@ -2649,6 +2718,12 @@ impl<'a> AcidTransaction<'a> {
                 state.meta.row_count = (state.meta.row_count as i64 + delta.row_count_delta) as u64;
                 if delta.next_rowid > state.meta.next_rowid {
                     state.meta.next_rowid = delta.next_rowid;
+                }
+                // Apply index root pages from delta.
+                for (col, root) in &delta.index_roots {
+                    if let Some(idx) = state.meta.indexes.iter_mut().find(|i| &i.column == col) {
+                        idx.root_page = *root;
+                    }
                 }
             }
         }
