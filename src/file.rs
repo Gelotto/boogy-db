@@ -67,7 +67,7 @@ impl PageFile {
 
     /// Number of pages currently known to the file.
     pub fn page_count(&self) -> u32 {
-        self.num_pages.load(Ordering::Relaxed)
+        self.num_pages.load(Ordering::Acquire)
     }
 
     /// Read a page from the shared cache, falling back to disk on a miss.
@@ -75,7 +75,7 @@ impl PageFile {
     /// This is the key concurrency primitive: it takes `&self`, so multiple
     /// threads can call it concurrently while holding only a shared reference.
     pub fn read_page(&self, page_no: u32) -> Result<Arc<Page>> {
-        let np = self.num_pages.load(Ordering::Relaxed);
+        let np = self.num_pages.load(Ordering::Acquire);
         if page_no >= np {
             return Err(BoogyError::Corruption(format!(
                 "page {page_no} out of range (have {np} pages)"
@@ -126,7 +126,7 @@ impl PageFile {
     /// in `open()` to restore WAL before-images without going through the
     /// normal write path.
     pub fn put_page_direct(&self, page_no: u32, page: Page) -> Result<()> {
-        let np = self.num_pages.load(Ordering::Relaxed);
+        let np = self.num_pages.load(Ordering::Acquire);
 
         // Write to disk.
         {
@@ -138,7 +138,7 @@ impl PageFile {
 
         // Update page count if this extends the file.
         if page_no >= np {
-            self.num_pages.store(page_no + 1, Ordering::Relaxed);
+            self.num_pages.store(page_no + 1, Ordering::Release);
         }
 
         // Insert into shared cache.
@@ -248,8 +248,10 @@ impl<'a> WriteGuard<'a> {
 
     /// Allocate a new page at the logical end of the file.
     pub fn allocate_page(&mut self) -> Result<u32> {
-        let base = self.file.num_pages.load(Ordering::Relaxed);
-        let page_no = base + self.state.new_page_count;
+        let base = self.file.num_pages.load(Ordering::Acquire);
+        let page_no = base
+            .checked_add(self.state.new_page_count)
+            .ok_or(BoogyError::Corruption("page count overflow".into()))?;
         self.state.new_page_count += 1;
         self.state.dirty.insert(page_no, Box::new(Page::default()));
         Ok(page_no)
@@ -275,7 +277,7 @@ impl<'a> WriteGuard<'a> {
 
         // Publish to shared cache.
         let new_page_count = self.state.new_page_count;
-        let np = self.file.num_pages.load(Ordering::Relaxed);
+        let np = self.file.num_pages.load(Ordering::Acquire);
         let new_total = np + new_page_count;
 
         {
@@ -291,7 +293,7 @@ impl<'a> WriteGuard<'a> {
         if new_page_count > 0 {
             self.file
                 .num_pages
-                .fetch_add(new_page_count, Ordering::Relaxed);
+                .fetch_add(new_page_count, Ordering::Release);
         }
 
         // Clear write state for next transaction.

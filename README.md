@@ -448,7 +448,7 @@ The `skills/` directory contains step-by-step guides for working with boogy-db:
 
 ### Storage
 
-Single file per database, 4 KB page-aligned. Each table is a separate B+ tree with u64 integer keys and fixed 12-byte branch entries. Rows are stored inline on leaf pages with an offset directory for O(1) column access. Rows exceeding page capacity (~4KB) spill into linked overflow pages transparently.
+Single file per database, 4 KB page-aligned. Each table is a separate B+ tree with u64 integer keys and fixed 12-byte branch entries. Rows are stored inline on leaf pages with an offset directory for O(1) column access. Rows exceeding page capacity (~4KB) spill into linked overflow pages transparently. The system page (table registry) is limited to 4KB, which constrains the total metadata size (table names, column definitions, index names). This accommodates approximately 20-30 tables with typical schemas.
 
 ### Concurrency
 

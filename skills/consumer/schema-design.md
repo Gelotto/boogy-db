@@ -56,6 +56,10 @@ db.drop_table("users")?;
 
 For zero-downtime migrations, build the migration into your app startup before serving requests.
 
+## System Page Limit
+
+The system page (table registry) is limited to a single 4KB page. This constrains the total metadata size -- table names, column definitions, and index names all share this space. Expect approximately 20-30 tables with typical schemas (3-5 columns, 1-2 indexes per table). If you approach this limit, use shorter table/column/index names.
+
 ## Row Size Limit
 
 Each row must fit within a single 4096-byte page minus overhead (~4068 bytes usable). Keep rows compact:

@@ -15,6 +15,10 @@ pub const ENCRYPTED_PAYLOAD_SIZE: usize = PAGE_SIZE - NONCE_SIZE - TAG_SIZE;
 ///
 /// Each encrypted page is laid out as `[nonce:12][ciphertext+tag]` and fits
 /// exactly in `PAGE_SIZE` bytes.
+///
+/// Note: Key material in the `Aes256Gcm` struct is not zeroized on drop.
+/// For applications requiring key zeroization, consider wrapping `Cipher`
+/// in a custom type that manages key lifetime.
 pub struct Cipher {
     inner: Aes256Gcm,
 }

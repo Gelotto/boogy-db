@@ -14,7 +14,7 @@ pub fn encode_index_key(col_type: Type, val: &Value, rowid: u64) -> Option<Vec<u
         (_, Value::Null) => None,
         (Type::Integer, Value::Integer(i)) => Some(encode_index_key_integer(*i, rowid)),
         (Type::Real, Value::Real(f)) => Some(encode_index_key_real(*f, rowid)),
-        (Type::Text, Value::Text(s)) => Some(encode_index_key_text(s, rowid)),
+        (Type::Text, Value::Text(s)) => encode_index_key_text(s, rowid),
         // Cross-type coercion: integer column with real value, etc.
         (Type::Integer, Value::Real(f)) => Some(encode_index_key_integer(*f as i64, rowid)),
         (Type::Real, Value::Integer(i)) => Some(encode_index_key_real(*i as f64, rowid)),
@@ -77,14 +77,17 @@ pub fn encode_index_key_real(val: f64, rowid: u64) -> Vec<u8> {
 }
 
 /// Text: `[utf8_bytes][0x00][rowid:8 BE]` — variable length.
-/// Text must not contain 0x00 bytes.
-pub fn encode_index_key_text(val: &str, rowid: u64) -> Vec<u8> {
-    debug_assert!(!val.as_bytes().contains(&0x00), "text keys must not contain null bytes");
+/// Text must not contain 0x00 bytes. Returns `None` if null bytes are present,
+/// since they break the null-terminated encoding.
+pub fn encode_index_key_text(val: &str, rowid: u64) -> Option<Vec<u8>> {
+    if val.as_bytes().contains(&0x00) {
+        return None; // null bytes break the null-terminated encoding
+    }
     let mut buf = Vec::with_capacity(val.len() + 1 + 8);
     buf.extend_from_slice(val.as_bytes());
     buf.push(0x00); // null terminator
     buf.extend_from_slice(&rowid.to_be_bytes());
-    buf
+    Some(buf)
 }
 
 /// Integer prefix (no rowid) for scan_prefix matching.
@@ -1000,9 +1003,9 @@ mod tests {
 
     #[test]
     fn test_text_key_sort_order() {
-        let k_a = encode_index_key_text("apple", 1);
-        let k_b = encode_index_key_text("banana", 1);
-        let k_c = encode_index_key_text("cherry", 1);
+        let k_a = encode_index_key_text("apple", 1).unwrap();
+        let k_b = encode_index_key_text("banana", 1).unwrap();
+        let k_c = encode_index_key_text("cherry", 1).unwrap();
 
         assert!(k_a < k_b, "apple should sort before banana");
         assert!(k_b < k_c, "banana should sort before cherry");
@@ -1010,9 +1013,9 @@ mod tests {
 
     #[test]
     fn test_text_key_same_value_different_rowids() {
-        let k1 = encode_index_key_text("hello", 1);
-        let k2 = encode_index_key_text("hello", 2);
-        let k3 = encode_index_key_text("hello", 999);
+        let k1 = encode_index_key_text("hello", 1).unwrap();
+        let k2 = encode_index_key_text("hello", 2).unwrap();
+        let k3 = encode_index_key_text("hello", 999).unwrap();
 
         assert!(k1 < k2);
         assert!(k2 < k3);
@@ -1022,8 +1025,8 @@ mod tests {
     fn test_text_key_prefix_ordering() {
         // "ab" < "abc" because after matching "ab", the next byte of the
         // shorter key is 0x00 (null terminator) while "abc" has 'c' (0x63).
-        let k_short = encode_index_key_text("ab", 1);
-        let k_long = encode_index_key_text("abc", 1);
+        let k_short = encode_index_key_text("ab", 1).unwrap();
+        let k_long = encode_index_key_text("abc", 1).unwrap();
         assert!(k_short < k_long);
     }
 
@@ -1078,9 +1081,9 @@ mod tests {
     #[test]
     fn test_text_prefix_matching() {
         let prefix = encode_text_prefix("hello");
-        let key1 = encode_index_key_text("hello", 1);
-        let key2 = encode_index_key_text("hello", 999);
-        let key3 = encode_index_key_text("world", 1);
+        let key1 = encode_index_key_text("hello", 1).unwrap();
+        let key2 = encode_index_key_text("hello", 999).unwrap();
+        let key3 = encode_index_key_text("world", 1).unwrap();
 
         assert!(key1.starts_with(&prefix));
         assert!(key2.starts_with(&prefix));
@@ -1115,7 +1118,7 @@ mod tests {
 
     #[test]
     fn test_extract_rowid_text() {
-        let key = encode_index_key_text("hello", 42);
+        let key = encode_index_key_text("hello", 42).unwrap();
         assert_eq!(extract_rowid(Type::Text, &key), 42);
     }
 
@@ -1317,7 +1320,7 @@ mod tests {
 
             let words = ["apple", "banana", "cherry", "apple", "banana"];
             for (rowid, word) in words.iter().enumerate() {
-                let key = encode_index_key_text(word, rowid as u64);
+                let key = encode_index_key_text(word, rowid as u64).unwrap();
                 let mut tree = IndexTreeWriter::new(&mut guard, root);
                 root = tree.insert(&key).unwrap();
             }
@@ -1354,7 +1357,7 @@ mod tests {
             // Insert 100 different text values.
             for i in 0..100u64 {
                 let text = format!("item_{:04}", i);
-                let key = encode_index_key_text(&text, i);
+                let key = encode_index_key_text(&text, i).unwrap();
                 let mut tree = IndexTreeWriter::new(&mut guard, root);
                 root = tree.insert(&key).unwrap();
             }
@@ -1506,10 +1509,10 @@ mod tests {
             let mut tree = IndexTreeWriter::new(&mut guard, root);
 
             for rowid in 1..=10u64 {
-                tree.insert(&encode_index_key_text("alice", rowid)).unwrap();
+                tree.insert(&encode_index_key_text("alice", rowid).unwrap()).unwrap();
             }
             for rowid in 1..=7u64 {
-                tree.insert(&encode_index_key_text("bob", rowid)).unwrap();
+                tree.insert(&encode_index_key_text("bob", rowid).unwrap()).unwrap();
             }
             guard.commit().unwrap();
         }
@@ -1572,16 +1575,16 @@ mod tests {
 
     #[test]
     fn test_text_key_empty_string() {
-        let k_empty = encode_index_key_text("", 1);
-        let k_a = encode_index_key_text("a", 1);
+        let k_empty = encode_index_key_text("", 1).unwrap();
+        let k_a = encode_index_key_text("a", 1).unwrap();
         // Empty string: just null terminator + rowid
         assert!(k_empty < k_a, "empty string should sort before 'a'");
     }
 
     #[test]
     fn test_text_key_empty_string_different_rowids() {
-        let k1 = encode_index_key_text("", 1);
-        let k2 = encode_index_key_text("", 2);
+        let k1 = encode_index_key_text("", 1).unwrap();
+        let k2 = encode_index_key_text("", 2).unwrap();
         assert!(k1 < k2);
     }
 
@@ -1589,7 +1592,7 @@ mod tests {
     fn test_text_key_long_value() {
         // Long text value that would exceed branch key truncation limit (36 bytes)
         let long_text = "a".repeat(100);
-        let k = encode_index_key_text(&long_text, 1);
+        let k = encode_index_key_text(&long_text, 1).unwrap();
         // Should be: 100 bytes text + 1 null terminator + 8 rowid = 109 bytes
         assert_eq!(k.len(), 100 + 1 + 8);
         assert_eq!(extract_rowid(Type::Text, &k), 1);
@@ -1597,8 +1600,8 @@ mod tests {
 
     #[test]
     fn test_text_key_unicode() {
-        let k_emoji = encode_index_key_text("hello", 1);
-        let k_z = encode_index_key_text("zzz", 1);
+        let k_emoji = encode_index_key_text("hello", 1).unwrap();
+        let k_z = encode_index_key_text("zzz", 1).unwrap();
         // Both should round-trip through extract_rowid
         assert_eq!(extract_rowid(Type::Text, &k_emoji), 1);
         assert_eq!(extract_rowid(Type::Text, &k_z), 1);
@@ -1678,7 +1681,7 @@ mod tests {
             // Insert keys with long text values (exceeding the 36-byte branch key limit)
             for i in 0..50u64 {
                 let text = format!("long_key_value_that_exceeds_branch_limit_{:04}", i);
-                let key = encode_index_key_text(&text, i);
+                let key = encode_index_key_text(&text, i).unwrap();
                 let mut tree = IndexTreeWriter::new(&mut guard, root);
                 root = tree.insert(&key).unwrap();
             }

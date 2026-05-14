@@ -47,13 +47,14 @@ impl Row {
 
 /// Durability level for write operations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
 pub enum Durability {
     /// Fsync WAL on every commit. Survives power loss.
-    Immediate,
+    Immediate = 0,
     /// No fsync. Survives process crash (OS cache), not power loss.
-    Normal,
+    Normal = 1,
     /// No WAL writes at all. Fastest. Data may be lost on any crash.
-    None,
+    None = 2,
 }
 
 /// Per-table state protected by its own RwLock.
@@ -518,7 +519,7 @@ impl BoogyDb {
         Ok(())
     }
 
-    /// Commit a WriteGuard, writing before-images to the WAL as appropriate
+    /// Commit a WriteGuard, writing after-images to the WAL as appropriate
     /// for the durability level. This is the single commit path used by all
     /// write operations.
     fn commit_write(
@@ -548,7 +549,7 @@ impl BoogyDb {
                     } else {
                         *data
                     };
-                    wal.append_before_image(table_id, *page_no, &write_data)?;
+                    wal.append_page_image(table_id, *page_no, &write_data)?;
                 }
                 wal.sync()?;
             }
@@ -560,7 +561,7 @@ impl BoogyDb {
                     } else {
                         *data
                     };
-                    wal.append_before_image(table_id, *page_no, &write_data)?;
+                    wal.append_page_image(table_id, *page_no, &write_data)?;
                 }
             }
             Durability::None => {
@@ -1776,6 +1777,7 @@ impl BoogyDb {
         }
 
         let durability = self.durability();
+        let cipher = crate::crypto::Cipher::new(key);
         let (root, table_id) = {
             let mut guard = self.file.begin_write();
             if self.file.page_count() == 0 {
@@ -1788,11 +1790,13 @@ impl BoogyDb {
                 *next += 1;
                 id
             };
+            // The initial root page is an empty B+ tree leaf containing no user data.
+            // We commit with cipher: None because this batch also includes the system
+            // page (page 0), which must always be plaintext. Subsequent data writes
+            // use the cipher for encryption.
             Self::commit_write(guard, &self.file, &self.wal, durability, table_id, None)?;
             (root, table_id)
         };
-
-        let cipher = crate::crypto::Cipher::new(key);
         let mut meta = TableMeta::new(name.to_string(), table_id, columns.to_vec(), root);
         meta.encrypted = true;
         meta.cipher = Some(cipher.clone());
@@ -2709,7 +2713,7 @@ impl<'a> AcidTransaction<'a> {
                     } else {
                         *data
                     };
-                    wal.append_before_image(table_id, *page_no, &write_data)?;
+                    wal.append_page_image(table_id, *page_no, &write_data)?;
                 }
                 if matches!(durability, Durability::Immediate) {
                     wal.sync()?;

@@ -64,13 +64,17 @@ impl Wal {
         }
     }
 
-    /// Append a before-image of a page to the WAL.
-    pub fn append_before_image(
+    /// Append an after-image (redo-log entry) of a page to the WAL.
+    pub fn append_page_image(
         &mut self,
         table_id: u32,
         page_no: u32,
         page_data: &[u8; PAGE_SIZE],
     ) -> Result<u64> {
+        if self.entry_count == u32::MAX {
+            return Err(BoogyError::Corruption("WAL entry count overflow".into()));
+        }
+
         let seq = self.next_sequence;
         self.next_sequence += 1;
 
@@ -187,8 +191,8 @@ mod tests {
         let mut wal = Wal::open(tmp.path()).unwrap();
 
         let page = [0xAB; PAGE_SIZE];
-        wal.append_before_image(1, 5, &page).unwrap();
-        wal.append_before_image(2, 10, &[0xCD; PAGE_SIZE]).unwrap();
+        wal.append_page_image(1, 5, &page).unwrap();
+        wal.append_page_image(2, 10, &[0xCD; PAGE_SIZE]).unwrap();
         wal.sync().unwrap();
 
         let entries = wal.read_entries().unwrap();
@@ -205,7 +209,7 @@ mod tests {
         let tmp = NamedTempFile::new().unwrap();
         let mut wal = Wal::open(tmp.path()).unwrap();
 
-        wal.append_before_image(1, 0, &[0; PAGE_SIZE]).unwrap();
+        wal.append_page_image(1, 0, &[0; PAGE_SIZE]).unwrap();
         assert_eq!(wal.entry_count(), 1);
 
         wal.truncate().unwrap();
@@ -222,7 +226,7 @@ mod tests {
 
         {
             let mut wal = Wal::open(&path).unwrap();
-            wal.append_before_image(1, 0, &[0x42; PAGE_SIZE]).unwrap();
+            wal.append_page_image(1, 0, &[0x42; PAGE_SIZE]).unwrap();
             wal.sync().unwrap();
         }
 
@@ -241,7 +245,7 @@ mod tests {
 
         {
             let mut wal = Wal::open(&path).unwrap();
-            wal.append_before_image(1, 0, &[0; PAGE_SIZE]).unwrap();
+            wal.append_page_image(1, 0, &[0; PAGE_SIZE]).unwrap();
             wal.sync().unwrap();
         }
 

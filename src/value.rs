@@ -44,13 +44,32 @@ impl Value {
             (Value::Null, _) => Some(Ordering::Less),
             (_, Value::Null) => Some(Ordering::Greater),
             (Value::Integer(a), Value::Integer(b)) => Some(a.cmp(b)),
-            (Value::Real(a), Value::Real(b)) => a.partial_cmp(b),
+            (Value::Real(a), Value::Real(b)) => {
+                match (a.is_nan(), b.is_nan()) {
+                    (true, true) => Some(Ordering::Equal),
+                    (true, false) => Some(Ordering::Greater), // NaN sorts last
+                    (false, true) => Some(Ordering::Less),
+                    (false, false) => a.partial_cmp(b),
+                }
+            }
             (Value::Text(a), Value::Text(b)) => Some(a.cmp(b)),
             (Value::Boolean(a), Value::Boolean(b)) => Some(a.cmp(b)),
             (Value::Blob(a), Value::Blob(b)) => Some(a.cmp(b)),
             // Cross-type: integer/real comparison
-            (Value::Integer(a), Value::Real(b)) => (*a as f64).partial_cmp(b),
-            (Value::Real(a), Value::Integer(b)) => a.partial_cmp(&(*b as f64)),
+            (Value::Integer(a), Value::Real(b)) => {
+                if b.is_nan() {
+                    Some(Ordering::Less) // finite < NaN
+                } else {
+                    (*a as f64).partial_cmp(b)
+                }
+            }
+            (Value::Real(a), Value::Integer(b)) => {
+                if a.is_nan() {
+                    Some(Ordering::Greater) // NaN > finite
+                } else {
+                    a.partial_cmp(&(*b as f64))
+                }
+            }
             _ => None,
         }
     }

@@ -157,8 +157,11 @@ pub fn patch_row(data: &[u8], target_col_id: u16, new_val: &Value) -> Result<Vec
     for i in (col_idx + 1)..num_cols {
         let e = dir_start + i * 4;
         let old_off = u16::from_le_bytes(result[e + 2..e + 4].try_into().unwrap()) as i32;
-        let new_off = (old_off + size_diff as i32) as u16;
-        result[e + 2..e + 4].copy_from_slice(&new_off.to_le_bytes());
+        let new_off = old_off + size_diff as i32;
+        if new_off < 0 || new_off > u16::MAX as i32 {
+            return Err(BoogyError::Corruption("row offset overflow during patch".into()));
+        }
+        result[e + 2..e + 4].copy_from_slice(&(new_off as u16).to_le_bytes());
     }
 
     Ok(result)
