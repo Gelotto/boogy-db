@@ -16,6 +16,7 @@ pub enum BoogyError {
     TableLocked(String),
     DecryptionFailed(String),
     InvalidKey(String),
+    RowTooLarge(usize),
     PageFull,
     TransactionConflict,
 }
@@ -36,6 +37,7 @@ impl fmt::Display for BoogyError {
             BoogyError::TableLocked(t) => write!(f, "table '{t}' is locked"),
             BoogyError::DecryptionFailed(msg) => write!(f, "decryption failed: {msg}"),
             BoogyError::InvalidKey(msg) => write!(f, "invalid key: {msg}"),
+            BoogyError::RowTooLarge(sz) => write!(f, "row too large: {sz} bytes exceeds maximum"),
             BoogyError::PageFull => write!(f, "page full"),
             BoogyError::TransactionConflict => write!(f, "transaction conflict"),
         }
