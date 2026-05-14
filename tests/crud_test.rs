@@ -1852,3 +1852,386 @@ fn test_overflow_find_scan() {
     let result = db.find("t", FindOptions::default()).unwrap();
     assert_eq!(result.rows.len(), 5);
 }
+
+// ---------------------------------------------------------------------------
+// IN operator tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_in_filter_without_index() {
+    let (db, _dir) = create_db();
+    db.create_table("t", &[ColumnDef::new("v", Type::Integer)]).unwrap();
+    for i in 1..=10 {
+        db.insert("t", &[("v", Value::Integer(i))]).unwrap();
+    }
+
+    let opts = FindOptions {
+        filters: vec![Filter::in_list("v", vec![
+            Value::Integer(2), Value::Integer(5), Value::Integer(8),
+        ])],
+        include_total: true,
+        ..Default::default()
+    };
+    let result = db.find("t", opts).unwrap();
+    assert_eq!(result.total, Some(3));
+    assert_eq!(result.rows.len(), 3);
+    let mut vals: Vec<i64> = result.rows.iter()
+        .map(|r| match r.get("v").unwrap() { Value::Integer(i) => i, _ => panic!() })
+        .collect();
+    vals.sort();
+    assert_eq!(vals, vec![2, 5, 8]);
+}
+
+#[test]
+fn test_in_filter_with_index() {
+    let (db, _dir) = create_db();
+    db.create_table("t", &[ColumnDef::new("v", Type::Integer)]).unwrap();
+    db.create_index("t", "idx_v", "v").unwrap();
+    for i in 1..=20 {
+        db.insert("t", &[("v", Value::Integer(i))]).unwrap();
+    }
+
+    let opts = FindOptions {
+        filters: vec![Filter::in_list("v", vec![
+            Value::Integer(3), Value::Integer(7), Value::Integer(15), Value::Integer(20),
+        ])],
+        include_total: true,
+        ..Default::default()
+    };
+    let result = db.find("t", opts).unwrap();
+    assert_eq!(result.total, Some(4));
+    assert_eq!(result.rows.len(), 4);
+    let mut vals: Vec<i64> = result.rows.iter()
+        .map(|r| match r.get("v").unwrap() { Value::Integer(i) => i, _ => panic!() })
+        .collect();
+    vals.sort();
+    assert_eq!(vals, vec![3, 7, 15, 20]);
+}
+
+#[test]
+fn test_in_filter_with_text_index() {
+    let (db, _dir) = create_db();
+    db.create_table("t", &[
+        ColumnDef::new("name", Type::Text),
+        ColumnDef::new("age", Type::Integer),
+    ]).unwrap();
+    db.create_index("t", "idx_name", "name").unwrap();
+
+    let names = ["alice", "bob", "charlie", "dave", "eve"];
+    for (i, name) in names.iter().enumerate() {
+        db.insert("t", &[
+            ("name", Value::Text(name.to_string())),
+            ("age", Value::Integer(20 + i as i64)),
+        ]).unwrap();
+    }
+
+    let opts = FindOptions {
+        filters: vec![Filter::in_list("name", vec![
+            Value::Text("alice".into()),
+            Value::Text("charlie".into()),
+            Value::Text("eve".into()),
+        ])],
+        ..Default::default()
+    };
+    let result = db.find("t", opts).unwrap();
+    assert_eq!(result.rows.len(), 3);
+    let mut found_names: Vec<String> = result.rows.iter()
+        .map(|r| match r.get("name").unwrap() { Value::Text(s) => s, _ => panic!() })
+        .collect();
+    found_names.sort();
+    assert_eq!(found_names, vec!["alice", "charlie", "eve"]);
+}
+
+#[test]
+fn test_in_combined_with_other_filters() {
+    let (db, _dir) = create_db();
+    db.create_table("t", &[
+        ColumnDef::new("author_id", Type::Integer),
+        ColumnDef::new("status", Type::Text),
+    ]).unwrap();
+    db.create_index("t", "idx_author", "author_id").unwrap();
+
+    // Insert rows with author_id 1-5 and alternating status
+    for i in 1..=20 {
+        let status = if i % 2 == 0 { "active" } else { "inactive" };
+        db.insert("t", &[
+            ("author_id", Value::Integer(i % 5 + 1)),
+            ("status", Value::Text(status.into())),
+        ]).unwrap();
+    }
+
+    // author_id IN [1, 2, 3] AND status = 'active'
+    let opts = FindOptions {
+        filters: vec![
+            Filter::in_list("author_id", vec![
+                Value::Integer(1), Value::Integer(2), Value::Integer(3),
+            ]),
+            Filter::eq("status", "active"),
+        ],
+        include_total: true,
+        ..Default::default()
+    };
+    let result = db.find("t", opts).unwrap();
+    // All matching rows must have author_id in {1,2,3} AND status == "active"
+    for row in &result.rows {
+        let aid = match row.get("author_id").unwrap() { Value::Integer(i) => i, _ => panic!() };
+        assert!([1, 2, 3].contains(&aid));
+        assert_eq!(row.get("status").unwrap(), Value::Text("active".into()));
+    }
+    assert!(result.rows.len() > 0);
+}
+
+#[test]
+fn test_in_with_limit_offset_sort() {
+    let (db, _dir) = create_db();
+    db.create_table("t", &[ColumnDef::new("v", Type::Integer)]).unwrap();
+    for i in 1..=20 {
+        db.insert("t", &[("v", Value::Integer(i))]).unwrap();
+    }
+
+    // IN list = [1,5,10,15,20], sort desc, limit 3, offset 1
+    let opts = FindOptions {
+        filters: vec![Filter::in_list("v", vec![
+            Value::Integer(1), Value::Integer(5), Value::Integer(10),
+            Value::Integer(15), Value::Integer(20),
+        ])],
+        sort: vec![Sort::desc("v")],
+        limit: Some(3),
+        offset: Some(1),
+        include_total: true,
+        ..Default::default()
+    };
+    let result = db.find("t", opts).unwrap();
+    // sorted desc: [20, 15, 10, 5, 1], offset 1 -> [15, 10, 5], limit 3 -> [15, 10, 5]
+    assert_eq!(result.total, Some(5));
+    assert_eq!(result.rows.len(), 3);
+    let vals: Vec<i64> = result.rows.iter()
+        .map(|r| match r.get("v").unwrap() { Value::Integer(i) => i, _ => panic!() })
+        .collect();
+    assert_eq!(vals, vec![15, 10, 5]);
+}
+
+#[test]
+fn test_in_empty_list() {
+    let (db, _dir) = create_db();
+    db.create_table("t", &[ColumnDef::new("v", Type::Integer)]).unwrap();
+    db.create_index("t", "idx_v", "v").unwrap();
+    for i in 1..=5 {
+        db.insert("t", &[("v", Value::Integer(i))]).unwrap();
+    }
+
+    // Empty IN list should match nothing
+    let opts = FindOptions {
+        filters: vec![Filter::in_list("v", vec![])],
+        include_total: true,
+        ..Default::default()
+    };
+    let result = db.find("t", opts).unwrap();
+    assert_eq!(result.total, Some(0));
+    assert_eq!(result.rows.len(), 0);
+}
+
+#[test]
+fn test_in_empty_list_no_index() {
+    let (db, _dir) = create_db();
+    db.create_table("t", &[ColumnDef::new("v", Type::Integer)]).unwrap();
+    for i in 1..=5 {
+        db.insert("t", &[("v", Value::Integer(i))]).unwrap();
+    }
+
+    // Empty IN list without index
+    let opts = FindOptions {
+        filters: vec![Filter::in_list("v", vec![])],
+        include_total: true,
+        ..Default::default()
+    };
+    let result = db.find("t", opts).unwrap();
+    assert_eq!(result.total, Some(0));
+    assert_eq!(result.rows.len(), 0);
+}
+
+#[test]
+fn test_in_large_list() {
+    let (db, _dir) = create_db();
+    db.create_table("t", &[ColumnDef::new("v", Type::Integer)]).unwrap();
+    db.create_index("t", "idx_v", "v").unwrap();
+
+    // Insert 500 rows
+    for i in 1..=500 {
+        db.insert("t", &[("v", Value::Integer(i))]).unwrap();
+    }
+
+    // IN list with 150 values (every 3rd value from 1 to 450)
+    let in_values: Vec<Value> = (1..=450).step_by(3).map(|i| Value::Integer(i)).collect();
+    let expected_count = in_values.len();
+
+    let opts = FindOptions {
+        filters: vec![Filter::in_list("v", in_values)],
+        include_total: true,
+        ..Default::default()
+    };
+    let result = db.find("t", opts).unwrap();
+    assert_eq!(result.total, Some(expected_count as u64));
+    assert_eq!(result.rows.len(), expected_count);
+}
+
+#[test]
+fn test_in_with_acid_transaction() {
+    let (db, _dir) = create_db();
+    db.set_acid(true);
+    db.create_table("t", &[ColumnDef::new("v", Type::Integer)]).unwrap();
+
+    // Insert via ACID transaction
+    {
+        let mut tx = db.begin().unwrap();
+        for i in 1..=10 {
+            tx.insert("t", &[("v", Value::Integer(i))]).unwrap();
+        }
+        tx.commit().unwrap();
+    }
+
+    // Query with IN
+    let opts = FindOptions {
+        filters: vec![Filter::in_list("v", vec![
+            Value::Integer(2), Value::Integer(4), Value::Integer(6),
+        ])],
+        include_total: true,
+        ..Default::default()
+    };
+    let result = db.find("t", opts).unwrap();
+    assert_eq!(result.total, Some(3));
+    assert_eq!(result.rows.len(), 3);
+}
+
+#[test]
+fn test_in_within_acid_transaction() {
+    let (db, _dir) = create_db();
+    db.set_acid(true);
+    db.create_table("t", &[ColumnDef::new("v", Type::Integer)]).unwrap();
+
+    for i in 1..=10 {
+        db.insert("t", &[("v", Value::Integer(i))]).unwrap();
+    }
+
+    // Query inside ACID transaction (uses AcidTransaction::find)
+    {
+        let mut tx = db.begin().unwrap();
+        // Insert a few more rows
+        tx.insert("t", &[("v", Value::Integer(11))]).unwrap();
+        tx.insert("t", &[("v", Value::Integer(12))]).unwrap();
+
+        let opts = FindOptions {
+            filters: vec![Filter::in_list("v", vec![
+                Value::Integer(1), Value::Integer(11), Value::Integer(12),
+            ])],
+            include_total: true,
+            ..Default::default()
+        };
+        let result = tx.find("t", opts).unwrap();
+        assert_eq!(result.total, Some(3));
+        assert_eq!(result.rows.len(), 3);
+        tx.commit().unwrap();
+    }
+}
+
+#[test]
+fn test_in_count() {
+    let (db, _dir) = create_db();
+    db.create_table("t", &[ColumnDef::new("v", Type::Integer)]).unwrap();
+    for i in 1..=10 {
+        db.insert("t", &[("v", Value::Integer(i))]).unwrap();
+    }
+
+    let count = db.count("t", &[Filter::in_list("v", vec![
+        Value::Integer(2), Value::Integer(5), Value::Integer(8),
+    ])]).unwrap();
+    assert_eq!(count, 3);
+}
+
+#[test]
+fn test_in_nonexistent_values() {
+    let (db, _dir) = create_db();
+    db.create_table("t", &[ColumnDef::new("v", Type::Integer)]).unwrap();
+    for i in 1..=5 {
+        db.insert("t", &[("v", Value::Integer(i))]).unwrap();
+    }
+
+    // All values in the IN list are absent
+    let opts = FindOptions {
+        filters: vec![Filter::in_list("v", vec![
+            Value::Integer(100), Value::Integer(200),
+        ])],
+        include_total: true,
+        ..Default::default()
+    };
+    let result = db.find("t", opts).unwrap();
+    assert_eq!(result.total, Some(0));
+    assert_eq!(result.rows.len(), 0);
+}
+
+#[test]
+fn test_in_duplicate_values_in_list() {
+    let (db, _dir) = create_db();
+    db.create_table("t", &[ColumnDef::new("v", Type::Integer)]).unwrap();
+    db.create_index("t", "idx_v", "v").unwrap();
+    for i in 1..=5 {
+        db.insert("t", &[("v", Value::Integer(i))]).unwrap();
+    }
+
+    // IN list has duplicates -- should still return each matching row only once
+    let opts = FindOptions {
+        filters: vec![Filter::in_list("v", vec![
+            Value::Integer(3), Value::Integer(3), Value::Integer(3),
+        ])],
+        include_total: true,
+        ..Default::default()
+    };
+    let result = db.find("t", opts).unwrap();
+    assert_eq!(result.total, Some(1));
+    assert_eq!(result.rows.len(), 1);
+}
+
+#[test]
+fn test_in_delete_where() {
+    let (db, _dir) = create_db();
+    db.create_table("t", &[ColumnDef::new("v", Type::Integer)]).unwrap();
+    for i in 1..=10 {
+        db.insert("t", &[("v", Value::Integer(i))]).unwrap();
+    }
+
+    let deleted = db.delete_where("t", &[Filter::in_list("v", vec![
+        Value::Integer(2), Value::Integer(4), Value::Integer(6),
+    ])]).unwrap();
+    assert_eq!(deleted, 3);
+    assert_eq!(db.count("t", &[]).unwrap(), 7);
+}
+
+#[test]
+fn test_in_update_where() {
+    let (db, _dir) = create_db();
+    db.create_table("t", &[
+        ColumnDef::new("v", Type::Integer),
+        ColumnDef::new("tag", Type::Text),
+    ]).unwrap();
+    for i in 1..=10 {
+        db.insert("t", &[
+            ("v", Value::Integer(i)),
+            ("tag", Value::Text("old".into())),
+        ]).unwrap();
+    }
+
+    let updated = db.update_where(
+        "t",
+        &[Filter::in_list("v", vec![Value::Integer(1), Value::Integer(5), Value::Integer(10)])],
+        &[("tag", Value::Text("new".into()))],
+    ).unwrap();
+    assert_eq!(updated, 3);
+
+    // Verify the updated rows
+    let opts = FindOptions {
+        filters: vec![Filter::eq("tag", "new")],
+        ..Default::default()
+    };
+    let result = db.find("t", opts).unwrap();
+    assert_eq!(result.rows.len(), 3);
+}

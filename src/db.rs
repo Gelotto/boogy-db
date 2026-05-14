@@ -1051,9 +1051,9 @@ impl BoogyDb {
         // Only when: no sort (ordering requires full collection) and not requesting total.
         let can_short_circuit = opts.sort.is_empty() && !opts.include_total;
 
-        // 3. Check for index-accelerated path (Eq filter on an indexed column).
+        // 3. Check for index-accelerated path (Eq or In filter on an indexed column).
         let index_candidate = opts.filters.iter().find(|f| {
-            f.op == FilterOp::Eq
+            (f.op == FilterOp::Eq || f.op == FilterOp::In)
                 && state.meta.find_index_for_column(&f.column).is_some()
         });
 
@@ -1070,32 +1070,58 @@ impl BoogyDb {
                 .map(|c| c.col_type)
                 .unwrap();
 
-            let prefix = match index::encode_value_prefix(col_type, &idx_filter.value) {
-                Some(p) => p,
-                None => return Ok(FindResult { rows: Vec::new(), total: if opts.include_total { Some(0) } else { None } }),
-            };
-
-            // Compute how many index entries we need.
-            let need = if can_short_circuit {
-                let off = opts.offset.unwrap_or(0) as usize;
-                let lim = opts.limit.unwrap_or(u32::MAX) as usize;
-                Some(off.saturating_add(lim))
-            } else {
-                None // need all of them
-            };
-
             let idx_reader = IndexTreeReader::new(&self.file, idx_meta.root_page);
-            let keys = if let Some(n) = need {
-                idx_reader.scan_prefix_limit(&prefix, n)?
-            } else {
-                idx_reader.scan_prefix(&prefix)?
-            };
 
-            let mut matching_rowids: Vec<u64> = keys
-                .iter()
-                .map(|k| index::extract_rowid(col_type, k))
-                .collect();
-            matching_rowids.sort_unstable();
+            // Collect matching rowids from index — Eq uses single prefix, In scans each value.
+            let matching_rowids = if idx_filter.op == FilterOp::In {
+                let values = match idx_filter.in_values {
+                    Some(ref v) => v,
+                    None => return Ok(FindResult { rows: Vec::new(), total: if opts.include_total { Some(0) } else { None } }),
+                };
+                if values.is_empty() {
+                    return Ok(FindResult { rows: Vec::new(), total: if opts.include_total { Some(0) } else { None } });
+                }
+                let mut rowids = Vec::new();
+                for val in values {
+                    if let Some(prefix) = index::encode_value_prefix(col_type, val) {
+                        let keys = idx_reader.scan_prefix(&prefix)?;
+                        for k in &keys {
+                            rowids.push(index::extract_rowid(col_type, k));
+                        }
+                    }
+                }
+                rowids.sort_unstable();
+                rowids.dedup();
+                rowids
+            } else {
+                // Eq path (original logic)
+                let prefix = match index::encode_value_prefix(col_type, &idx_filter.value) {
+                    Some(p) => p,
+                    None => return Ok(FindResult { rows: Vec::new(), total: if opts.include_total { Some(0) } else { None } }),
+                };
+
+                // Compute how many index entries we need.
+                let need = if can_short_circuit {
+                    let off = opts.offset.unwrap_or(0) as usize;
+                    let lim = opts.limit.unwrap_or(u32::MAX) as usize;
+                    Some(off.saturating_add(lim))
+                } else {
+                    None // need all of them
+                };
+
+                let keys = if let Some(n) = need {
+                    idx_reader.scan_prefix_limit(&prefix, n)?
+                } else {
+                    idx_reader.scan_prefix(&prefix)?
+                };
+
+                let mut rowids: Vec<u64> = keys
+                    .iter()
+                    .map(|k| index::extract_rowid(col_type, k))
+                    .collect();
+                rowids.sort_unstable();
+                rowids
+            };
 
             // Batch-fetch rows via leaf-chain walk (much faster than N individual searches)
             let btree_reader = BTreeReader::new(&self.file, state.meta.root_page);
@@ -1111,7 +1137,7 @@ impl BoogyDb {
                     let passes = opts.filters.iter().all(|f| {
                         if let Some(col_id) = state.meta.col_id(&f.column) {
                             if let Ok(Some(raw)) = row::extract_column_raw(bytes, col_id) {
-                                if let Some(result) = crate::filter::eval_filter_raw(raw, &f.op, &f.value) {
+                                if let Some(result) = crate::filter::eval_filter_raw_full(raw, f) {
                                     return result;
                                 }
                             }
@@ -1132,12 +1158,7 @@ impl BoogyDb {
 
             // Determine total if requested.
             let total: Option<u64> = if opts.include_total {
-                if need.is_some() {
-                    // We limited the scan, so get the real count from the index.
-                    Some(idx_reader.count_prefix(&prefix)?)
-                } else {
-                    Some(rows.len() as u64)
-                }
+                Some(rows.len() as u64)
             } else {
                 None
             };
@@ -1151,8 +1172,8 @@ impl BoogyDb {
             }
 
             (rows, total)
-        } else if opts.filters.len() == 1 {
-            // Single filter: use scan_filtered (extract_column on raw bytes, no full decode)
+        } else if opts.filters.len() == 1 && opts.filters[0].op != FilterOp::In {
+            // Single filter (non-IN): use scan_filtered (extract_column on raw bytes, no full decode)
             let f = &opts.filters[0];
             if let Some(col_id) = state.meta.col_id(&f.column) {
                 let reader = BTreeReader::new(&self.file, state.meta.root_page);
@@ -1201,7 +1222,7 @@ impl BoogyDb {
                 .collect();
             (matching, total)
         } else {
-            // Multi-filter: scan all, raw-byte filter, lazy Row
+            // Multi-filter (or single IN filter): scan all, raw-byte filter, lazy Row
             let reader = BTreeReader::new(&self.file, state.meta.root_page);
             let all = reader.scan_all()?;
             let col_names = state.meta.col_names.clone();
@@ -1210,7 +1231,7 @@ impl BoogyDb {
                 let passes = opts.filters.iter().all(|f| {
                     if let Some(col_id) = state.meta.col_id(&f.column) {
                         if let Ok(Some(raw)) = row::extract_column_raw(bytes, col_id) {
-                            if let Some(result) = crate::filter::eval_filter_raw(raw, &f.op, &f.value) {
+                            if let Some(result) = crate::filter::eval_filter_raw_full(raw, f) {
                                 return result;
                             }
                         }
@@ -1302,8 +1323,8 @@ impl BoogyDb {
             }
         }
 
-        // Single filter: use count_filtered (extract_column on raw bytes)
-        if filters.len() == 1 {
+        // Single filter (non-IN): use count_filtered (extract_column on raw bytes)
+        if filters.len() == 1 && filters[0].op != FilterOp::In {
             let f = &filters[0];
             if let Some(col_id) = state.meta.col_id(&f.column) {
                 let reader = BTreeReader::new(&self.file, state.meta.root_page);
@@ -1312,7 +1333,7 @@ impl BoogyDb {
             return Ok(0);
         }
 
-        // Multi-filter: scan all, raw-byte filter
+        // Multi-filter (or IN filter): scan all, raw-byte filter
         let reader = BTreeReader::new(&self.file, state.meta.root_page);
         let all = reader.scan_all()?;
 
@@ -1321,7 +1342,7 @@ impl BoogyDb {
             let passes = filters.iter().all(|f| {
                 if let Some(col_id) = state.meta.col_id(&f.column) {
                     if let Ok(Some(raw)) = row::extract_column_raw(bytes, col_id) {
-                        if let Some(result) = crate::filter::eval_filter_raw(raw, &f.op, &f.value) {
+                        if let Some(result) = crate::filter::eval_filter_raw_full(raw, f) {
                             return result;
                         }
                     }
@@ -1499,7 +1520,7 @@ impl BoogyDb {
                     if let Some(col_id) = filter_col_ids[i] {
                         if let Ok(Some(raw)) = row::extract_column_raw(data, col_id) {
                             if let Some(result) =
-                                crate::filter::eval_filter_raw(raw, &f.op, &f.value)
+                                crate::filter::eval_filter_raw_full(raw, f)
                             {
                                 return result;
                             }
@@ -1613,7 +1634,7 @@ impl BoogyDb {
                     if let Some(col_id) = filter_col_ids[i] {
                         if let Ok(Some(raw)) = row::extract_column_raw(data, col_id) {
                             if let Some(result) =
-                                crate::filter::eval_filter_raw(raw, &f.op, &f.value)
+                                crate::filter::eval_filter_raw_full(raw, f)
                             {
                                 return result;
                             }
@@ -2456,7 +2477,7 @@ impl<'a> AcidTransaction<'a> {
             let passes = opts.filters.iter().all(|f| {
                 if let Some(col_id) = col_name_to_id.get(&f.column).copied() {
                     if let Ok(Some(raw)) = row::extract_column_raw(bytes, col_id) {
-                        if let Some(result) = crate::filter::eval_filter_raw(raw, &f.op, &f.value) {
+                        if let Some(result) = crate::filter::eval_filter_raw_full(raw, f) {
                             return result;
                         }
                     }
@@ -2531,7 +2552,7 @@ impl<'a> AcidTransaction<'a> {
             let passes = filters.iter().all(|f| {
                 if let Some(col_id) = col_name_to_id.get(&f.column).copied() {
                     if let Ok(Some(raw)) = row::extract_column_raw(bytes, col_id) {
-                        if let Some(result) = crate::filter::eval_filter_raw(raw, &f.op, &f.value) {
+                        if let Some(result) = crate::filter::eval_filter_raw_full(raw, f) {
                             return result;
                         }
                     }
@@ -2588,7 +2609,7 @@ impl<'a> AcidTransaction<'a> {
                 filters.iter().all(|f| {
                     if let Some(col_id) = col_name_to_id.get(&f.column).copied() {
                         if let Ok(Some(raw)) = row::extract_column_raw(bytes, col_id) {
-                            if let Some(result) = crate::filter::eval_filter_raw(raw, &f.op, &f.value) {
+                            if let Some(result) = crate::filter::eval_filter_raw_full(raw, f) {
                                 return result;
                             }
                         }
@@ -2633,7 +2654,7 @@ impl<'a> AcidTransaction<'a> {
                 filters.iter().all(|f| {
                     if let Some(col_id) = col_name_to_id.get(&f.column).copied() {
                         if let Ok(Some(raw)) = row::extract_column_raw(bytes, col_id) {
-                            if let Some(result) = crate::filter::eval_filter_raw(raw, &f.op, &f.value) {
+                            if let Some(result) = crate::filter::eval_filter_raw_full(raw, f) {
                                 return result;
                             }
                         }

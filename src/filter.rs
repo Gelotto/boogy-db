@@ -9,6 +9,7 @@ pub enum FilterOp {
     Le,
     Gt,
     Ge,
+    In,
 }
 
 #[derive(Debug, Clone)]
@@ -16,30 +17,41 @@ pub struct Filter {
     pub column: String,
     pub op: FilterOp,
     pub value: Value,
+    /// Only used when op == In. Contains the list of values to match against.
+    pub in_values: Option<Vec<Value>>,
 }
 
 impl Filter {
     pub fn eq(column: impl Into<String>, value: impl Into<Value>) -> Self {
-        Self { column: column.into(), op: FilterOp::Eq, value: value.into() }
+        Self { column: column.into(), op: FilterOp::Eq, value: value.into(), in_values: None }
     }
     pub fn ne(column: impl Into<String>, value: impl Into<Value>) -> Self {
-        Self { column: column.into(), op: FilterOp::Ne, value: value.into() }
+        Self { column: column.into(), op: FilterOp::Ne, value: value.into(), in_values: None }
     }
     pub fn lt(column: impl Into<String>, value: impl Into<Value>) -> Self {
-        Self { column: column.into(), op: FilterOp::Lt, value: value.into() }
+        Self { column: column.into(), op: FilterOp::Lt, value: value.into(), in_values: None }
     }
     pub fn le(column: impl Into<String>, value: impl Into<Value>) -> Self {
-        Self { column: column.into(), op: FilterOp::Le, value: value.into() }
+        Self { column: column.into(), op: FilterOp::Le, value: value.into(), in_values: None }
     }
     pub fn gt(column: impl Into<String>, value: impl Into<Value>) -> Self {
-        Self { column: column.into(), op: FilterOp::Gt, value: value.into() }
+        Self { column: column.into(), op: FilterOp::Gt, value: value.into(), in_values: None }
     }
     pub fn ge(column: impl Into<String>, value: impl Into<Value>) -> Self {
-        Self { column: column.into(), op: FilterOp::Ge, value: value.into() }
+        Self { column: column.into(), op: FilterOp::Ge, value: value.into(), in_values: None }
+    }
+    pub fn in_list(column: impl Into<String>, values: Vec<Value>) -> Self {
+        Self { column: column.into(), op: FilterOp::In, value: Value::Null, in_values: Some(values) }
     }
 
     /// Evaluate this filter against a value.
     pub fn matches(&self, actual: &Value) -> bool {
+        if self.op == FilterOp::In {
+            if let Some(ref values) = self.in_values {
+                return values.iter().any(|v| actual.compare(v) == Some(Ordering::Equal));
+            }
+            return false;
+        }
         let cmp = actual.compare(&self.value);
         match cmp {
             Some(ord) => match self.op {
@@ -49,6 +61,7 @@ impl Filter {
                 FilterOp::Le => ord != Ordering::Greater,
                 FilterOp::Gt => ord == Ordering::Greater,
                 FilterOp::Ge => ord != Ordering::Less,
+                FilterOp::In => unreachable!(),
             },
             None => false, // incompatible types don't match
         }
@@ -56,7 +69,11 @@ impl Filter {
 }
 
 /// Evaluate a filter op directly without a Filter struct. Used by B+ tree scan_filtered.
+/// Note: FilterOp::In is not supported here (no values list). Use `eval_filter_in` instead.
 pub fn eval_filter_op(actual: &Value, op: &FilterOp, expected: &Value) -> bool {
+    if *op == FilterOp::In {
+        return false; // In requires values list; caller should use eval_filter_in or Filter::matches
+    }
     match actual.compare(expected) {
         Some(ord) => match op {
             FilterOp::Eq => ord == Ordering::Equal,
@@ -65,15 +82,24 @@ pub fn eval_filter_op(actual: &Value, op: &FilterOp, expected: &Value) -> bool {
             FilterOp::Le => ord != Ordering::Greater,
             FilterOp::Gt => ord == Ordering::Greater,
             FilterOp::Ge => ord != Ordering::Less,
+            FilterOp::In => unreachable!(),
         },
         None => false,
     }
+}
+
+/// Evaluate an IN filter against a decoded value and a list of candidate values.
+pub fn eval_filter_in(actual: &Value, values: &[Value]) -> bool {
+    values.iter().any(|v| actual.compare(v) == Some(Ordering::Equal))
 }
 
 /// Evaluate a filter against raw column bytes (type_tag + value_bytes).
 /// Avoids decoding/allocating a Value on the hot path.
 /// Returns None if comparison can't be done in raw mode (falls back to decode).
 pub fn eval_filter_raw(raw: &[u8], op: &FilterOp, expected: &Value) -> Option<bool> {
+    if *op == FilterOp::In {
+        return None; // In requires values list; use eval_filter_raw_in instead
+    }
     if raw.is_empty() {
         return None;
     }
@@ -110,9 +136,73 @@ pub fn eval_filter_raw(raw: &[u8], op: &FilterOp, expected: &Value) -> Option<bo
                 FilterOp::Le => ord != std::cmp::Ordering::Greater,
                 FilterOp::Gt => ord == std::cmp::Ordering::Greater,
                 FilterOp::Ge => ord != std::cmp::Ordering::Less,
+                FilterOp::In => unreachable!(),
             })
         }
         _ => None, // fall back to decode path
+    }
+}
+
+/// Evaluate an IN filter against raw column bytes and a list of candidate values.
+/// Zero-copy fast path for integer IN (compare i64 bytes) and text IN (compare raw bytes).
+/// Returns None for unsupported types to fall back to decode path.
+pub fn eval_filter_raw_in(raw: &[u8], values: &[Value]) -> Option<bool> {
+    if raw.is_empty() || values.is_empty() {
+        return Some(false);
+    }
+    let tag = raw[0];
+    match tag {
+        // Integer IN: decode actual i64 once, compare against each value
+        2 => {
+            if raw.len() < 9 { return None; }
+            let actual_i = i64::from_le_bytes(raw[1..9].try_into().unwrap());
+            // Check if all values are integers (otherwise fall back)
+            for v in values {
+                match v {
+                    Value::Integer(i) => {
+                        if actual_i == *i {
+                            return Some(true);
+                        }
+                    }
+                    _ => return None, // mixed types, fall back to decode
+                }
+            }
+            Some(false)
+        }
+        // Text IN: decode actual text length once, compare raw bytes against each value
+        1 => {
+            if raw.len() < 5 { return None; }
+            let len = u32::from_le_bytes(raw[1..5].try_into().unwrap()) as usize;
+            if raw.len() < 5 + len { return None; }
+            let actual_bytes = &raw[5..5 + len];
+            for v in values {
+                match v {
+                    Value::Text(s) => {
+                        let expected_bytes = s.as_bytes();
+                        if len == expected_bytes.len() && actual_bytes == expected_bytes {
+                            return Some(true);
+                        }
+                    }
+                    _ => return None, // mixed types, fall back to decode
+                }
+            }
+            Some(false)
+        }
+        _ => None, // fall back to decode path
+    }
+}
+
+/// Evaluate a Filter against raw column bytes. Handles both regular ops and IN.
+/// Returns None if the raw path can't handle it (caller should decode and use matches()).
+pub fn eval_filter_raw_full(raw: &[u8], filter: &Filter) -> Option<bool> {
+    if filter.op == FilterOp::In {
+        if let Some(ref values) = filter.in_values {
+            eval_filter_raw_in(raw, values)
+        } else {
+            Some(false)
+        }
+    } else {
+        eval_filter_raw(raw, &filter.op, &filter.value)
     }
 }
 
@@ -371,5 +461,139 @@ mod tests {
         assert!(f.matches(&Value::Integer(5)));
         assert!(!f.matches(&Value::Integer(10)));
         assert!(!f.matches(&Value::Integer(15)));
+    }
+
+    // --- IN operator tests ---
+
+    #[test]
+    fn test_in_list_integers() {
+        let f = Filter::in_list("v", vec![Value::Integer(1), Value::Integer(3), Value::Integer(5)]);
+        assert!(f.matches(&Value::Integer(1)));
+        assert!(f.matches(&Value::Integer(3)));
+        assert!(f.matches(&Value::Integer(5)));
+        assert!(!f.matches(&Value::Integer(2)));
+        assert!(!f.matches(&Value::Integer(4)));
+    }
+
+    #[test]
+    fn test_in_list_texts() {
+        let f = Filter::in_list("v", vec![
+            Value::Text("alice".into()),
+            Value::Text("bob".into()),
+        ]);
+        assert!(f.matches(&Value::Text("alice".into())));
+        assert!(f.matches(&Value::Text("bob".into())));
+        assert!(!f.matches(&Value::Text("charlie".into())));
+    }
+
+    #[test]
+    fn test_in_list_reals() {
+        let f = Filter::in_list("v", vec![Value::Real(1.5), Value::Real(2.5)]);
+        assert!(f.matches(&Value::Real(1.5)));
+        assert!(f.matches(&Value::Real(2.5)));
+        assert!(!f.matches(&Value::Real(3.5)));
+    }
+
+    #[test]
+    fn test_in_list_booleans() {
+        let f = Filter::in_list("v", vec![Value::Boolean(true)]);
+        assert!(f.matches(&Value::Boolean(true)));
+        assert!(!f.matches(&Value::Boolean(false)));
+    }
+
+    #[test]
+    fn test_in_list_empty() {
+        let f = Filter::in_list("v", vec![]);
+        assert!(!f.matches(&Value::Integer(1)));
+        assert!(!f.matches(&Value::Text("hello".into())));
+        assert!(!f.matches(&Value::Null));
+    }
+
+    #[test]
+    fn test_in_list_single_element() {
+        // Single-element in_list should behave like Eq
+        let f_in = Filter::in_list("v", vec![Value::Integer(42)]);
+        let f_eq = Filter::eq("v", 42i64);
+        for val in [Value::Integer(42), Value::Integer(0), Value::Integer(100)] {
+            assert_eq!(f_in.matches(&val), f_eq.matches(&val));
+        }
+    }
+
+    #[test]
+    fn test_in_list_no_values_field() {
+        // A malformed IN filter with in_values = None should match nothing
+        let f = Filter { column: "v".into(), op: FilterOp::In, value: Value::Null, in_values: None };
+        assert!(!f.matches(&Value::Integer(1)));
+    }
+
+    // --- eval_filter_raw_in tests ---
+
+    #[test]
+    fn test_eval_filter_raw_in_integers() {
+        use crate::row::encode_value_to_vec;
+        let raw = encode_value_to_vec(&Value::Integer(42));
+        let values = vec![Value::Integer(10), Value::Integer(42), Value::Integer(99)];
+        assert_eq!(eval_filter_raw_in(&raw, &values), Some(true));
+
+        let values_miss = vec![Value::Integer(10), Value::Integer(20)];
+        assert_eq!(eval_filter_raw_in(&raw, &values_miss), Some(false));
+    }
+
+    #[test]
+    fn test_eval_filter_raw_in_texts() {
+        use crate::row::encode_value_to_vec;
+        let raw = encode_value_to_vec(&Value::Text("hello".into()));
+        let values = vec![Value::Text("world".into()), Value::Text("hello".into())];
+        assert_eq!(eval_filter_raw_in(&raw, &values), Some(true));
+
+        let values_miss = vec![Value::Text("world".into()), Value::Text("foo".into())];
+        assert_eq!(eval_filter_raw_in(&raw, &values_miss), Some(false));
+    }
+
+    #[test]
+    fn test_eval_filter_raw_in_empty_values() {
+        use crate::row::encode_value_to_vec;
+        let raw = encode_value_to_vec(&Value::Integer(42));
+        assert_eq!(eval_filter_raw_in(&raw, &[]), Some(false));
+    }
+
+    #[test]
+    fn test_eval_filter_raw_in_unsupported_type_falls_back() {
+        use crate::row::encode_value_to_vec;
+        // Real not supported in raw IN path
+        let raw = encode_value_to_vec(&Value::Real(3.14));
+        let values = vec![Value::Real(3.14)];
+        assert_eq!(eval_filter_raw_in(&raw, &values), None);
+    }
+
+    #[test]
+    fn test_eval_filter_raw_in_mixed_types_falls_back() {
+        use crate::row::encode_value_to_vec;
+        // Integer raw with Text values -> falls back
+        let raw = encode_value_to_vec(&Value::Integer(42));
+        let values = vec![Value::Text("42".into())];
+        assert_eq!(eval_filter_raw_in(&raw, &values), None);
+    }
+
+    // --- eval_filter_raw_full tests ---
+
+    #[test]
+    fn test_eval_filter_raw_full_regular_op() {
+        use crate::row::encode_value_to_vec;
+        let raw = encode_value_to_vec(&Value::Integer(42));
+        let f = Filter::eq("v", 42i64);
+        assert_eq!(eval_filter_raw_full(&raw, &f), Some(true));
+        let f = Filter::eq("v", 43i64);
+        assert_eq!(eval_filter_raw_full(&raw, &f), Some(false));
+    }
+
+    #[test]
+    fn test_eval_filter_raw_full_in_op() {
+        use crate::row::encode_value_to_vec;
+        let raw = encode_value_to_vec(&Value::Integer(42));
+        let f = Filter::in_list("v", vec![Value::Integer(10), Value::Integer(42)]);
+        assert_eq!(eval_filter_raw_full(&raw, &f), Some(true));
+        let f = Filter::in_list("v", vec![Value::Integer(10), Value::Integer(20)]);
+        assert_eq!(eval_filter_raw_full(&raw, &f), Some(false));
     }
 }
