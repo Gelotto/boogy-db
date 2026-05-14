@@ -14,6 +14,11 @@ use crate::table::{IndexMeta, TableMeta};
 use crate::value::{ColumnDef, Type, Value};
 use crate::wal::Wal;
 
+#[cfg(feature = "vector")]
+use crate::vector::VectorCollection;
+#[cfg(feature = "vector")]
+use crate::vector::{VectorCollectionOptions, VectorResult, VectorSearchOptions};
+
 /// A row returned from queries. Wraps raw bytes; decodes columns on demand.
 #[derive(Debug, Clone)]
 pub struct Row {
@@ -77,6 +82,8 @@ pub struct BoogyDb {
     path: PathBuf,
     table_ciphers: RwLock<HashMap<u32, Arc<crate::crypto::Cipher>>>,
     max_row_size: std::sync::atomic::AtomicU32,
+    #[cfg(feature = "vector")]
+    vector_collections: RwLock<HashMap<(String, String), VectorCollection>>,
 }
 
 // System page (page 0) format:
@@ -472,6 +479,8 @@ impl BoogyDb {
             path,
             table_ciphers: RwLock::new(HashMap::new()),
             max_row_size: std::sync::atomic::AtomicU32::new(10 * 1024 * 1024),
+            #[cfg(feature = "vector")]
+            vector_collections: RwLock::new(HashMap::new()),
         })
     }
 
@@ -1944,6 +1953,211 @@ impl BoogyDb {
     fn get_branch_child_from_page(page: &Page, idx: usize) -> u32 {
         let offset = 16 + idx * 12; // PAGE_HEADER_SIZE + idx * BRANCH_ENTRY_SIZE
         u32::from_le_bytes(page.data[offset..offset + 4].try_into().unwrap())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Vector search API
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "vector")]
+impl BoogyDb {
+    /// Path for a vector collection's data file.
+    fn vector_file_path(&self, table: &str, collection: &str) -> PathBuf {
+        self.path.with_extension(format!("{table}.{collection}.vec"))
+    }
+
+    /// Path for a vector collection's WAL file.
+    fn vector_wal_path(&self, table: &str, collection: &str) -> PathBuf {
+        self.path.with_extension(format!("{table}.{collection}.vec.wal"))
+    }
+
+    /// Build the HashMap key for a vector collection.
+    fn collection_key(table: &str, collection: &str) -> (String, String) {
+        (table.to_string(), collection.to_string())
+    }
+
+    /// Create a new vector collection attached to an existing table.
+    pub fn create_vector_collection(
+        &self,
+        table: &str,
+        name: &str,
+        options: &VectorCollectionOptions,
+    ) -> Result<()> {
+        // Verify table exists.
+        {
+            let tables = self.tables.read().unwrap();
+            if !tables.contains_key(table) {
+                return Err(BoogyError::TableNotFound(table.to_string()));
+            }
+        }
+
+        let key = Self::collection_key(table, name);
+        let mut collections = self.vector_collections.write().unwrap();
+
+        if collections.contains_key(&key) {
+            return Err(BoogyError::VectorCollectionExists(format!(
+                "{table}.{name}"
+            )));
+        }
+
+        let vec_path = self.vector_file_path(table, name);
+        let wal_path = self.vector_wal_path(table, name);
+        let collection = VectorCollection::create(vec_path, wal_path, options)?;
+        collections.insert(key, collection);
+
+        Ok(())
+    }
+
+    /// Drop a vector collection, removing its files from disk.
+    pub fn drop_vector_collection(&self, table: &str, name: &str) -> Result<()> {
+        let key = Self::collection_key(table, name);
+        let mut collections = self.vector_collections.write().unwrap();
+
+        if collections.remove(&key).is_none() {
+            return Err(BoogyError::VectorCollectionNotFound(format!(
+                "{table}.{name}"
+            )));
+        }
+
+        // Remove files from disk.
+        let vec_path = self.vector_file_path(table, name);
+        let wal_path = self.vector_wal_path(table, name);
+        let _ = std::fs::remove_file(vec_path);
+        let _ = std::fs::remove_file(wal_path);
+
+        Ok(())
+    }
+
+    /// Insert a vector for a row in the given collection.
+    pub fn vector_insert(
+        &self,
+        table: &str,
+        collection: &str,
+        rowid: u64,
+        vector: &[f32],
+    ) -> Result<()> {
+        // Verify rowid exists in the table.
+        if self.get(table, rowid)?.is_none() {
+            return Err(BoogyError::RowNotFound(rowid.to_string()));
+        }
+
+        let key = Self::collection_key(table, collection);
+        let mut collections = self.vector_collections.write().unwrap();
+        let coll = collections.get_mut(&key).ok_or_else(|| {
+            BoogyError::VectorCollectionNotFound(format!("{table}.{collection}"))
+        })?;
+
+        let fsync = self.durability() == Durability::Immediate;
+        coll.insert(rowid, vector, fsync)?;
+
+        Ok(())
+    }
+
+    /// Batch-insert vectors for multiple rows.
+    pub fn vector_insert_batch(
+        &self,
+        table: &str,
+        collection: &str,
+        entries: &[(u64, Vec<f32>)],
+    ) -> Result<()> {
+        let key = Self::collection_key(table, collection);
+        let mut collections = self.vector_collections.write().unwrap();
+        let coll = collections.get_mut(&key).ok_or_else(|| {
+            BoogyError::VectorCollectionNotFound(format!("{table}.{collection}"))
+        })?;
+
+        let fsync = self.durability() == Durability::Immediate;
+        let last_idx = entries.len().saturating_sub(1);
+        for (i, (rowid, vector)) in entries.iter().enumerate() {
+            let do_fsync = fsync && i == last_idx;
+            coll.insert(*rowid, vector, do_fsync)?;
+        }
+
+        Ok(())
+    }
+
+    /// Update the vector for a row in the given collection.
+    pub fn vector_update(
+        &self,
+        table: &str,
+        collection: &str,
+        rowid: u64,
+        vector: &[f32],
+    ) -> Result<()> {
+        let key = Self::collection_key(table, collection);
+        let mut collections = self.vector_collections.write().unwrap();
+        let coll = collections.get_mut(&key).ok_or_else(|| {
+            BoogyError::VectorCollectionNotFound(format!("{table}.{collection}"))
+        })?;
+
+        let fsync = self.durability() == Durability::Immediate;
+        coll.update(rowid, vector, fsync)?;
+
+        Ok(())
+    }
+
+    /// Delete a vector from the given collection.
+    pub fn vector_delete(
+        &self,
+        table: &str,
+        collection: &str,
+        rowid: u64,
+    ) -> Result<()> {
+        let key = Self::collection_key(table, collection);
+        let mut collections = self.vector_collections.write().unwrap();
+        let coll = collections.get_mut(&key).ok_or_else(|| {
+            BoogyError::VectorCollectionNotFound(format!("{table}.{collection}"))
+        })?;
+
+        let fsync = self.durability() == Durability::Immediate;
+        coll.delete(rowid, fsync)?;
+
+        Ok(())
+    }
+
+    /// Search for the k nearest vectors, optionally filtering by row metadata.
+    pub fn vector_search(
+        &self,
+        table: &str,
+        collection: &str,
+        query: &[f32],
+        options: &VectorSearchOptions,
+    ) -> Result<Vec<VectorResult>> {
+        let key = Self::collection_key(table, collection);
+        let collections = self.vector_collections.read().unwrap();
+        let coll = collections.get(&key).ok_or_else(|| {
+            BoogyError::VectorCollectionNotFound(format!("{table}.{collection}"))
+        })?;
+
+        if options.filter.is_some() {
+            // Filtered search: inflate ef_search and k by 4x, then post-filter.
+            let inflated_k = options.k.saturating_mul(4);
+            let inflated_ef = options.ef_search.saturating_mul(4);
+            let candidates = coll.search(query, inflated_k, inflated_ef)?;
+
+            let filter = options.filter.as_ref().unwrap();
+            let mut filtered = Vec::with_capacity(options.k as usize);
+
+            for result in candidates {
+                if filtered.len() >= options.k as usize {
+                    break;
+                }
+                // Load the row from boogy-db and check the filter.
+                if let Ok(Some(row)) = self.get(table, result.rowid) {
+                    let col_val = row
+                        .get(&filter.column)
+                        .unwrap_or(Value::Null);
+                    if filter.matches(&col_val) {
+                        filtered.push(result);
+                    }
+                }
+            }
+
+            Ok(filtered)
+        } else {
+            coll.search(query, options.k, options.ef_search)
+        }
     }
 }
 
