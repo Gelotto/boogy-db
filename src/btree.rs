@@ -715,12 +715,16 @@ impl<'a, 'b> BTreeWriter<'a, 'b> {
                     return Ok(InsertResult::Fit);
                 }
 
-                // Inline doesn't fit on this page — split with inline data
+                // Inline doesn't fit on this page — split with inline data.
+                // Must find a split point where BOTH halves fit in a page.
+                // The naive mid = total/2 fails when the inline row is nearly
+                // page-sized — compute cumulative sizes to find a valid split.
                 let snapshot = page.data;
                 let next_leaf = page.next_leaf();
                 let prev_leaf = page.prev_leaf();
                 let total = num_rows + 1;
-                let mid = total / 2;
+
+                let mid = find_overflow_split_point(&snapshot, num_rows, pos, &inline, total);
 
                 let new_page_no = self.guard.allocate_page()?;
                 let separator = extract_id_at_virtual_pos(&snapshot, num_rows, pos, &inline, mid)?;
@@ -1207,6 +1211,71 @@ fn write_leaf_range(
 
     page.set_num_rows(count as u16);
     page.set_free_space_offset(write_pos as u16);
+}
+
+/// Find a split point for the overflow-split path where BOTH halves fit in a
+/// page. The inline row (nearly page-sized) must land in a half with enough
+/// room. We scan from left to right, accumulating sizes, and split at the
+/// first point where the left half would exceed the page if we added one more.
+fn find_overflow_split_point(
+    snapshot: &[u8; PAGE_SIZE],
+    old_count: usize,
+    insert_pos: usize,
+    new_row: &[u8],
+    total: usize,
+) -> usize {
+    // Compute the size of each virtual row.
+    let mut sizes = Vec::with_capacity(total);
+    for vi in 0..total {
+        if vi == insert_pos {
+            sizes.push(new_row.len());
+        } else {
+            let orig = if vi < insert_pos { vi } else { vi - 1 };
+            let (s, e) = row_bounds_raw(snapshot, orig, old_count);
+            sizes.push(e - s);
+        }
+    }
+
+    // Find the largest mid in [1, total-1] where the left half fits in a page.
+    // left half has `mid` rows: header + mid*2 offsets + data + checksum
+    let mut best = 1; // always at least 1 row on the left
+    let mut data_sum = 0usize;
+    for mid in 1..total {
+        data_sum += sizes[mid - 1];
+        let left_size = PAGE_HEADER_SIZE + mid * 2 + data_sum + CHECKSUM_SIZE;
+        if left_size <= PAGE_SIZE {
+            best = mid;
+        } else {
+            break;
+        }
+    }
+
+    // Verify right half fits too; if not, use the first valid split from left.
+    let right_count = total - best;
+    let right_data: usize = sizes[best..].iter().sum();
+    let right_size = PAGE_HEADER_SIZE + right_count * 2 + right_data + CHECKSUM_SIZE;
+    if right_size <= PAGE_SIZE {
+        return best;
+    }
+
+    // Fallback: scan from left=1 upward until we find a point where BOTH fit.
+    data_sum = sizes[0];
+    for mid in 1..total {
+        let left_count = mid;
+        let left_size = PAGE_HEADER_SIZE + left_count * 2 + data_sum + CHECKSUM_SIZE;
+        let r_count = total - mid;
+        let r_data: usize = sizes[mid..].iter().sum();
+        let r_size = PAGE_HEADER_SIZE + r_count * 2 + r_data + CHECKSUM_SIZE;
+        if left_size <= PAGE_SIZE && r_size <= PAGE_SIZE {
+            return mid;
+        }
+        if mid < total {
+            data_sum += sizes[mid];
+        }
+    }
+
+    // Should not reach here if inline fits on a page alone, but fallback.
+    total / 2
 }
 
 /// Extract the rowid of the row at a given position in the virtual sequence

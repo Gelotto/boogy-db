@@ -1690,3 +1690,165 @@ fn test_acid_persists_across_reopen() {
         assert_eq!(db.count("t", &[]).unwrap(), 2);
     }
 }
+
+// ===========================================================================
+// Overflow page tests
+// ===========================================================================
+
+#[test]
+fn test_overflow_insert_get_10kb() {
+    let (db, _dir) = create_db();
+    db.create_table("t", &[ColumnDef::new("data", Type::Blob)]).unwrap();
+    let blob = vec![0xABu8; 10_000];
+    let id = db.insert("t", &[("data", Value::Blob(blob.clone()))]).unwrap();
+    let row = db.get("t", id).unwrap().unwrap();
+    assert_eq!(row.get("data").unwrap(), Value::Blob(blob));
+}
+
+#[test]
+fn test_overflow_insert_get_100kb() {
+    let (db, _dir) = create_db();
+    db.create_table("t", &[ColumnDef::new("data", Type::Blob)]).unwrap();
+    let blob = vec![0xCDu8; 100_000];
+    let id = db.insert("t", &[("data", Value::Blob(blob.clone()))]).unwrap();
+    let row = db.get("t", id).unwrap().unwrap();
+    assert_eq!(row.get("data").unwrap(), Value::Blob(blob));
+}
+
+#[test]
+fn test_overflow_insert_get_1mb() {
+    let (db, _dir) = create_db();
+    db.create_table("t", &[ColumnDef::new("data", Type::Blob)]).unwrap();
+    let blob = vec![0xEFu8; 1_000_000];
+    let id = db.insert("t", &[("data", Value::Blob(blob.clone()))]).unwrap();
+    let row = db.get("t", id).unwrap().unwrap();
+    assert_eq!(row.get("data").unwrap(), Value::Blob(blob));
+}
+
+#[test]
+fn test_overflow_long_text() {
+    let (db, _dir) = create_db();
+    db.create_table("t", &[ColumnDef::new("content", Type::Text)]).unwrap();
+    let text = "x".repeat(100_000);
+    let id = db.insert("t", &[("content", Value::Text(text.clone()))]).unwrap();
+    let row = db.get("t", id).unwrap().unwrap();
+    assert_eq!(row.get("content").unwrap(), Value::Text(text));
+}
+
+#[test]
+fn test_overflow_delete() {
+    let (db, _dir) = create_db();
+    db.create_table("t", &[ColumnDef::new("data", Type::Blob)]).unwrap();
+    let id = db.insert("t", &[("data", Value::Blob(vec![0xAB; 50_000]))]).unwrap();
+    assert!(db.delete("t", id).unwrap());
+    assert!(db.get("t", id).unwrap().is_none());
+}
+
+#[test]
+fn test_overflow_mixed_with_normal_rows() {
+    let (db, _dir) = create_db();
+    db.create_table("t", &[
+        ColumnDef::new("name", Type::Text),
+        ColumnDef::new("data", Type::Blob),
+    ]).unwrap();
+    for i in 0..10 {
+        db.insert("t", &[
+            ("name", Value::Text(format!("small_{i}"))),
+            ("data", Value::Blob(vec![i as u8; 100])),
+        ]).unwrap();
+    }
+    for i in 0..5 {
+        db.insert("t", &[
+            ("name", Value::Text(format!("big_{i}"))),
+            ("data", Value::Blob(vec![i as u8; 50_000])),
+        ]).unwrap();
+    }
+    assert_eq!(db.count("t", &[]).unwrap(), 15);
+    let row = db.get("t", 11).unwrap().unwrap();
+    assert_eq!(row.get("data").unwrap(), Value::Blob(vec![0u8; 50_000]));
+}
+
+#[test]
+fn test_overflow_max_row_size_enforced() {
+    let (db, _dir) = create_db();
+    db.set_max_row_size(1000);
+    db.create_table("t", &[ColumnDef::new("data", Type::Blob)]).unwrap();
+    let result = db.insert("t", &[("data", Value::Blob(vec![0u8; 2000]))]);
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_overflow_update_large_to_small() {
+    let (db, _dir) = create_db();
+    db.create_table("t", &[ColumnDef::new("data", Type::Blob)]).unwrap();
+    let id = db.insert("t", &[("data", Value::Blob(vec![0xAB; 50_000]))]).unwrap();
+    db.update("t", id, &[("data", Value::Blob(vec![0xCD; 100]))]).unwrap();
+    let row = db.get("t", id).unwrap().unwrap();
+    assert_eq!(row.get("data").unwrap(), Value::Blob(vec![0xCD; 100]));
+}
+
+#[test]
+fn test_overflow_update_small_to_large() {
+    let (db, _dir) = create_db();
+    db.create_table("t", &[ColumnDef::new("data", Type::Blob)]).unwrap();
+    let id = db.insert("t", &[("data", Value::Blob(vec![0xAB; 100]))]).unwrap();
+    db.update("t", id, &[("data", Value::Blob(vec![0xCD; 50_000]))]).unwrap();
+    let row = db.get("t", id).unwrap().unwrap();
+    assert_eq!(row.get("data").unwrap(), Value::Blob(vec![0xCD; 50_000]));
+}
+
+#[test]
+fn test_overflow_persist_across_reopen() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("test.boogy");
+    let blob = vec![0xABu8; 50_000];
+    {
+        let db = BoogyDb::open(&path).unwrap();
+        db.set_durability(Durability::Normal);
+        db.create_table("t", &[ColumnDef::new("data", Type::Blob)]).unwrap();
+        db.insert("t", &[("data", Value::Blob(blob.clone()))]).unwrap();
+    }
+    {
+        let db = BoogyDb::open(&path).unwrap();
+        let row = db.get("t", 1).unwrap().unwrap();
+        assert_eq!(row.get("data").unwrap(), Value::Blob(blob));
+    }
+}
+
+#[test]
+fn test_overflow_with_acid() {
+    let (db, _dir) = create_db();
+    db.set_acid(true);
+    db.create_table("t", &[ColumnDef::new("data", Type::Blob)]).unwrap();
+    let blob = vec![0xABu8; 50_000];
+    let mut tx = db.begin().unwrap();
+    let id = tx.insert("t", &[("data", Value::Blob(blob.clone()))]).unwrap();
+    tx.commit().unwrap();
+    let row = db.get("t", id).unwrap().unwrap();
+    assert_eq!(row.get("data").unwrap(), Value::Blob(blob));
+
+    // Rollback
+    {
+        let mut tx = db.begin().unwrap();
+        tx.insert("t", &[("data", Value::Blob(vec![0xCD; 50_000]))]).unwrap();
+    }
+    assert_eq!(db.count("t", &[]).unwrap(), 1);
+}
+
+#[test]
+fn test_overflow_find_scan() {
+    let (db, _dir) = create_db();
+    db.create_table("t", &[
+        ColumnDef::new("tag", Type::Text),
+        ColumnDef::new("data", Type::Blob),
+    ]).unwrap();
+    for i in 0..5 {
+        let size = if i % 2 == 0 { 100 } else { 50_000 };
+        db.insert("t", &[
+            ("tag", Value::Text(format!("item_{i}"))),
+            ("data", Value::Blob(vec![i as u8; size])),
+        ]).unwrap();
+    }
+    let result = db.find("t", FindOptions::default()).unwrap();
+    assert_eq!(result.rows.len(), 5);
+}
