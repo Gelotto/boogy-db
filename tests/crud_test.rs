@@ -2235,3 +2235,240 @@ fn test_in_update_where() {
     let result = db.find("t", opts).unwrap();
     assert_eq!(result.rows.len(), 3);
 }
+
+// ---------------------------------------------------------------------------
+// IsNull / IsNotNull operator tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_is_null_filter() {
+    let (db, _dir) = create_db();
+    db.create_table("t", &[
+        ColumnDef::new("name", Type::Text),
+        ColumnDef::new("email", Type::Text),
+    ]).unwrap();
+
+    // Insert rows with email set and rows without email (Null)
+    db.insert("t", &[
+        ("name", Value::Text("alice".into())),
+        ("email", Value::Text("alice@example.com".into())),
+    ]).unwrap();
+    db.insert("t", &[
+        ("name", Value::Text("bob".into())),
+        // email omitted -> Null
+    ]).unwrap();
+    db.insert("t", &[
+        ("name", Value::Text("charlie".into())),
+        ("email", Value::Null),
+    ]).unwrap();
+    db.insert("t", &[
+        ("name", Value::Text("dave".into())),
+        ("email", Value::Text("dave@example.com".into())),
+    ]).unwrap();
+
+    // IsNull should return rows where email is absent or explicitly Null
+    let opts = FindOptions {
+        filters: vec![Filter::is_null("email")],
+        include_total: true,
+        ..Default::default()
+    };
+    let result = db.find("t", opts).unwrap();
+    assert_eq!(result.total, Some(2));
+    assert_eq!(result.rows.len(), 2);
+    let mut names: Vec<String> = result.rows.iter()
+        .map(|r| match r.get("name").unwrap() { Value::Text(s) => s, _ => panic!() })
+        .collect();
+    names.sort();
+    assert_eq!(names, vec!["bob", "charlie"]);
+}
+
+#[test]
+fn test_is_not_null_filter() {
+    let (db, _dir) = create_db();
+    db.create_table("t", &[
+        ColumnDef::new("name", Type::Text),
+        ColumnDef::new("email", Type::Text),
+    ]).unwrap();
+
+    db.insert("t", &[
+        ("name", Value::Text("alice".into())),
+        ("email", Value::Text("alice@example.com".into())),
+    ]).unwrap();
+    db.insert("t", &[
+        ("name", Value::Text("bob".into())),
+    ]).unwrap();
+    db.insert("t", &[
+        ("name", Value::Text("charlie".into())),
+        ("email", Value::Null),
+    ]).unwrap();
+    db.insert("t", &[
+        ("name", Value::Text("dave".into())),
+        ("email", Value::Text("dave@example.com".into())),
+    ]).unwrap();
+
+    // IsNotNull should return rows where email is present and not Null
+    let opts = FindOptions {
+        filters: vec![Filter::is_not_null("email")],
+        include_total: true,
+        ..Default::default()
+    };
+    let result = db.find("t", opts).unwrap();
+    assert_eq!(result.total, Some(2));
+    assert_eq!(result.rows.len(), 2);
+    let mut names: Vec<String> = result.rows.iter()
+        .map(|r| match r.get("name").unwrap() { Value::Text(s) => s, _ => panic!() })
+        .collect();
+    names.sort();
+    assert_eq!(names, vec!["alice", "dave"]);
+}
+
+#[test]
+fn test_is_null_combined_with_other_filters() {
+    let (db, _dir) = create_db();
+    db.create_table("t", &[
+        ColumnDef::new("category", Type::Text),
+        ColumnDef::new("value", Type::Integer),
+    ]).unwrap();
+
+    // Insert rows: some with value, some without
+    for i in 0..10 {
+        let cat = format!("cat_{}", i % 2);
+        db.insert("t", &[
+            ("category", Value::Text(cat)),
+            ("value", Value::Integer(i)),
+        ]).unwrap();
+    }
+    for i in 0..6 {
+        let cat = format!("cat_{}", i % 2);
+        db.insert("t", &[
+            ("category", Value::Text(cat)),
+            // value omitted -> Null
+        ]).unwrap();
+    }
+
+    // category = "cat_0" AND value IS NULL
+    let opts = FindOptions {
+        filters: vec![
+            Filter::eq("category", "cat_0"),
+            Filter::is_null("value"),
+        ],
+        include_total: true,
+        ..Default::default()
+    };
+    let result = db.find("t", opts).unwrap();
+    assert_eq!(result.total, Some(3)); // 3 rows with cat_0 and no value
+    assert_eq!(result.rows.len(), 3);
+    for row in &result.rows {
+        assert_eq!(row.get("category").unwrap(), Value::Text("cat_0".into()));
+        assert!(row.get("value").is_none()); // absent column
+    }
+}
+
+#[test]
+fn test_is_null_with_acid_transaction() {
+    let (db, _dir) = create_db();
+    db.set_acid(true);
+    db.create_table("t", &[
+        ColumnDef::new("name", Type::Text),
+        ColumnDef::new("email", Type::Text),
+    ]).unwrap();
+
+    // Insert inside ACID transaction
+    {
+        let mut tx = db.begin().unwrap();
+        tx.insert("t", &[
+            ("name", Value::Text("alice".into())),
+            ("email", Value::Text("alice@example.com".into())),
+        ]).unwrap();
+        tx.insert("t", &[
+            ("name", Value::Text("bob".into())),
+            // email is Null (omitted)
+        ]).unwrap();
+        tx.insert("t", &[
+            ("name", Value::Text("charlie".into())),
+            ("email", Value::Null),
+        ]).unwrap();
+        tx.commit().unwrap();
+    }
+
+    // IsNull query
+    let opts = FindOptions {
+        filters: vec![Filter::is_null("email")],
+        include_total: true,
+        ..Default::default()
+    };
+    let result = db.find("t", opts).unwrap();
+    assert_eq!(result.total, Some(2));
+
+    // IsNotNull query
+    let opts = FindOptions {
+        filters: vec![Filter::is_not_null("email")],
+        include_total: true,
+        ..Default::default()
+    };
+    let result = db.find("t", opts).unwrap();
+    assert_eq!(result.total, Some(1));
+
+    // Also test querying within an ACID transaction
+    {
+        let mut tx = db.begin().unwrap();
+        tx.insert("t", &[
+            ("name", Value::Text("dave".into())),
+            // email Null
+        ]).unwrap();
+
+        let opts = FindOptions {
+            filters: vec![Filter::is_null("email")],
+            include_total: true,
+            ..Default::default()
+        };
+        let result = tx.find("t", opts).unwrap();
+        assert_eq!(result.total, Some(3)); // bob, charlie, dave
+        tx.commit().unwrap();
+    }
+}
+
+#[test]
+fn test_is_null_count() {
+    let (db, _dir) = create_db();
+    db.create_table("t", &[
+        ColumnDef::new("v", Type::Integer),
+    ]).unwrap();
+
+    for i in 0..5 {
+        db.insert("t", &[("v", Value::Integer(i))]).unwrap();
+    }
+    for _ in 0..3 {
+        db.insert("t", &[("v", Value::Null)]).unwrap();
+    }
+
+    assert_eq!(db.count("t", &[Filter::is_null("v")]).unwrap(), 3);
+    assert_eq!(db.count("t", &[Filter::is_not_null("v")]).unwrap(), 5);
+}
+
+#[test]
+fn test_is_not_null_combined_with_is_null() {
+    let (db, _dir) = create_db();
+    db.create_table("t", &[
+        ColumnDef::new("a", Type::Text),
+        ColumnDef::new("b", Type::Integer),
+    ]).unwrap();
+
+    db.insert("t", &[("a", Value::Text("x".into())), ("b", Value::Integer(1))]).unwrap();
+    db.insert("t", &[("a", Value::Text("y".into()))]).unwrap(); // b absent
+    db.insert("t", &[("b", Value::Integer(3))]).unwrap(); // a absent
+    db.insert("t", &[]).unwrap(); // both absent
+
+    // a IS NOT NULL AND b IS NULL
+    let opts = FindOptions {
+        filters: vec![
+            Filter::is_not_null("a"),
+            Filter::is_null("b"),
+        ],
+        include_total: true,
+        ..Default::default()
+    };
+    let result = db.find("t", opts).unwrap();
+    assert_eq!(result.total, Some(1));
+    assert_eq!(result.rows[0].get("a").unwrap(), Value::Text("y".into()));
+}

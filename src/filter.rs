@@ -10,6 +10,8 @@ pub enum FilterOp {
     Gt,
     Ge,
     In,
+    IsNull,
+    IsNotNull,
 }
 
 #[derive(Debug, Clone)]
@@ -43,6 +45,12 @@ impl Filter {
     pub fn in_list(column: impl Into<String>, values: Vec<Value>) -> Self {
         Self { column: column.into(), op: FilterOp::In, value: Value::Null, in_values: Some(values) }
     }
+    pub fn is_null(column: impl Into<String>) -> Self {
+        Self { column: column.into(), op: FilterOp::IsNull, value: Value::Null, in_values: None }
+    }
+    pub fn is_not_null(column: impl Into<String>) -> Self {
+        Self { column: column.into(), op: FilterOp::IsNotNull, value: Value::Null, in_values: None }
+    }
 
     /// Evaluate this filter against a value.
     pub fn matches(&self, actual: &Value) -> bool {
@@ -51,6 +59,12 @@ impl Filter {
                 return values.iter().any(|v| actual.compare(v) == Some(Ordering::Equal));
             }
             return false;
+        }
+        if self.op == FilterOp::IsNull {
+            return matches!(actual, Value::Null);
+        }
+        if self.op == FilterOp::IsNotNull {
+            return !matches!(actual, Value::Null);
         }
         let cmp = actual.compare(&self.value);
         match cmp {
@@ -61,7 +75,7 @@ impl Filter {
                 FilterOp::Le => ord != Ordering::Greater,
                 FilterOp::Gt => ord == Ordering::Greater,
                 FilterOp::Ge => ord != Ordering::Less,
-                FilterOp::In => unreachable!(),
+                FilterOp::In | FilterOp::IsNull | FilterOp::IsNotNull => unreachable!(),
             },
             None => false, // incompatible types don't match
         }
@@ -74,6 +88,12 @@ pub fn eval_filter_op(actual: &Value, op: &FilterOp, expected: &Value) -> bool {
     if *op == FilterOp::In {
         return false; // In requires values list; caller should use eval_filter_in or Filter::matches
     }
+    if *op == FilterOp::IsNull {
+        return matches!(actual, Value::Null);
+    }
+    if *op == FilterOp::IsNotNull {
+        return !matches!(actual, Value::Null);
+    }
     match actual.compare(expected) {
         Some(ord) => match op {
             FilterOp::Eq => ord == Ordering::Equal,
@@ -82,7 +102,7 @@ pub fn eval_filter_op(actual: &Value, op: &FilterOp, expected: &Value) -> bool {
             FilterOp::Le => ord != Ordering::Greater,
             FilterOp::Gt => ord == Ordering::Greater,
             FilterOp::Ge => ord != Ordering::Less,
-            FilterOp::In => unreachable!(),
+            FilterOp::In | FilterOp::IsNull | FilterOp::IsNotNull => unreachable!(),
         },
         None => false,
     }
@@ -104,6 +124,13 @@ pub fn eval_filter_raw(raw: &[u8], op: &FilterOp, expected: &Value) -> Option<bo
         return None;
     }
     let tag = raw[0];
+    // IsNull / IsNotNull: single byte comparison on the type tag, no decode needed.
+    if *op == FilterOp::IsNull {
+        return Some(tag == 0); // TAG_NULL = 0
+    }
+    if *op == FilterOp::IsNotNull {
+        return Some(tag != 0);
+    }
     match (tag, expected, op) {
         // Text Eq: compare raw UTF-8 bytes directly — no String allocation
         (1, Value::Text(s), FilterOp::Eq) => {
@@ -136,7 +163,7 @@ pub fn eval_filter_raw(raw: &[u8], op: &FilterOp, expected: &Value) -> Option<bo
                 FilterOp::Le => ord != std::cmp::Ordering::Greater,
                 FilterOp::Gt => ord == std::cmp::Ordering::Greater,
                 FilterOp::Ge => ord != std::cmp::Ordering::Less,
-                FilterOp::In => unreachable!(),
+                FilterOp::In | FilterOp::IsNull | FilterOp::IsNotNull => unreachable!(),
             })
         }
         _ => None, // fall back to decode path
@@ -201,6 +228,9 @@ pub fn eval_filter_raw_full(raw: &[u8], filter: &Filter) -> Option<bool> {
         } else {
             Some(false)
         }
+    } else if filter.op == FilterOp::IsNull || filter.op == FilterOp::IsNotNull {
+        // Fast path: single byte tag check, delegates to eval_filter_raw
+        eval_filter_raw(raw, &filter.op, &filter.value)
     } else {
         eval_filter_raw(raw, &filter.op, &filter.value)
     }
@@ -595,5 +625,113 @@ mod tests {
         assert_eq!(eval_filter_raw_full(&raw, &f), Some(true));
         let f = Filter::in_list("v", vec![Value::Integer(10), Value::Integer(20)]);
         assert_eq!(eval_filter_raw_full(&raw, &f), Some(false));
+    }
+
+    // --- IsNull / IsNotNull tests ---
+
+    #[test]
+    fn test_filter_is_null_matches_null() {
+        let f = Filter::is_null("x");
+        assert!(f.matches(&Value::Null));
+    }
+
+    #[test]
+    fn test_filter_is_null_rejects_non_null() {
+        let f = Filter::is_null("x");
+        assert!(!f.matches(&Value::Integer(0)));
+        assert!(!f.matches(&Value::Text("".into())));
+        assert!(!f.matches(&Value::Real(0.0)));
+        assert!(!f.matches(&Value::Boolean(false)));
+        assert!(!f.matches(&Value::Blob(vec![])));
+    }
+
+    #[test]
+    fn test_filter_is_not_null_matches_non_null() {
+        let f = Filter::is_not_null("x");
+        assert!(f.matches(&Value::Integer(42)));
+        assert!(f.matches(&Value::Text("hello".into())));
+        assert!(f.matches(&Value::Real(3.14)));
+        assert!(f.matches(&Value::Boolean(true)));
+        assert!(f.matches(&Value::Blob(vec![1, 2, 3])));
+    }
+
+    #[test]
+    fn test_filter_is_not_null_rejects_null() {
+        let f = Filter::is_not_null("x");
+        assert!(!f.matches(&Value::Null));
+    }
+
+    #[test]
+    fn test_eval_filter_op_is_null() {
+        assert!(eval_filter_op(&Value::Null, &FilterOp::IsNull, &Value::Null));
+        assert!(!eval_filter_op(&Value::Integer(0), &FilterOp::IsNull, &Value::Null));
+        assert!(!eval_filter_op(&Value::Text("".into()), &FilterOp::IsNull, &Value::Null));
+    }
+
+    #[test]
+    fn test_eval_filter_op_is_not_null() {
+        assert!(!eval_filter_op(&Value::Null, &FilterOp::IsNotNull, &Value::Null));
+        assert!(eval_filter_op(&Value::Integer(0), &FilterOp::IsNotNull, &Value::Null));
+        assert!(eval_filter_op(&Value::Text("hello".into()), &FilterOp::IsNotNull, &Value::Null));
+    }
+
+    #[test]
+    fn test_eval_filter_raw_is_null() {
+        use crate::row::encode_value_to_vec;
+
+        // Null raw bytes -> IsNull should be true
+        let raw_null = encode_value_to_vec(&Value::Null);
+        assert_eq!(eval_filter_raw(&raw_null, &FilterOp::IsNull, &Value::Null), Some(true));
+
+        // Integer raw bytes -> IsNull should be false
+        let raw_int = encode_value_to_vec(&Value::Integer(42));
+        assert_eq!(eval_filter_raw(&raw_int, &FilterOp::IsNull, &Value::Null), Some(false));
+
+        // Text raw bytes -> IsNull should be false
+        let raw_text = encode_value_to_vec(&Value::Text("hello".into()));
+        assert_eq!(eval_filter_raw(&raw_text, &FilterOp::IsNull, &Value::Null), Some(false));
+    }
+
+    #[test]
+    fn test_eval_filter_raw_is_not_null() {
+        use crate::row::encode_value_to_vec;
+
+        // Null raw bytes -> IsNotNull should be false
+        let raw_null = encode_value_to_vec(&Value::Null);
+        assert_eq!(eval_filter_raw(&raw_null, &FilterOp::IsNotNull, &Value::Null), Some(false));
+
+        // Integer raw bytes -> IsNotNull should be true
+        let raw_int = encode_value_to_vec(&Value::Integer(42));
+        assert_eq!(eval_filter_raw(&raw_int, &FilterOp::IsNotNull, &Value::Null), Some(true));
+
+        // Real raw bytes -> IsNotNull should be true
+        let raw_real = encode_value_to_vec(&Value::Real(3.14));
+        assert_eq!(eval_filter_raw(&raw_real, &FilterOp::IsNotNull, &Value::Null), Some(true));
+
+        // Boolean raw bytes -> IsNotNull should be true
+        let raw_bool = encode_value_to_vec(&Value::Boolean(false));
+        assert_eq!(eval_filter_raw(&raw_bool, &FilterOp::IsNotNull, &Value::Null), Some(true));
+    }
+
+    #[test]
+    fn test_eval_filter_raw_full_is_null() {
+        use crate::row::encode_value_to_vec;
+        let raw_null = encode_value_to_vec(&Value::Null);
+        let f = Filter::is_null("x");
+        assert_eq!(eval_filter_raw_full(&raw_null, &f), Some(true));
+
+        let raw_int = encode_value_to_vec(&Value::Integer(1));
+        assert_eq!(eval_filter_raw_full(&raw_int, &f), Some(false));
+    }
+
+    #[test]
+    fn test_eval_filter_raw_full_is_not_null() {
+        use crate::row::encode_value_to_vec;
+        let raw_null = encode_value_to_vec(&Value::Null);
+        let f = Filter::is_not_null("x");
+        assert_eq!(eval_filter_raw_full(&raw_null, &f), Some(false));
+
+        let raw_int = encode_value_to_vec(&Value::Integer(1));
+        assert_eq!(eval_filter_raw_full(&raw_int, &f), Some(true));
     }
 }

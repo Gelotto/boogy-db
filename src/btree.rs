@@ -259,7 +259,8 @@ impl<'a> BTreeReader<'a> {
                         // Column might be in the overflow portion — reassemble and retry
                         None
                     } else {
-                        Some(false) // column not found, no overflow
+                        // Column not found, no overflow — treat as Null
+                        Some(crate::filter::eval_filter_op(&crate::value::Value::Null, &filter_op, filter_val))
                     };
 
                     if let Some(m) = inline_match {
@@ -345,7 +346,8 @@ impl<'a> BTreeReader<'a> {
                     let actual = col_val.as_ref().unwrap_or(&crate::value::Value::Null);
                     crate::filter::eval_filter_op(actual, &filter_op, filter_val)
                 } else {
-                    false // column not found, no overflow
+                    // Column not found, no overflow — treat as Null
+                    crate::filter::eval_filter_op(&crate::value::Value::Null, &filter_op, filter_val)
                 };
 
                 if matches {

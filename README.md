@@ -118,6 +118,54 @@ tx.commit()?;
 | `set_acid(enabled)` | Enable/disable ACID transaction mode |
 | `set_max_row_size(bytes)` | Set maximum row size in bytes (default 10MB) |
 
+### Filters
+
+Queries (`find`, `count`, `delete_where`, `update_where`) accept a list of `Filter` values that are ANDed together. Each filter targets a single column.
+
+| Constructor | SQL Equivalent | Description |
+|-------------|---------------|-------------|
+| `Filter::eq(col, val)` | `col = val` | Equality |
+| `Filter::ne(col, val)` | `col != val` | Inequality |
+| `Filter::lt(col, val)` | `col < val` | Less than |
+| `Filter::le(col, val)` | `col <= val` | Less than or equal |
+| `Filter::gt(col, val)` | `col > val` | Greater than |
+| `Filter::ge(col, val)` | `col >= val` | Greater than or equal |
+| `Filter::in_list(col, values)` | `col IN (...)` | Match any value in list |
+| `Filter::is_null(col)` | `col IS NULL` | Column is null or absent |
+| `Filter::is_not_null(col)` | `col IS NOT NULL` | Column has a non-null value |
+
+```rust
+// IN: match rows where status is one of several values
+let result = db.find("orders", FindOptions {
+    filters: vec![Filter::in_list("status", vec![
+        Value::Text("pending".into()),
+        Value::Text("processing".into()),
+    ])],
+    ..Default::default()
+})?;
+
+// IS NULL: find rows with missing email
+let result = db.find("users", FindOptions {
+    filters: vec![Filter::is_null("email")],
+    ..Default::default()
+})?;
+
+// IS NOT NULL: find rows that have a verified_at timestamp
+let result = db.find("users", FindOptions {
+    filters: vec![Filter::is_not_null("verified_at")],
+    ..Default::default()
+})?;
+
+// Combine filters (AND): active users with no email
+let result = db.find("users", FindOptions {
+    filters: vec![
+        Filter::eq("status", "active"),
+        Filter::is_null("email"),
+    ],
+    ..Default::default()
+})?;
+```
+
 ## Benchmarks
 
 All benchmarks run on:
