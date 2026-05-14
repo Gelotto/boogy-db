@@ -19,6 +19,10 @@ pub enum BoogyError {
     RowTooLarge(usize),
     PageFull,
     TransactionConflict,
+    VectorCollectionNotFound(String),
+    VectorCollectionExists(String),
+    VectorDimensionMismatch { expected: u32, got: u32 },
+    VectorError(String),
 }
 
 impl fmt::Display for BoogyError {
@@ -40,6 +44,10 @@ impl fmt::Display for BoogyError {
             BoogyError::RowTooLarge(sz) => write!(f, "row too large: {sz} bytes exceeds maximum"),
             BoogyError::PageFull => write!(f, "page full"),
             BoogyError::TransactionConflict => write!(f, "transaction conflict"),
+            BoogyError::VectorCollectionNotFound(name) => write!(f, "vector collection '{name}' not found"),
+            BoogyError::VectorCollectionExists(name) => write!(f, "vector collection '{name}' already exists"),
+            BoogyError::VectorDimensionMismatch { expected, got } => write!(f, "vector dimension mismatch: expected {expected}, got {got}"),
+            BoogyError::VectorError(msg) => write!(f, "vector error: {msg}"),
         }
     }
 }

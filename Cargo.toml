@@ -7,12 +7,14 @@ license = "Apache-2.0"
 [features]
 default = []
 tokio = ["dep:tokio"]
+vector = ["dep:memmap2"]
 
 [dependencies]
 crc32fast = "1"
 aes-gcm = "0.10"
 rand = "0.9"
 tokio = { version = "1", features = ["rt"], optional = true }
+memmap2 = { version = "0.9", optional = true }
 
 [dev-dependencies]
 tempfile = "3"
