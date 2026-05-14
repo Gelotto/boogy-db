@@ -34,6 +34,7 @@ A fast embedded storage engine for Rust, purpose-built for concurrent API worklo
 - **Zero-copy filter evaluation** — `extract_column_raw` returns a slice into the page; `eval_filter_raw` compares raw bytes without allocating a `Value`
 - **In-place row patching** — `patch_row` splices raw bytes for single-column updates without full decode/encode
 - **Batch bulk operations** — `delete_matching`/`update_matching` walk the leaf chain once, rebuilding each page in a single pass instead of per-row tree surgery
+- **Overflow pages** — rows larger than a single page automatically spill into linked overflow pages, supporting blobs up to 10MB (configurable). Zero overhead on normal-sized rows
 - **Per-table encryption** — opt-in AES-256-GCM at the page level. Plaintext in memory, ciphertext on disk. Zero overhead on unencrypted tables
 - **ACID transactions** — opt-in atomic multi-operation transactions with rollback via `set_acid(true)`. Zero overhead when disabled
 - **Async API** — optional `tokio` feature provides `AsyncBoogyDb` with zero-overhead async methods
@@ -107,6 +108,7 @@ tx.commit()?;
 | `transaction(fn)` | Multi-table transaction (callback-based) |
 | `begin()` | Begin a guard-based transaction (alternative to `transaction(fn)`) |
 | `set_acid(enabled)` | Enable/disable ACID transaction mode |
+| `set_max_row_size(bytes)` | Set maximum row size in bytes (default 10MB) |
 
 ## Benchmarks
 
@@ -438,6 +440,7 @@ The `skills/` directory contains step-by-step guides for working with boogy-db:
 
 - **Storage**: Single file per database, 4 KB page-aligned. Page 0 is the system page (table registry). Each table is a separate B+ tree.
 - **Row format**: `[rowid:8][num_cols:2][offset_directory: num_cols × 4 bytes][column_data]`. Each offset directory entry is `[col_id:2][data_offset:2]`, sorted by `col_id` for binary-search column access. `patch_row` splices raw bytes to replace a single column without full decode/encode; `patch_row_multi` chains patches for multi-column updates.
+- **Overflow**: Rows exceeding leaf page capacity (~4KB) spill into linked `PAGE_OVERFLOW` pages. The leaf stores an inline prefix with a 9-byte trailer `[0xFF][first_page:4][remaining_len:4]` pointing to the overflow chain. Reassembly is transparent — callers always receive complete row data. Configurable maximum via `set_max_row_size()` (default 10MB). Normal rows have zero overhead (one byte comparison on read).
 - **B+ tree**: `BTreeReader` (takes `&PageFile`, read-only) and `BTreeWriter` (takes `&mut WriteGuard`, exclusive). u64 integer keys with fixed 12-byte branch entries (`[child:4][key:8]`). Leaf pages store rows inline with a row-offset array. `scan_filtered` evaluates filters on raw page bytes via `extract_column_raw` + `eval_filter_raw`, falling back to decode only when the raw path doesn't cover the type/op. `delete_matching`/`update_matching` walk the leaf chain once for batch page rebuilds. `multi_get_sorted` batch-fetches clustered rowids via a single leaf-chain walk.
 - **Indexes**: Each secondary index is a separate B+ tree (`IndexTreeReader`/`IndexTreeWriter`) keyed by composite `(encoded_value, rowid)` bytes. Values are encoded for correct byte-order sorting (integers: big-endian with sign-flip; floats: IEEE 754 with sign normalization; text: null-terminated UTF-8). Index lookups use `scan_prefix` to find all rowids for a value, then `multi_get_sorted` to batch-fetch the matching rows.
 - **Concurrency**: Per-table `RwLock` for table metadata. Page cache is `RwLock<Vec<Option<Arc<Page>>>>` — readers take a shared lock, clone the `Arc` pointer, and release immediately. Writers get exclusive access to a `Mutex<WriteState>` dirty-page overlay via `WriteGuard`; `peek_dirty` provides zero-copy reads of dirty pages during tree traversal. `BTreeReader`/`IndexTreeReader` take `&PageFile` and never hold any lock during tree traversal.

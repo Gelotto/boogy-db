@@ -6,6 +6,50 @@ use crate::row;
 /// Checksum occupies the last 4 bytes of each page.
 const CHECKSUM_SIZE: usize = 4;
 
+/// Reassemble a row that may have overflow pages (via PageFile for Reader).
+fn reassemble_row_reader(row_bytes: &[u8], file: &PageFile) -> Result<Vec<u8>> {
+    if !crate::overflow::has_overflow(row_bytes) {
+        return Ok(row_bytes.to_vec());
+    }
+    let (inline_len, first_page, remaining) = crate::overflow::decode_overflow_trailer(row_bytes);
+    let mut full = Vec::with_capacity(inline_len + remaining as usize);
+    full.extend_from_slice(&row_bytes[..inline_len]);
+
+    let mut current = first_page;
+    let mut left = remaining as usize;
+    while current != 0 && left > 0 {
+        let page = file.read_page(current)?;
+        let payload = crate::overflow::read_overflow_payload(&page);
+        let take = payload.len().min(left);
+        full.extend_from_slice(&payload[..take]);
+        left -= take;
+        current = page.overflow_next();
+    }
+    Ok(full)
+}
+
+/// Reassemble via WriteGuard (for Writer -- sees dirty overlay).
+fn reassemble_row_writer(row_bytes: &[u8], guard: &WriteGuard) -> Result<Vec<u8>> {
+    if !crate::overflow::has_overflow(row_bytes) {
+        return Ok(row_bytes.to_vec());
+    }
+    let (inline_len, first_page, remaining) = crate::overflow::decode_overflow_trailer(row_bytes);
+    let mut full = Vec::with_capacity(inline_len + remaining as usize);
+    full.extend_from_slice(&row_bytes[..inline_len]);
+
+    let mut current = first_page;
+    let mut left = remaining as usize;
+    while current != 0 && left > 0 {
+        let page_arc = guard.read_page(current)?;
+        let payload = crate::overflow::read_overflow_payload(&page_arc);
+        let take = payload.len().min(left);
+        full.extend_from_slice(&payload[..take]);
+        left -= take;
+        current = page_arc.overflow_next();
+    }
+    Ok(full)
+}
+
 // ===========================================================================
 // BTreeReader — read-only access via &PageFile
 // ===========================================================================
@@ -41,9 +85,9 @@ impl<'a> BTreeReader<'a> {
                 let (start, end) = row_bounds(&page, i, num_rows);
                 if start < end && end <= PAGE_SIZE {
                     let data = &page.data[start..end];
-                    if let Ok(id) = row::extract_id(data) {
-                        results.push((id, data.to_vec()));
-                    }
+                    let full = reassemble_row_reader(data, self.file)?;
+                    let id = row::extract_id(&full)?;
+                    results.push((id, full));
                 }
             }
             let next = page.next_leaf();
@@ -87,7 +131,7 @@ impl<'a> BTreeReader<'a> {
                         return Ok(results);
                     }
                     if rowids[rid_idx] == row_id {
-                        results.push(data.to_vec());
+                        results.push(reassemble_row_reader(data, self.file)?);
                         rid_idx += 1;
                     }
                 }
@@ -154,9 +198,9 @@ impl<'a> BTreeReader<'a> {
                 if matches {
                     total += 1;
                     if total > skip && (total - skip) <= take {
-                        if let Ok(id) = row::extract_id(data) {
-                            results.push((id, data.to_vec()));
-                        }
+                        let full = reassemble_row_reader(data, self.file)?;
+                        let id = row::extract_id(&full)?;
+                        results.push((id, full));
                     }
                     if let Some(max) = stop_after {
                         if total >= max {
@@ -248,7 +292,8 @@ impl<'a> BTreeReader<'a> {
             if found {
                 let (start, end) = row_bounds(&page, pos, num_rows);
                 if start < end && end <= PAGE_SIZE {
-                    return Ok(Some(page.data[start..end].to_vec()));
+                    let raw = &page.data[start..end];
+                    return Ok(Some(reassemble_row_reader(raw, self.file)?));
                 }
             }
             Ok(None)
@@ -340,9 +385,9 @@ impl<'a, 'b> BTreeWriter<'a, 'b> {
                 let (start, end) = row_bounds(&page, i, num_rows);
                 if start < end && end <= PAGE_SIZE {
                     let data = &page.data[start..end];
-                    if let Ok(id) = row::extract_id(data) {
-                        results.push((id, data.to_vec()));
-                    }
+                    let full = reassemble_row_writer(data, self.guard)?;
+                    let id = row::extract_id(&full)?;
+                    results.push((id, full));
                 }
             }
             let next = page.next_leaf();
@@ -380,8 +425,9 @@ impl<'a, 'b> BTreeWriter<'a, 'b> {
                 }
                 let data = &page.data[start..end];
                 if pred(data) {
-                    if let Ok(id) = row::extract_id(data) {
-                        deleted.push((id, data.to_vec()));
+                    let full = reassemble_row_writer(data, self.guard)?;
+                    if let Ok(id) = row::extract_id(&full) {
+                        deleted.push((id, full));
                         match_indices.push(i);
                     }
                 }
@@ -441,9 +487,10 @@ impl<'a, 'b> BTreeWriter<'a, 'b> {
                 }
                 let data = &page.data[start..end];
                 if pred(data) {
-                    let new_bytes = updater(data);
-                    if let Ok(id) = row::extract_id(data) {
-                        replacements.push((i, new_bytes, id, data.to_vec()));
+                    let full = reassemble_row_writer(data, self.guard)?;
+                    let new_bytes = updater(&full);
+                    if let Ok(id) = row::extract_id(&full) {
+                        replacements.push((i, new_bytes, id, full));
                     }
                 }
             }
@@ -518,7 +565,7 @@ impl<'a, 'b> BTreeWriter<'a, 'b> {
         }
         let (start, end) = row_bounds(&page, pos, num_rows);
         if start < end && end <= PAGE_SIZE {
-            Ok(Some(page.data[start..end].to_vec()))
+            Ok(Some(reassemble_row_writer(&page.data[start..end], self.guard)?))
         } else {
             Ok(None)
         }
@@ -581,6 +628,33 @@ impl<'a, 'b> BTreeWriter<'a, 'b> {
         }
     }
 
+    /// Split a row into an inline portion + overflow pages when it is too large
+    /// for any single leaf page.
+    fn write_overflow_row(&mut self, row_data: &[u8], max_inline: usize) -> Result<Vec<u8>> {
+        let inline_data_len = max_inline - crate::overflow::OVERFLOW_TRAILER_SIZE;
+        let overflow_data = &row_data[inline_data_len..];
+
+        // Build overflow chain from LAST chunk to FIRST (so we know next_page pointers)
+        let chunks: Vec<&[u8]> = overflow_data.chunks(crate::overflow::OVERFLOW_PAYLOAD_MAX).collect();
+        let mut next_page: u32 = 0;
+        let mut first_page: u32 = 0;
+
+        for chunk in chunks.iter().rev() {
+            let page_no = self.guard.allocate_page()?;
+            let page = crate::overflow::build_overflow_page(chunk, next_page);
+            self.guard.put_page(page_no, page);
+            next_page = page_no;
+            first_page = page_no;
+        }
+
+        // Build inline portion with trailer
+        let mut inline = Vec::with_capacity(max_inline);
+        inline.extend_from_slice(&row_data[..inline_data_len]);
+        crate::overflow::append_overflow_trailer(&mut inline, first_page, overflow_data.len() as u32);
+
+        Ok(inline)
+    }
+
     fn insert_into_leaf(
         &mut self,
         page_no: u32,
@@ -619,7 +693,68 @@ impl<'a, 'b> BTreeWriter<'a, 'b> {
             page.update_checksum();
             Ok(InsertResult::Fit)
         } else {
-            // --- Split ---
+            // Check if the row needs overflow (too large for ANY page)
+            let max_single_row = PAGE_SIZE - PAGE_HEADER_SIZE - 2 - CHECKSUM_SIZE;
+            if row_data.len() > max_single_row {
+                // Row needs overflow pages
+                let inline = self.write_overflow_row(row_data, max_single_row)?;
+
+                // Try inserting the inline portion on this page
+                let needed_inline = PAGE_HEADER_SIZE
+                    + (num_rows + 1) * 2
+                    + existing_data_size
+                    + inline.len()
+                    + CHECKSUM_SIZE;
+
+                if needed_inline <= PAGE_SIZE {
+                    // Inline portion fits on this page
+                    let snapshot = page.data;
+                    let page = self.guard.write_page(page_no)?;
+                    write_leaf_with_insert(page, &snapshot, num_rows, pos, &inline);
+                    page.update_checksum();
+                    return Ok(InsertResult::Fit);
+                }
+
+                // Inline doesn't fit on this page — split with inline data.
+                // Must find a split point where BOTH halves fit in a page.
+                // The naive mid = total/2 fails when the inline row is nearly
+                // page-sized — compute cumulative sizes to find a valid split.
+                let snapshot = page.data;
+                let next_leaf = page.next_leaf();
+                let prev_leaf = page.prev_leaf();
+                let total = num_rows + 1;
+
+                let mid = find_overflow_split_point(&snapshot, num_rows, pos, &inline, total);
+
+                let new_page_no = self.guard.allocate_page()?;
+                let separator = extract_id_at_virtual_pos(&snapshot, num_rows, pos, &inline, mid)?;
+
+                let left_page = self.guard.write_page(page_no)?;
+                write_leaf_range(left_page, &snapshot, num_rows, pos, &inline, 0, mid);
+                left_page.set_next_leaf(new_page_no);
+                left_page.set_prev_leaf(prev_leaf);
+                left_page.update_checksum();
+
+                let mut right_page = Page::new_leaf();
+                write_leaf_range(&mut right_page, &snapshot, num_rows, pos, &inline, mid, total);
+                right_page.set_prev_leaf(page_no);
+                right_page.set_next_leaf(next_leaf);
+                right_page.update_checksum();
+                self.guard.put_page(new_page_no, right_page);
+
+                if next_leaf != 0 {
+                    let np = self.guard.write_page(next_leaf)?;
+                    np.set_prev_leaf(new_page_no);
+                    np.update_checksum();
+                }
+
+                return Ok(InsertResult::Split {
+                    new_page: new_page_no,
+                    separator,
+                });
+            }
+
+            // --- Split (row fits on a page but THIS page is full) ---
             let snapshot = page.data;
             let next_leaf = page.next_leaf();
             let prev_leaf = page.prev_leaf();
@@ -752,6 +887,17 @@ impl<'a, 'b> BTreeWriter<'a, 'b> {
         let (pos, found) = find_insertion_point(&page, rowid)?;
         if !found {
             return Ok(false);
+        }
+
+        // Check for overflow pages (leaked for now -- no free list yet)
+        let (start, end) = row_bounds(&page, pos, num_rows);
+        if start < end && end <= PAGE_SIZE {
+            let row_data = &page.data[start..end];
+            if crate::overflow::has_overflow(row_data) {
+                let (_, first_page, _) = crate::overflow::decode_overflow_trailer(row_data);
+                // Pages remain allocated but unused; no free list yet
+                let _ = first_page;
+            }
         }
 
         let snapshot = page.data;
@@ -1065,6 +1211,71 @@ fn write_leaf_range(
 
     page.set_num_rows(count as u16);
     page.set_free_space_offset(write_pos as u16);
+}
+
+/// Find a split point for the overflow-split path where BOTH halves fit in a
+/// page. The inline row (nearly page-sized) must land in a half with enough
+/// room. We scan from left to right, accumulating sizes, and split at the
+/// first point where the left half would exceed the page if we added one more.
+fn find_overflow_split_point(
+    snapshot: &[u8; PAGE_SIZE],
+    old_count: usize,
+    insert_pos: usize,
+    new_row: &[u8],
+    total: usize,
+) -> usize {
+    // Compute the size of each virtual row.
+    let mut sizes = Vec::with_capacity(total);
+    for vi in 0..total {
+        if vi == insert_pos {
+            sizes.push(new_row.len());
+        } else {
+            let orig = if vi < insert_pos { vi } else { vi - 1 };
+            let (s, e) = row_bounds_raw(snapshot, orig, old_count);
+            sizes.push(e - s);
+        }
+    }
+
+    // Find the largest mid in [1, total-1] where the left half fits in a page.
+    // left half has `mid` rows: header + mid*2 offsets + data + checksum
+    let mut best = 1; // always at least 1 row on the left
+    let mut data_sum = 0usize;
+    for mid in 1..total {
+        data_sum += sizes[mid - 1];
+        let left_size = PAGE_HEADER_SIZE + mid * 2 + data_sum + CHECKSUM_SIZE;
+        if left_size <= PAGE_SIZE {
+            best = mid;
+        } else {
+            break;
+        }
+    }
+
+    // Verify right half fits too; if not, use the first valid split from left.
+    let right_count = total - best;
+    let right_data: usize = sizes[best..].iter().sum();
+    let right_size = PAGE_HEADER_SIZE + right_count * 2 + right_data + CHECKSUM_SIZE;
+    if right_size <= PAGE_SIZE {
+        return best;
+    }
+
+    // Fallback: scan from left=1 upward until we find a point where BOTH fit.
+    data_sum = sizes[0];
+    for mid in 1..total {
+        let left_count = mid;
+        let left_size = PAGE_HEADER_SIZE + left_count * 2 + data_sum + CHECKSUM_SIZE;
+        let r_count = total - mid;
+        let r_data: usize = sizes[mid..].iter().sum();
+        let r_size = PAGE_HEADER_SIZE + r_count * 2 + r_data + CHECKSUM_SIZE;
+        if left_size <= PAGE_SIZE && r_size <= PAGE_SIZE {
+            return mid;
+        }
+        if mid < total {
+            data_sum += sizes[mid];
+        }
+    }
+
+    // Should not reach here if inline fits on a page alone, but fallback.
+    total / 2
 }
 
 /// Extract the rowid of the row at a given position in the virtual sequence

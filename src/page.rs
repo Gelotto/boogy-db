@@ -8,6 +8,7 @@ pub const PAGE_LEAF: u16 = 0x01;
 pub const PAGE_BRANCH: u16 = 0x02;
 pub const PAGE_SYSTEM: u16 = 0x04;
 pub const PAGE_FREE: u16 = 0x08;
+pub const PAGE_OVERFLOW: u16 = 0x10;
 
 const MAGIC: u16 = 0xB00D;
 
@@ -43,6 +44,14 @@ impl Page {
         let mut page = Self { data: [0; PAGE_SIZE] };
         page.set_magic(MAGIC);
         page.set_flags(PAGE_SYSTEM);
+        page.update_checksum();
+        page
+    }
+
+    pub fn new_overflow() -> Self {
+        let mut page = Self { data: [0; PAGE_SIZE] };
+        page.set_magic(MAGIC);
+        page.set_flags(PAGE_OVERFLOW);
         page.update_checksum();
         page
     }
@@ -84,6 +93,23 @@ impl Page {
 
     pub fn is_leaf(&self) -> bool { self.flags() & PAGE_LEAF != 0 }
     pub fn is_branch(&self) -> bool { self.flags() & PAGE_BRANCH != 0 }
+    pub fn is_overflow(&self) -> bool { self.flags() & PAGE_OVERFLOW != 0 }
+
+    pub fn overflow_payload_len(&self) -> u16 {
+        self.num_rows() // reuse same header field (bytes 4-5)
+    }
+
+    pub fn set_overflow_payload_len(&mut self, len: u16) {
+        self.set_num_rows(len)
+    }
+
+    pub fn overflow_next(&self) -> u32 {
+        self.next_leaf() // reuse same header field (bytes 8-11)
+    }
+
+    pub fn set_overflow_next(&mut self, page_no: u32) {
+        self.set_next_leaf(page_no)
+    }
 
     pub fn num_rows(&self) -> u16 {
         u16::from_le_bytes([self.data[4], self.data[5]])

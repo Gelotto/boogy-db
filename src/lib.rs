@@ -9,6 +9,7 @@ pub mod wal;
 pub mod table;
 pub mod index;
 pub mod crypto;
+pub mod overflow;
 pub mod db;
 
 #[cfg(feature = "tokio")]

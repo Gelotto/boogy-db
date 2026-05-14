@@ -75,6 +75,7 @@ pub struct BoogyDb {
     #[allow(dead_code)]
     path: PathBuf,
     table_ciphers: RwLock<HashMap<u32, Arc<crate::crypto::Cipher>>>,
+    max_row_size: std::sync::atomic::AtomicU32,
 }
 
 // System page (page 0) format:
@@ -418,6 +419,7 @@ impl BoogyDb {
             acid: std::sync::atomic::AtomicBool::new(false),
             path,
             table_ciphers: RwLock::new(HashMap::new()),
+            max_row_size: std::sync::atomic::AtomicU32::new(10 * 1024 * 1024),
         })
     }
 
@@ -444,6 +446,17 @@ impl BoogyDb {
     /// Check whether ACID transaction mode is enabled.
     pub fn is_acid(&self) -> bool {
         self.acid.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Set the maximum encoded row size in bytes. Rows larger than this will
+    /// be rejected with `BoogyError::RowTooLarge`. Default is 10 MiB.
+    pub fn set_max_row_size(&self, bytes: u32) {
+        self.max_row_size.store(bytes, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Get the current maximum row size in bytes.
+    pub fn max_row_size(&self) -> u32 {
+        self.max_row_size.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Check that an encrypted table has been unlocked before any operation.
@@ -725,6 +738,10 @@ impl BoogyDb {
             .collect();
         let row_bytes = row::encode_row(rowid, &col_values);
 
+        if row_bytes.len() > self.max_row_size() as usize {
+            return Err(BoogyError::RowTooLarge(row_bytes.len()));
+        }
+
         // 6. WriteGuard for B-tree insert + index maintenance.
         let durability = self.durability();
         {
@@ -781,6 +798,10 @@ impl BoogyDb {
             .filter_map(|(name, val)| state.meta.col_id(name).map(|cid| (cid, val)))
             .collect();
         let row_bytes = row::encode_row(rowid, &col_values);
+
+        if row_bytes.len() > self.max_row_size() as usize {
+            return Err(BoogyError::RowTooLarge(row_bytes.len()));
+        }
 
         // 6. WriteGuard for B-tree insert + index maintenance.
         let durability = self.durability();
@@ -1621,6 +1642,10 @@ impl BoogyDb {
                     .collect();
                 let row_bytes = row::encode_row(rowid, &col_values);
 
+                if row_bytes.len() > self.max_row_size() as usize {
+                    return Err(BoogyError::RowTooLarge(row_bytes.len()));
+                }
+
                 let mut tree = BTreeWriter::new(&mut guard, state.meta.root_page);
                 let new_root = tree.insert(rowid, &row_bytes)?;
                 state.meta.root_page = new_root;
@@ -1992,6 +2017,10 @@ impl<'a> AcidTransaction<'a> {
             .collect();
         let row_bytes = row::encode_row(rowid, &col_values);
 
+        if row_bytes.len() > self.db.max_row_size() as usize {
+            return Err(BoogyError::RowTooLarge(row_bytes.len()));
+        }
+
         // Extract index info before entering with_guard
         let index_info: Vec<(u16, crate::value::Type, u32)> = state
             .meta
@@ -2069,6 +2098,10 @@ impl<'a> AcidTransaction<'a> {
             .filter_map(|(name, val)| state.meta.col_id(name).map(|cid| (cid, val)))
             .collect();
         let row_bytes = row::encode_row(rowid, &col_values);
+
+        if row_bytes.len() > self.db.max_row_size() as usize {
+            return Err(BoogyError::RowTooLarge(row_bytes.len()));
+        }
 
         let index_info: Vec<(u16, crate::value::Type, u32)> = state
             .meta
