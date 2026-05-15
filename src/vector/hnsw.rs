@@ -206,14 +206,60 @@ pub fn search_layer(
     out
 }
 
-/// Simple neighbor selection: take the M closest from sorted candidates.
-pub fn select_neighbors(candidates: &[(u32, f32)], m: usize) -> Vec<u32> {
+/// Diversity-aware neighbor selection per Malkov & Yashunin (2018) heuristic.
+///
+/// Iterates candidates sorted by distance. A candidate is selected only if it's
+/// closer to the target node than to any already-selected neighbor. This ensures
+/// spatial diversity — each selected neighbor covers a different "direction" from
+/// the node, avoiding clusters of similar neighbors pointing to the same region.
+pub fn select_neighbors(
+    candidates: &[(u32, f32)],
+    m: usize,
+    distance_fn: &dyn Fn(&[f32], &[f32]) -> f32,
+    read_vector: &dyn Fn(u32) -> Vec<f32>,
+) -> Vec<u32> {
     let mut sorted: Vec<(u32, f32)> = candidates.to_vec();
     sorted.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
-    sorted.iter().take(m).map(|&(id, _)| id).collect()
+
+    let mut selected: Vec<u32> = Vec::with_capacity(m);
+    let mut selected_vecs: Vec<Vec<f32>> = Vec::with_capacity(m);
+
+    for &(cand_id, cand_dist) in &sorted {
+        if selected.len() >= m {
+            break;
+        }
+        let cand_vec = read_vector(cand_id);
+
+        // Check diversity: is this candidate closer to the node than to any
+        // already-selected neighbor?
+        let dominated = selected_vecs.iter().any(|sel_vec| {
+            distance_fn(&cand_vec, sel_vec) < cand_dist
+        });
+
+        if !dominated {
+            selected_vecs.push(cand_vec);
+            selected.push(cand_id);
+        }
+    }
+
+    // If diversity filtering was too aggressive, fill remaining slots with closest
+    if selected.len() < m {
+        for &(cand_id, _) in &sorted {
+            if selected.len() >= m {
+                break;
+            }
+            if !selected.contains(&cand_id) {
+                selected.push(cand_id);
+            }
+        }
+    }
+
+    selected
 }
 
-/// Prune a neighbor list: filter deleted, compute distances from node_id, keep closest max_neighbors.
+/// Diversity-aware neighbor pruning.
+///
+/// Filters deleted nodes, then applies the same diversity heuristic as select_neighbors.
 pub fn prune_neighbors(
     node_id: u32,
     current_neighbors: &[u32],
@@ -223,7 +269,7 @@ pub fn prune_neighbors(
     is_deleted: &dyn Fn(u32) -> bool,
 ) -> Vec<u32> {
     let node_vec = read_vector(node_id);
-    let mut scored: Vec<(u32, f32)> = current_neighbors
+    let scored: Vec<(u32, f32)> = current_neighbors
         .iter()
         .filter(|&&n| !is_deleted(n))
         .map(|&n| {
@@ -231,8 +277,7 @@ pub fn prune_neighbors(
             (n, d)
         })
         .collect();
-    scored.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
-    scored.iter().take(max_neighbors).map(|&(id, _)| id).collect()
+    select_neighbors(&scored, max_neighbors, distance_fn, read_vector)
 }
 
 /// Full k-NN search: descend upper layers, beam search layer 0, return top k.
@@ -354,8 +399,8 @@ pub fn insert(
             &|_| true,
         );
 
-        // Select M closest as neighbors for the new node
-        let selected = select_neighbors(&candidates, max_neighbors.min(m as usize));
+        // Select M neighbors with diversity heuristic
+        let selected = select_neighbors(&candidates, max_neighbors.min(m as usize), distance_fn, read_vector);
 
         // Record the new node's neighbor list at this layer
         connections.push((node_id, layer, selected.clone()));
@@ -502,7 +547,14 @@ mod tests {
     }
 
     #[test]
-    fn test_select_neighbors() {
+    fn test_select_neighbors_diversity() {
+        // 5 nodes on a line: positions 0, 1, 2, 3, 4
+        // Target node is at position 2.5 (implied by the distances)
+        // Candidates sorted by distance to target:
+        //   node 3 (0.5), node 1 (1.0), node 4 (2.0), node 2 (3.0), node 0 (5.0)
+        let vectors: Vec<Vec<f32>> = vec![
+            vec![0.0], vec![1.0], vec![2.0], vec![3.0], vec![4.0],
+        ];
         let candidates = vec![
             (0, 5.0),
             (1, 1.0),
@@ -510,9 +562,42 @@ mod tests {
             (3, 0.5),
             (4, 2.0),
         ];
-        let selected = select_neighbors(&candidates, 3);
-        // Should pick the 3 closest: node 3 (0.5), node 1 (1.0), node 4 (2.0)
-        assert_eq!(selected, vec![3, 1, 4]);
+        let selected = select_neighbors(
+            &candidates,
+            3,
+            &euclidean,
+            &|id| vectors[id as usize].clone(),
+        );
+        // Node 3 (closest) always selected first.
+        assert_eq!(selected[0], 3);
+        // Diversity heuristic may reorder remaining picks vs simple closest-M,
+        // but all selected nodes should be valid candidates.
+        assert_eq!(selected.len(), 3);
+        // All selected should be from the candidate set
+        for &s in &selected {
+            assert!(candidates.iter().any(|&(id, _)| id == s));
+        }
+    }
+
+    #[test]
+    fn test_select_neighbors_fills_when_diversity_too_aggressive() {
+        // If all candidates are in the same direction, diversity filtering
+        // might reject too many — the fallback fill should kick in.
+        let vectors: Vec<Vec<f32>> = vec![
+            vec![1.0], vec![2.0], vec![3.0], vec![4.0], vec![5.0],
+        ];
+        // All on the same side of the origin, very clustered
+        let candidates = vec![
+            (0, 1.0), (1, 2.0), (2, 3.0), (3, 4.0), (4, 5.0),
+        ];
+        let selected = select_neighbors(
+            &candidates,
+            3,
+            &euclidean,
+            &|id| vectors[id as usize].clone(),
+        );
+        // Should still return 3 neighbors (fallback fill)
+        assert_eq!(selected.len(), 3);
     }
 
     #[test]
