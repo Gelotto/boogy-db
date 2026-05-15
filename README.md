@@ -610,7 +610,7 @@ Sub-millisecond at all collection sizes. HNSW is **23x faster** than brute-force
 | 1K | 2,514 v/s | 2,379 v/s |
 | 10K | 1,134 v/s | 1,146 v/s |
 
-**Zero regression** on existing CRUD operations with the vector feature enabled (insert 193K/s, get 3.7M/s, find 187K/s — identical to without the feature).
+The vector feature adds zero overhead to existing CRUD operations when no vector collections are in use.
 
 ## Skills & Guides
 
