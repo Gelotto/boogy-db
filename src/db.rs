@@ -83,7 +83,7 @@ pub struct BoogyDb {
     table_ciphers: RwLock<HashMap<u32, Arc<crate::crypto::Cipher>>>,
     max_row_size: std::sync::atomic::AtomicU32,
     #[cfg(feature = "vector")]
-    vector_collections: RwLock<HashMap<(String, String), VectorCollection>>,
+    vector_collections: RwLock<HashMap<(String, String), Arc<RwLock<VectorCollection>>>>,
 }
 
 // System page (page 0) format:
@@ -2039,7 +2039,7 @@ impl BoogyDb {
             coll.rebuild_mappings(mappings);
 
             let key = Self::collection_key(&table, &collection);
-            self.vector_collections.write().unwrap().insert(key, coll);
+            self.vector_collections.write().unwrap().insert(key, Arc::new(RwLock::new(coll)));
         }
 
         Ok(())
@@ -2072,7 +2072,7 @@ impl BoogyDb {
         let vec_path = self.vector_file_path(table, name);
         let wal_path = self.vector_wal_path(table, name);
         let collection = VectorCollection::create(vec_path, wal_path, options)?;
-        collections.insert(key, collection);
+        collections.insert(key, Arc::new(RwLock::new(collection)));
 
         // Drop the write lock before creating the mapping table (it takes its own locks).
         drop(collections);
@@ -2112,7 +2112,7 @@ impl BoogyDb {
         let vec_path = self.vector_file_path(table, name);
         let wal_path = self.vector_wal_path(table, name);
         let collection = VectorCollection::open(vec_path, wal_path)?;
-        collections.insert(key, collection);
+        collections.insert(key, Arc::new(RwLock::new(collection)));
 
         Ok(())
     }
@@ -2125,10 +2125,13 @@ impl BoogyDb {
         mappings: Vec<(u64, u32)>,
     ) -> Result<()> {
         let key = Self::collection_key(table, collection);
-        let mut collections = self.vector_collections.write().unwrap();
-        let coll = collections.get_mut(&key).ok_or_else(|| {
-            BoogyError::VectorCollectionNotFound(format!("{table}.{collection}"))
-        })?;
+        let coll_arc = {
+            let collections = self.vector_collections.read().unwrap();
+            collections.get(&key).ok_or_else(|| {
+                BoogyError::VectorCollectionNotFound(format!("{table}.{collection}"))
+            })?.clone()
+        };
+        let mut coll = coll_arc.write().unwrap();
         coll.rebuild_mappings(mappings);
         Ok(())
     }
@@ -2174,16 +2177,18 @@ impl BoogyDb {
         }
 
         let key = Self::collection_key(table, collection);
-        let mut collections = self.vector_collections.write().unwrap();
-        let coll = collections.get_mut(&key).ok_or_else(|| {
-            BoogyError::VectorCollectionNotFound(format!("{table}.{collection}"))
-        })?;
+        let coll_arc = {
+            let collections = self.vector_collections.read().unwrap();
+            collections.get(&key).ok_or_else(|| {
+                BoogyError::VectorCollectionNotFound(format!("{table}.{collection}"))
+            })?.clone()
+        };
 
         let fsync = self.durability() == Durability::Immediate;
-        let node_id = coll.insert(rowid, vector, fsync)?;
-
-        // Drop the write lock before writing to the mapping table.
-        drop(collections);
+        let node_id = {
+            let mut coll = coll_arc.write().unwrap();
+            coll.insert(rowid, vector, fsync)?
+        };
 
         // Persist the rowid<->node_id mapping.
         let mapping_table = Self::vector_mapping_table(table, collection);
@@ -2202,22 +2207,24 @@ impl BoogyDb {
         entries: &[(u64, Vec<f32>)],
     ) -> Result<()> {
         let key = Self::collection_key(table, collection);
-        let mut collections = self.vector_collections.write().unwrap();
-        let coll = collections.get_mut(&key).ok_or_else(|| {
-            BoogyError::VectorCollectionNotFound(format!("{table}.{collection}"))
-        })?;
+        let coll_arc = {
+            let collections = self.vector_collections.read().unwrap();
+            collections.get(&key).ok_or_else(|| {
+                BoogyError::VectorCollectionNotFound(format!("{table}.{collection}"))
+            })?.clone()
+        };
 
         let fsync = self.durability() == Durability::Immediate;
         let last_idx = entries.len().saturating_sub(1);
         let mut node_ids = Vec::with_capacity(entries.len());
-        for (i, (rowid, vector)) in entries.iter().enumerate() {
-            let do_fsync = fsync && i == last_idx;
-            let node_id = coll.insert(*rowid, vector, do_fsync)?;
-            node_ids.push((*rowid, node_id));
+        {
+            let mut coll = coll_arc.write().unwrap();
+            for (i, (rowid, vector)) in entries.iter().enumerate() {
+                let do_fsync = fsync && i == last_idx;
+                let node_id = coll.insert(*rowid, vector, do_fsync)?;
+                node_ids.push((*rowid, node_id));
+            }
         }
-
-        // Drop the write lock before writing to the mapping table.
-        drop(collections);
 
         // Persist mappings.
         let mapping_table = Self::vector_mapping_table(table, collection);
@@ -2239,16 +2246,18 @@ impl BoogyDb {
         vector: &[f32],
     ) -> Result<()> {
         let key = Self::collection_key(table, collection);
-        let mut collections = self.vector_collections.write().unwrap();
-        let coll = collections.get_mut(&key).ok_or_else(|| {
-            BoogyError::VectorCollectionNotFound(format!("{table}.{collection}"))
-        })?;
+        let coll_arc = {
+            let collections = self.vector_collections.read().unwrap();
+            collections.get(&key).ok_or_else(|| {
+                BoogyError::VectorCollectionNotFound(format!("{table}.{collection}"))
+            })?.clone()
+        };
 
         let fsync = self.durability() == Durability::Immediate;
-        let new_node_id = coll.update(rowid, vector, fsync)?;
-
-        // Drop the write lock before modifying the mapping table.
-        drop(collections);
+        let new_node_id = {
+            let mut coll = coll_arc.write().unwrap();
+            coll.update(rowid, vector, fsync)?
+        };
 
         // Update the mapping (delete old, insert new node_id).
         let mapping_table = Self::vector_mapping_table(table, collection);
@@ -2268,16 +2277,18 @@ impl BoogyDb {
         rowid: u64,
     ) -> Result<()> {
         let key = Self::collection_key(table, collection);
-        let mut collections = self.vector_collections.write().unwrap();
-        let coll = collections.get_mut(&key).ok_or_else(|| {
-            BoogyError::VectorCollectionNotFound(format!("{table}.{collection}"))
-        })?;
+        let coll_arc = {
+            let collections = self.vector_collections.read().unwrap();
+            collections.get(&key).ok_or_else(|| {
+                BoogyError::VectorCollectionNotFound(format!("{table}.{collection}"))
+            })?.clone()
+        };
 
         let fsync = self.durability() == Durability::Immediate;
-        coll.delete(rowid, fsync)?;
-
-        // Drop the write lock before modifying the mapping table.
-        drop(collections);
+        {
+            let mut coll = coll_arc.write().unwrap();
+            coll.delete(rowid, fsync)?;
+        }
 
         // Remove the mapping.
         let mapping_table = Self::vector_mapping_table(table, collection);
@@ -2295,10 +2306,13 @@ impl BoogyDb {
         options: &VectorSearchOptions,
     ) -> Result<Vec<VectorResult>> {
         let key = Self::collection_key(table, collection);
-        let collections = self.vector_collections.read().unwrap();
-        let coll = collections.get(&key).ok_or_else(|| {
-            BoogyError::VectorCollectionNotFound(format!("{table}.{collection}"))
-        })?;
+        let coll_arc = {
+            let collections = self.vector_collections.read().unwrap();
+            collections.get(&key).ok_or_else(|| {
+                BoogyError::VectorCollectionNotFound(format!("{table}.{collection}"))
+            })?.clone()
+        };
+        let coll = coll_arc.read().unwrap();
 
         let row_loader: Option<Box<dyn Fn(u64) -> Option<Vec<(String, Value)>> + '_>> =
             options.filter.as_ref().map(|_| {
