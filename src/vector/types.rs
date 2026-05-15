@@ -38,6 +38,8 @@ pub struct VectorCollectionOptions {
     pub m: u32,
     /// Beam width during insert. Default: 200.
     pub ef_construction: u32,
+    /// Optional 256-bit encryption key. When set, the vector file and WAL are encrypted at rest.
+    pub key: Option<[u8; 32]>,
 }
 
 impl Default for VectorCollectionOptions {
@@ -47,6 +49,7 @@ impl Default for VectorCollectionOptions {
             metric: DistanceMetric::Cosine,
             m: 16,
             ef_construction: 200,
+            key: None,
         }
     }
 }

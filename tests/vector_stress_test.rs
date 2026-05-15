@@ -177,6 +177,7 @@ fn test_large_collection_recall_50k() {
         metric: DistanceMetric::Euclidean,
         m: 16,
         ef_construction: 200,
+        key: None,
     };
     db.create_vector_collection("items", "emb", &opts).unwrap();
 

@@ -85,6 +85,7 @@ fn setup_db(n: usize, rng: &mut Xorshift64) -> (BoogyDb, tempfile::TempDir) {
             metric: DistanceMetric::Cosine,
             m: 16,
             ef_construction: 200,
+            key: None,
         },
     )
     .unwrap();
@@ -353,6 +354,7 @@ fn bench_hnsw_vs_brute_force() {
             metric: DistanceMetric::Cosine,
             m: 16,
             ef_construction: 200,
+            key: None,
         },
     )
     .unwrap();

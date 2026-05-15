@@ -59,6 +59,35 @@ impl Cipher {
         Ok(page)
     }
 
+    /// Encrypt arbitrary-length plaintext. Returns `[nonce:12][ciphertext+tag]`.
+    pub fn encrypt_bytes(&self, plaintext: &[u8]) -> Result<Vec<u8>> {
+        let mut nonce_bytes = [0u8; NONCE_SIZE];
+        rand::fill(&mut nonce_bytes);
+        let nonce = Nonce::from_slice(&nonce_bytes);
+        let ciphertext = self
+            .inner
+            .encrypt(nonce, plaintext)
+            .map_err(|e| BoogyError::DecryptionFailed(format!("encryption failed: {e}")))?;
+        let mut out = Vec::with_capacity(NONCE_SIZE + ciphertext.len());
+        out.extend_from_slice(&nonce_bytes);
+        out.extend_from_slice(&ciphertext);
+        Ok(out)
+    }
+
+    /// Decrypt bytes produced by `encrypt_bytes`. Input: `[nonce:12][ciphertext+tag]`.
+    pub fn decrypt_bytes(&self, encrypted: &[u8]) -> Result<Vec<u8>> {
+        if encrypted.len() < NONCE_SIZE {
+            return Err(BoogyError::DecryptionFailed(
+                "encrypted data too short".into(),
+            ));
+        }
+        let nonce = Nonce::from_slice(&encrypted[..NONCE_SIZE]);
+        let ciphertext = &encrypted[NONCE_SIZE..];
+        self.inner
+            .decrypt(nonce, ciphertext)
+            .map_err(|e| BoogyError::DecryptionFailed(format!("decryption failed: {e}")))
+    }
+
     /// Decrypt a full encrypted page back to the original plaintext.
     pub fn decrypt_page(&self, encrypted: &[u8; PAGE_SIZE]) -> Result<[u8; ENCRYPTED_PAYLOAD_SIZE]> {
         let nonce = Nonce::from_slice(&encrypted[..NONCE_SIZE]);
@@ -164,5 +193,60 @@ mod tests {
         let cipher = Cipher::new(&key);
         let debug = format!("{:?}", cipher);
         assert_eq!(debug, "Cipher(***)");
+    }
+
+    #[test]
+    fn roundtrip_encrypt_decrypt_bytes() {
+        let key = test_key();
+        let cipher = Cipher::new(&key);
+
+        let plaintext = b"hello, arbitrary-length encryption!";
+        let encrypted = cipher.encrypt_bytes(plaintext).unwrap();
+        assert_ne!(&encrypted[..], &plaintext[..]);
+        let decrypted = cipher.decrypt_bytes(&encrypted).unwrap();
+        assert_eq!(&decrypted[..], &plaintext[..]);
+    }
+
+    #[test]
+    fn encrypt_bytes_large_payload() {
+        let key = test_key();
+        let cipher = Cipher::new(&key);
+
+        let mut plaintext = vec![0u8; 256 * 1024];
+        rand::fill(&mut plaintext[..]);
+        let encrypted = cipher.encrypt_bytes(&plaintext).unwrap();
+        let decrypted = cipher.decrypt_bytes(&encrypted).unwrap();
+        assert_eq!(decrypted, plaintext);
+    }
+
+    #[test]
+    fn decrypt_bytes_wrong_key_fails() {
+        let key1 = test_key();
+        let key2 = test_key();
+        let cipher1 = Cipher::new(&key1);
+        let cipher2 = Cipher::new(&key2);
+
+        let plaintext = b"secret data";
+        let encrypted = cipher1.encrypt_bytes(plaintext).unwrap();
+        let result = cipher2.decrypt_bytes(&encrypted);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn decrypt_bytes_too_short_fails() {
+        let key = test_key();
+        let cipher = Cipher::new(&key);
+        let result = cipher.decrypt_bytes(&[0u8; 5]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn encrypt_bytes_empty() {
+        let key = test_key();
+        let cipher = Cipher::new(&key);
+
+        let encrypted = cipher.encrypt_bytes(b"").unwrap();
+        let decrypted = cipher.decrypt_bytes(&encrypted).unwrap();
+        assert!(decrypted.is_empty());
     }
 }

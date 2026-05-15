@@ -1,8 +1,10 @@
-use std::fs::{File, OpenOptions};
+use std::fs::{self, File, OpenOptions};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use memmap2::MmapMut;
 
+use crate::crypto::Cipher;
 use crate::error::{BoogyError, Result};
 use crate::vector::types::DistanceMetric;
 
@@ -147,6 +149,7 @@ pub struct VecFile {
     _file: File,
     mmap: MmapMut,
     header: VecFileHeader,
+    cipher: Option<Cipher>,
 }
 
 impl VecFile {
@@ -160,15 +163,39 @@ impl VecFile {
         m: u32,
         ef_construction: u32,
         initial_capacity: u32,
+        key: Option<&[u8; 32]>,
     ) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .open(&path)?;
+        let cipher = key.map(Cipher::new);
 
         let size = total_file_size(initial_capacity, dimensions, m);
+
+        // When encrypted, the mmap is backed by an anonymous tempfile.
+        // The on-disk path only receives encrypted content on flush.
+        let file = if cipher.is_some() {
+            // Touch the path to claim it (error if it already exists).
+            OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)?;
+            // Create a tempfile for the mmap backing.
+            let tmp_path = path.with_extension("bvec.tmp");
+            let f = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&tmp_path)?;
+            let _ = fs::remove_file(&tmp_path);
+            f
+        } else {
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .open(&path)?
+        };
+
         file.set_len(size)?;
 
         let mut mmap = unsafe { MmapMut::map_mut(&file)? };
@@ -213,17 +240,51 @@ impl VecFile {
             graph_data_len: 0,
         };
 
-        Ok(VecFile { path, _file: file, mmap, header })
+        Ok(VecFile { path, _file: file, mmap, header, cipher })
     }
 
     /// Open an existing vector file.
-    pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+    ///
+    /// If the file is encrypted (does not start with BVEC magic), a key must be
+    /// provided. The encrypted content is decrypted into a temporary file which
+    /// is memory-mapped for zero-copy reads. On flush, the plaintext mmap is
+    /// encrypted back to the original path.
+    pub fn open(path: impl AsRef<Path>, key: Option<&[u8; 32]>) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
-        let file = OpenOptions::new().read(true).write(true).open(&path)?;
+        let cipher = key.map(Cipher::new);
 
-        let mmap = unsafe { MmapMut::map_mut(&file)? };
+        // Read the first 4 bytes to check if the file is encrypted.
+        let raw = fs::read(&path)?;
+        let is_encrypted = raw.len() < 4 || &raw[..4] != MAGIC;
 
-        // Validate magic.
+        let (file, mmap) = if is_encrypted {
+            // File is encrypted — decrypt and mmap a tempfile.
+            let c = cipher.as_ref().ok_or_else(|| {
+                BoogyError::DecryptionFailed("vec file is encrypted but no key provided".into())
+            })?;
+            let plaintext = c.decrypt_bytes(&raw)?;
+
+            // Write plaintext to a temp file in the same directory (same filesystem
+            // so that rename on flush is atomic).
+            let tmp_path = path.with_extension("bvec.tmp");
+            {
+                let mut tmp = File::create(&tmp_path)?;
+                tmp.write_all(&plaintext)?;
+                tmp.sync_all()?;
+            }
+            let file = OpenOptions::new().read(true).write(true).open(&tmp_path)?;
+            // Remove the temp file from the directory entry; the fd keeps it alive.
+            let _ = fs::remove_file(&tmp_path);
+            let mmap = unsafe { MmapMut::map_mut(&file)? };
+            (file, mmap)
+        } else {
+            // Unencrypted — mmap directly.
+            let file = OpenOptions::new().read(true).write(true).open(&path)?;
+            let mmap = unsafe { MmapMut::map_mut(&file)? };
+            (file, mmap)
+        };
+
+        // Validate magic (now guaranteed to be plaintext).
         if &mmap[OFF_MAGIC..OFF_MAGIC + 4] != MAGIC {
             return Err(BoogyError::Corruption(
                 "vec file: bad magic".into(),
@@ -268,7 +329,7 @@ impl VecFile {
             graph_data_len,
         };
 
-        Ok(VecFile { path, _file: file, mmap, header })
+        Ok(VecFile { path, _file: file, mmap, header, cipher })
     }
 
     // ── Header accessors ──────────────────────────────────────────────────────
@@ -547,6 +608,8 @@ impl VecFile {
     // ── Flush ─────────────────────────────────────────────────────────────────
 
     /// Write in-memory header fields back to the mmap and msync.
+    /// When a cipher is set, the plaintext mmap content is encrypted and written
+    /// to the original on-disk path.
     pub fn flush(&mut self) -> Result<()> {
         let h = self.header.clone();
 
@@ -571,12 +634,25 @@ impl VecFile {
         mmap_write_u64(&mut self.mmap, OFF_GRAPH_DATA_LEN, h.graph_data_len);
 
         self.mmap.flush()?;
+
+        // If encrypted, write the encrypted content to the on-disk path.
+        if let Some(ref cipher) = self.cipher {
+            let plaintext = &self.mmap[..];
+            let encrypted = cipher.encrypt_bytes(plaintext)?;
+            fs::write(&self.path, &encrypted)?;
+        }
+
         Ok(())
     }
 
     /// Path of the underlying file.
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Whether this file is encrypted at rest.
+    pub fn is_encrypted(&self) -> bool {
+        self.cipher.is_some()
     }
 }
 
@@ -642,7 +718,7 @@ mod tests {
 
     fn make_file(dir: &TempDir, dims: u32, m: u32, cap: u32) -> VecFile {
         let path = dir.path().join("test.bvec");
-        VecFile::create(&path, dims, DistanceMetric::Cosine, m, 200, cap).unwrap()
+        VecFile::create(&path, dims, DistanceMetric::Cosine, m, 200, cap, None).unwrap()
     }
 
     #[test]
@@ -652,7 +728,7 @@ mod tests {
 
         {
             let mut vf =
-                VecFile::create(&path, 4, DistanceMetric::Euclidean, 8, 100, 16).unwrap();
+                VecFile::create(&path, 4, DistanceMetric::Euclidean, 8, 100, 16, None).unwrap();
             assert_eq!(vf.header().dimensions, 4);
             assert_eq!(vf.header().metric, DistanceMetric::Euclidean);
             assert_eq!(vf.header().m, 8);
@@ -666,7 +742,7 @@ mod tests {
         }
 
         {
-            let vf = VecFile::open(&path).unwrap();
+            let vf = VecFile::open(&path, None).unwrap();
             assert_eq!(vf.header().dimensions, 4);
             assert_eq!(vf.header().metric, DistanceMetric::Euclidean);
             assert_eq!(vf.header().m, 8);
@@ -750,7 +826,7 @@ mod tests {
         let m = 2u32;
         let path = dir.path().join("grow.bvec");
         let mut vf =
-            VecFile::create(&path, dims, DistanceMetric::DotProduct, m, 50, cap).unwrap();
+            VecFile::create(&path, dims, DistanceMetric::DotProduct, m, 50, cap, None).unwrap();
 
         // Fill capacity: allocate all 4 nodes, write vectors + graph records.
         for i in 0..cap {
@@ -781,7 +857,7 @@ mod tests {
 
         // Flush + reopen to verify persistence.
         vf.flush().unwrap();
-        let vf2 = VecFile::open(&path).unwrap();
+        let vf2 = VecFile::open(&path, None).unwrap();
         assert_eq!(vf2.header().node_capacity, cap * 2);
         assert_eq!(vf2.header().node_count, cap + 1);
         for i in 0..cap {
