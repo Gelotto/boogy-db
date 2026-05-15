@@ -21,6 +21,7 @@ tempfile = "3"
 uuid = { version = "1", features = ["v4"] }
 rusqlite = { version = "0.38", features = ["bundled"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+usearch = "2.25"
 
 [[bench]]
 name = "sqlite_comparison"
@@ -48,5 +49,10 @@ name = "acid_ops"
 harness = false
 [[bench]]
 name = "vector_ops"
+harness = false
+required-features = ["vector"]
+
+[[bench]]
+name = "vector_comparison"
 harness = false
 required-features = ["vector"]
