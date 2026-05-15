@@ -153,40 +153,45 @@ impl VectorCollection {
             &|id| self.vecfile.is_deleted(id),
         );
 
-        // Build WAL entries.
+        // Compute new header values.
+        let new_ep = result.new_entry_point.unwrap_or_else(|| {
+            entry_point.unwrap_or(node_id)
+        });
+        let new_max = result.new_max_layer.unwrap_or(current_max_layer);
+
+        // Build ALL WAL entries before any mmap mutation of connections/header.
         let mut wal_entries = Vec::new();
         wal_entries.push(WalEntry::InsertVector {
             node_id,
             layer,
             vector: vector.to_vec(),
         });
-
-        // Apply connections to mmap and record in WAL.
         for &(nid, l, ref neighbors) in &result.connections {
-            self.vecfile.write_neighbors(nid, l, neighbors);
             wal_entries.push(WalEntry::SetNeighbors {
                 node_id: nid,
                 layer: l,
                 neighbors: neighbors.clone(),
             });
         }
-
-        // Update header (entry_point, max_layer).
-        let new_ep = result.new_entry_point.unwrap_or_else(|| {
-            entry_point.unwrap_or(node_id)
-        });
-        let new_max = result.new_max_layer.unwrap_or(current_max_layer);
-        self.vecfile.header_mut().entry_point = Some(new_ep);
-        self.vecfile.header_mut().max_layer = new_max;
-
         wal_entries.push(WalEntry::UpdateHeader {
             entry_point: new_ep,
             node_count: self.vecfile.header().node_count,
             max_layer: new_max,
         });
 
-        // Write WAL committed, flush mmap, truncate WAL.
+        // Write WAL committed BEFORE applying mutations to mmap.
         self.wal.append_committed(&wal_entries, fsync)?;
+
+        // Now apply connections to mmap.
+        for &(nid, l, ref neighbors) in &result.connections {
+            self.vecfile.write_neighbors(nid, l, neighbors);
+        }
+
+        // Update header in mmap.
+        self.vecfile.header_mut().entry_point = Some(new_ep);
+        self.vecfile.header_mut().max_layer = new_max;
+
+        // Flush mmap, then truncate WAL.
         self.vecfile.flush()?;
         self.wal.truncate()?;
 
@@ -204,32 +209,36 @@ impl VectorCollection {
         })?;
         self.node_to_rowid.remove(&node_id);
 
-        // Free node in mmap (marks deleted, adds to free list).
-        self.vecfile.free_node(node_id);
-
-        // If deleted node was entry point, find replacement.
+        // Compute new entry point BEFORE freeing the node (we need to read
+        // neighbors while the node is still intact).
         let mut new_ep = self.vecfile.header().entry_point;
         if new_ep == Some(node_id) {
-            // Find a replacement: any non-deleted neighbor at layer 0.
             let neighbors = self.vecfile.read_neighbors(node_id, 0);
             let replacement = neighbors
                 .iter()
                 .find(|&&n| !self.vecfile.is_deleted(n))
                 .copied();
             new_ep = replacement;
-            self.vecfile.header_mut().entry_point = new_ep;
         }
 
         let ep_raw = new_ep.unwrap_or(NONE_U32);
-        let mut wal_entries = Vec::new();
-        wal_entries.push(WalEntry::DeleteNode { node_id });
-        wal_entries.push(WalEntry::UpdateHeader {
-            entry_point: ep_raw,
-            node_count: self.vecfile.header().node_count,
-            max_layer: self.vecfile.header().max_layer,
-        });
+        let wal_entries = vec![
+            WalEntry::DeleteNode { node_id },
+            WalEntry::UpdateHeader {
+                entry_point: ep_raw,
+                node_count: self.vecfile.header().node_count,
+                max_layer: self.vecfile.header().max_layer,
+            },
+        ];
 
+        // Write WAL BEFORE mutating mmap.
         self.wal.append_committed(&wal_entries, fsync)?;
+
+        // Now apply mutations to mmap.
+        self.vecfile.free_node(node_id);
+        self.vecfile.header_mut().entry_point = new_ep;
+
+        // Flush mmap, then truncate WAL.
         self.vecfile.flush()?;
         self.wal.truncate()?;
 

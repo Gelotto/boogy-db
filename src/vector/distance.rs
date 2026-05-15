@@ -145,6 +145,37 @@ mod tests {
         assert_eq!(f(&a, &b), 0.0);
     }
 
+    // NaN handling tests.
+    //
+    // NaN propagates through IEEE 754 arithmetic, so any NaN in the input
+    // produces NaN output. This is "garbage in, garbage out" — callers must
+    // validate inputs before insertion. We document this here so that if
+    // NaN-guarding is added later, these tests catch the behavior change.
+
+    #[test]
+    fn nan_propagates_in_euclidean() {
+        let a = [1.0f32, f32::NAN, 3.0];
+        let b = [1.0f32, 2.0, 3.0];
+        let d = euclidean_distance(&a, &b);
+        assert!(d.is_nan(), "euclidean_distance with NaN input should return NaN, got {d}");
+    }
+
+    #[test]
+    fn nan_propagates_in_cosine() {
+        let a = [1.0f32, f32::NAN, 0.0];
+        let b = [1.0f32, 0.0, 0.0];
+        let d = cosine_distance(&a, &b);
+        assert!(d.is_nan(), "cosine_distance with NaN input should return NaN, got {d}");
+    }
+
+    #[test]
+    fn nan_propagates_in_dot_product() {
+        let a = [f32::NAN, 2.0];
+        let b = [1.0f32, 2.0];
+        let d = dot_product_distance(&a, &b);
+        assert!(d.is_nan(), "dot_product_distance with NaN input should return NaN, got {d}");
+    }
+
     // cosine on normalized vectors equals 1 - dot_product
     #[test]
     fn cosine_normalized_equals_one_minus_dot() {

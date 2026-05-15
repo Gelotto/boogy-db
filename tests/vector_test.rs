@@ -543,7 +543,167 @@ fn test_recall_against_brute_force() {
     let recall = hits as f64 / k as f64;
 
     assert!(
-        recall >= 0.80,
-        "recall {recall:.2} is below 80% floor (hits: {hits}/{k})"
+        recall >= 0.90,
+        "recall {recall:.2} is below 90% floor (hits: {hits}/{k})"
+    );
+}
+
+#[test]
+fn test_crash_recovery_persistence() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("recovery.boogy");
+
+    // Phase 1: create, insert, then drop (simulating clean shutdown).
+    {
+        let db = BoogyDb::open(&db_path).unwrap();
+        db.create_table(
+            "items",
+            &[
+                ColumnDef::new("name", Type::Text),
+                ColumnDef::new("category", Type::Text),
+            ],
+        )
+        .unwrap();
+
+        let opts = VectorCollectionOptions::new(3, DistanceMetric::Euclidean);
+        db.create_vector_collection("items", "emb", &opts).unwrap();
+
+        let id1 = db
+            .insert(
+                "items",
+                &[
+                    ("name", Value::Text("alpha".into())),
+                    ("category", Value::Text("A".into())),
+                ],
+            )
+            .unwrap();
+        let id2 = db
+            .insert(
+                "items",
+                &[
+                    ("name", Value::Text("beta".into())),
+                    ("category", Value::Text("B".into())),
+                ],
+            )
+            .unwrap();
+        let id3 = db
+            .insert(
+                "items",
+                &[
+                    ("name", Value::Text("gamma".into())),
+                    ("category", Value::Text("A".into())),
+                ],
+            )
+            .unwrap();
+
+        db.vector_insert("items", "emb", id1, &[1.0, 0.0, 0.0])
+            .unwrap();
+        db.vector_insert("items", "emb", id2, &[0.0, 1.0, 0.0])
+            .unwrap();
+        db.vector_insert("items", "emb", id3, &[0.0, 0.0, 1.0])
+            .unwrap();
+        // db dropped here -- WAL flush + truncate cycle completes
+    }
+
+    // Phase 2: reopen and verify vectors survived.
+    {
+        let db = BoogyDb::open(&db_path).unwrap();
+        let results = db
+            .vector_search(
+                "items",
+                "emb",
+                &[1.0, 0.0, 0.0],
+                &VectorSearchOptions::new(3),
+            )
+            .unwrap();
+
+        assert!(
+            !results.is_empty(),
+            "search after reopen should return results"
+        );
+        // The closest vector to [1,0,0] should be the first one we inserted.
+        // Verify we get all 3 back.
+        assert_eq!(
+            results.len(),
+            3,
+            "all 3 vectors should survive persistence, got {}",
+            results.len()
+        );
+    }
+}
+
+#[test]
+fn test_rowid_linkage_after_delete() {
+    let (_dir, db) = setup_db();
+
+    let opts = VectorCollectionOptions::new(3, DistanceMetric::Euclidean);
+    db.create_vector_collection("items", "emb", &opts).unwrap();
+
+    let id1 = db
+        .insert(
+            "items",
+            &[
+                ("name", Value::Text("one".into())),
+                ("category", Value::Text("X".into())),
+            ],
+        )
+        .unwrap();
+    let id2 = db
+        .insert(
+            "items",
+            &[
+                ("name", Value::Text("two".into())),
+                ("category", Value::Text("X".into())),
+            ],
+        )
+        .unwrap();
+    let id3 = db
+        .insert(
+            "items",
+            &[
+                ("name", Value::Text("three".into())),
+                ("category", Value::Text("X".into())),
+            ],
+        )
+        .unwrap();
+
+    db.vector_insert("items", "emb", id1, &[1.0, 0.0, 0.0])
+        .unwrap();
+    db.vector_insert("items", "emb", id2, &[0.0, 1.0, 0.0])
+        .unwrap();
+    db.vector_insert("items", "emb", id3, &[0.0, 0.0, 1.0])
+        .unwrap();
+
+    // Delete the vector for id2.
+    db.vector_delete("items", "emb", id2).unwrap();
+
+    // Search for something close to the deleted vector.
+    let results = db
+        .vector_search(
+            "items",
+            "emb",
+            &[0.0, 1.0, 0.0],
+            &VectorSearchOptions::new(10),
+        )
+        .unwrap();
+
+    // The deleted rowid must not appear in results.
+    for r in &results {
+        assert_ne!(
+            r.rowid, id2,
+            "deleted rowid {} should not appear in search results",
+            id2
+        );
+    }
+
+    // The remaining vectors should still be findable.
+    let result_rowids: Vec<u64> = results.iter().map(|r| r.rowid).collect();
+    assert!(
+        result_rowids.contains(&id1),
+        "rowid {id1} should be in results: {result_rowids:?}"
+    );
+    assert!(
+        result_rowids.contains(&id3),
+        "rowid {id3} should be in results: {result_rowids:?}"
     );
 }
