@@ -47,8 +47,9 @@ impl VectorCollection {
             options.m,
             options.ef_construction,
             1024,
+            options.key.as_ref(),
         )?;
-        let wal = VectorWal::open(wal_path)?;
+        let wal = VectorWal::open(wal_path, options.key.as_ref())?;
         let dist = distance_fn(options.metric);
 
         Ok(VectorCollection {
@@ -62,12 +63,15 @@ impl VectorCollection {
     }
 
     /// Open an existing vector collection.
+    ///
+    /// If the vector file is encrypted, `key` must be provided.
     pub fn open(
         vec_path: impl AsRef<Path>,
         wal_path: impl AsRef<Path>,
+        key: Option<&[u8; 32]>,
     ) -> Result<Self> {
-        let mut vecfile = VecFile::open(vec_path)?;
-        let mut wal = VectorWal::open(wal_path)?;
+        let mut vecfile = VecFile::open(vec_path, key)?;
+        let mut wal = VectorWal::open(wal_path, key)?;
 
         let metric = vecfile.header().metric;
         let dist = distance_fn(metric);
@@ -430,6 +434,7 @@ mod tests {
             metric: DistanceMetric::Euclidean,
             m: 8,
             ef_construction: 50,
+            key: None,
         }
     }
 
@@ -535,7 +540,7 @@ mod tests {
 
         // Reopen and rebuild mappings.
         {
-            let mut col = VectorCollection::open(&vec_path, &wal_path).unwrap();
+            let mut col = VectorCollection::open(&vec_path, &wal_path, None).unwrap();
             col.rebuild_mappings(vec![(100, 0), (200, 1), (300, 2)]);
 
             let results = col.search(&[1.0, 0.1, 0.0], 3, 50, None, None).unwrap();
@@ -554,5 +559,112 @@ mod tests {
 
         let results = col.search(&[1.0, 0.0, 0.0], 5, 50, None, None).unwrap();
         assert!(results.is_empty(), "empty collection search should return empty vec");
+    }
+
+    fn test_key() -> [u8; 32] {
+        let mut key = [0u8; 32];
+        rand::fill(&mut key);
+        key
+    }
+
+    fn encrypted_options(dims: u32, key: [u8; 32]) -> VectorCollectionOptions {
+        VectorCollectionOptions {
+            dimensions: dims,
+            metric: DistanceMetric::Euclidean,
+            m: 8,
+            ef_construction: 50,
+            key: Some(key),
+        }
+    }
+
+    #[test]
+    fn test_encrypted_vector_collection() {
+        let dir = TempDir::new().unwrap();
+        let vec_path = dir.path().join("enc.bvec");
+        let wal_path = dir.path().join("enc.bwal");
+        let key = test_key();
+
+        // Create, insert, search.
+        {
+            let opts = encrypted_options(3, key);
+            let mut col = VectorCollection::create(&vec_path, &wal_path, &opts).unwrap();
+            col.insert(100, &[1.0, 0.0, 0.0], false).unwrap();
+            col.insert(200, &[0.0, 1.0, 0.0], false).unwrap();
+            col.insert(300, &[0.0, 0.0, 1.0], false).unwrap();
+
+            let results = col.search(&[1.0, 0.1, 0.0], 3, 50, None, None).unwrap();
+            assert!(!results.is_empty());
+            assert_eq!(results[0].rowid, 100);
+        }
+
+        // Verify the file on disk is NOT plaintext (no BVEC magic).
+        let raw = std::fs::read(&vec_path).unwrap();
+        assert_ne!(&raw[..4], b"BVEC", "encrypted file should not have BVEC magic");
+
+        // Reopen with key, search again.
+        {
+            let mut col = VectorCollection::open(&vec_path, &wal_path, Some(&key)).unwrap();
+            col.rebuild_mappings(vec![(100, 0), (200, 1), (300, 2)]);
+
+            let results = col.search(&[1.0, 0.1, 0.0], 3, 50, None, None).unwrap();
+            assert!(!results.is_empty());
+            assert_eq!(results[0].rowid, 100);
+        }
+    }
+
+    #[test]
+    fn test_encrypted_wrong_key_fails() {
+        let dir = TempDir::new().unwrap();
+        let vec_path = dir.path().join("enc2.bvec");
+        let wal_path = dir.path().join("enc2.bwal");
+        let key = test_key();
+
+        {
+            let opts = encrypted_options(3, key);
+            let mut col = VectorCollection::create(&vec_path, &wal_path, &opts).unwrap();
+            col.insert(100, &[1.0, 0.0, 0.0], false).unwrap();
+        }
+
+        // Open with wrong key should fail.
+        let wrong_key = test_key();
+        let result = VectorCollection::open(&vec_path, &wal_path, Some(&wrong_key));
+        assert!(result.is_err(), "opening with wrong key should fail");
+    }
+
+    #[test]
+    fn test_encrypted_and_unencrypted_coexist() {
+        let dir = TempDir::new().unwrap();
+        let key = test_key();
+
+        // Encrypted collection.
+        let enc_vec = dir.path().join("enc.bvec");
+        let enc_wal = dir.path().join("enc.bwal");
+        let enc_opts = encrypted_options(3, key);
+        let mut enc_col = VectorCollection::create(&enc_vec, &enc_wal, &enc_opts).unwrap();
+        enc_col.insert(100, &[1.0, 0.0, 0.0], false).unwrap();
+
+        // Unencrypted collection.
+        let plain_vec = dir.path().join("plain.bvec");
+        let plain_wal = dir.path().join("plain.bwal");
+        let mut plain_col = VectorCollection::create(&plain_vec, &plain_wal, &test_options(3)).unwrap();
+        plain_col.insert(200, &[0.0, 1.0, 0.0], false).unwrap();
+
+        // Both should work independently.
+        let enc_results = enc_col.search(&[1.0, 0.0, 0.0], 1, 50, None, None).unwrap();
+        assert_eq!(enc_results[0].rowid, 100);
+
+        let plain_results = plain_col.search(&[0.0, 1.0, 0.0], 1, 50, None, None).unwrap();
+        assert_eq!(plain_results[0].rowid, 200);
+
+        // Drop both.
+        drop(enc_col);
+        drop(plain_col);
+
+        // Verify on disk: encrypted file has no BVEC magic, plain file does.
+        let enc_raw = std::fs::read(&enc_vec).unwrap();
+        assert_ne!(&enc_raw[..4], b"BVEC");
+
+        let plain_raw = std::fs::read(&plain_vec).unwrap();
+        assert_eq!(&plain_raw[..4], b"BVEC");
     }
 }

@@ -2022,8 +2022,13 @@ impl BoogyDb {
                 continue; // orphaned mapping table — skip
             }
 
-            // Open the vector collection.
-            let mut coll = VectorCollection::open(&vec_path, &wal_path)?;
+            // Try to open without a key. If the file is encrypted, skip it —
+            // the user must call unlock_vector_collection() to provide the key.
+            let mut coll = match VectorCollection::open(&vec_path, &wal_path, None) {
+                Ok(c) => c,
+                Err(BoogyError::DecryptionFailed(_)) => continue,
+                Err(e) => return Err(e),
+            };
 
             // Rebuild mappings from the internal table.
             let rows = self.find(&mapping_name, crate::filter::FindOptions::default())?;
@@ -2111,7 +2116,7 @@ impl BoogyDb {
 
         let vec_path = self.vector_file_path(table, name);
         let wal_path = self.vector_wal_path(table, name);
-        let collection = VectorCollection::open(vec_path, wal_path)?;
+        let collection = VectorCollection::open(vec_path, wal_path, None)?;
         collections.insert(key, Arc::new(RwLock::new(collection)));
 
         Ok(())
@@ -2133,6 +2138,56 @@ impl BoogyDb {
         };
         let mut coll = coll_arc.write().unwrap();
         coll.rebuild_mappings(mappings);
+        Ok(())
+    }
+
+    /// Unlock an encrypted vector collection by providing its key.
+    ///
+    /// Encrypted collections are skipped during `reopen_vector_collections`.
+    /// Call this method to provide the key and open them.
+    pub fn unlock_vector_collection(&self, table: &str, name: &str, key: &[u8; 32]) -> Result<()> {
+        // Verify table exists.
+        {
+            let tables = self.tables.read().unwrap();
+            if !tables.contains_key(table) {
+                return Err(BoogyError::TableNotFound(table.to_string()));
+            }
+        }
+
+        let coll_key = Self::collection_key(table, name);
+        {
+            let collections = self.vector_collections.read().unwrap();
+            if collections.contains_key(&coll_key) {
+                return Err(BoogyError::VectorCollectionExists(format!(
+                    "{table}.{name} is already open"
+                )));
+            }
+        }
+
+        let vec_path = self.vector_file_path(table, name);
+        let wal_path = self.vector_wal_path(table, name);
+
+        if !vec_path.exists() {
+            return Err(BoogyError::VectorCollectionNotFound(format!("{table}.{name}")));
+        }
+
+        let mut coll = VectorCollection::open(&vec_path, &wal_path, Some(key))?;
+
+        // Rebuild mappings from the internal mapping table.
+        let mapping_table = Self::vector_mapping_table(table, name);
+        let rows = self.find(&mapping_table, crate::filter::FindOptions::default())?;
+        let mappings: Vec<(u64, u32)> = rows.rows.iter()
+            .filter_map(|row| {
+                let node_id = match row.get("node_id") {
+                    Some(Value::Integer(n)) => n as u32,
+                    _ => return None,
+                };
+                Some((row.id, node_id))
+            })
+            .collect();
+        coll.rebuild_mappings(mappings);
+
+        self.vector_collections.write().unwrap().insert(coll_key, Arc::new(RwLock::new(coll)));
         Ok(())
     }
 

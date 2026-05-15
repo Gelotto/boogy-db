@@ -2,6 +2,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
+use crate::crypto::Cipher;
 use crate::error::Result;
 
 /// A single entry in the vector WAL.
@@ -125,6 +126,71 @@ fn read_u32(reader: &mut BufReader<&File>) -> std::io::Result<u32> {
     Ok(u32::from_le_bytes(buf))
 }
 
+fn read_u32_from<R: Read>(reader: &mut R) -> std::io::Result<u32> {
+    let mut buf = [0u8; 4];
+    reader.read_exact(&mut buf)?;
+    Ok(u32::from_le_bytes(buf))
+}
+
+/// Decode a WalEntry from a byte slice (used for decrypted WAL entries).
+fn decode_from_slice(data: &[u8]) -> crate::error::Result<Option<WalEntry>> {
+    use std::io::Cursor;
+    if data.is_empty() {
+        return Ok(None);
+    }
+    let mut cursor = Cursor::new(data);
+    let mut tag_buf = [0u8; 1];
+    match cursor.read_exact(&mut tag_buf) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(e) => return Err(e.into()),
+    }
+
+    let entry = match tag_buf[0] {
+        TAG_INSERT_VECTOR => {
+            let node_id = read_u32_from(&mut cursor)?;
+            let layer = read_u32_from(&mut cursor)?;
+            let vec_len = read_u32_from(&mut cursor)? as usize;
+            let mut vector = Vec::with_capacity(vec_len);
+            for _ in 0..vec_len {
+                let mut fb = [0u8; 4];
+                cursor.read_exact(&mut fb)?;
+                vector.push(f32::from_le_bytes(fb));
+            }
+            WalEntry::InsertVector { node_id, layer, vector }
+        }
+        TAG_SET_NEIGHBORS => {
+            let node_id = read_u32_from(&mut cursor)?;
+            let layer = read_u32_from(&mut cursor)?;
+            let count = read_u32_from(&mut cursor)? as usize;
+            let mut neighbors = Vec::with_capacity(count);
+            for _ in 0..count {
+                neighbors.push(read_u32_from(&mut cursor)?);
+            }
+            WalEntry::SetNeighbors { node_id, layer, neighbors }
+        }
+        TAG_DELETE_NODE => {
+            let node_id = read_u32_from(&mut cursor)?;
+            WalEntry::DeleteNode { node_id }
+        }
+        TAG_UPDATE_HEADER => {
+            let entry_point = read_u32_from(&mut cursor)?;
+            let node_count = read_u32_from(&mut cursor)?;
+            let max_layer = read_u32_from(&mut cursor)?;
+            WalEntry::UpdateHeader { entry_point, node_count, max_layer }
+        }
+        TAG_COMMIT => WalEntry::Commit,
+        _ => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "unknown WAL entry tag",
+            ).into());
+        }
+    };
+
+    Ok(Some(entry))
+}
+
 /// Write-ahead log for vector mutations.
 ///
 /// Each entry is written as `[len: u32 LE][encoded_data]`.
@@ -133,11 +199,12 @@ fn read_u32(reader: &mut BufReader<&File>) -> std::io::Result<u32> {
 pub struct VectorWal {
     pub path: PathBuf,
     pub file: File,
+    pub cipher: Option<Cipher>,
 }
 
 impl VectorWal {
     /// Open or create the WAL file at the given path.
-    pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+    pub fn open(path: impl AsRef<Path>, key: Option<&[u8; 32]>) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
         let file = OpenOptions::new()
             .read(true)
@@ -145,16 +212,24 @@ impl VectorWal {
             .create(true)
             .truncate(false)
             .open(&path)?;
-        Ok(Self { path, file })
+        let cipher = key.map(Cipher::new);
+        Ok(Self { path, file, cipher })
     }
 
-    /// Append a single entry as `[len: u32][encoded_data]`.
+    /// Append a single entry as `[len: u32][payload]`.
+    /// When encrypted, payload is `[nonce:12][ciphertext+tag]` of the encoded data.
+    /// When unencrypted, payload is the raw encoded data.
     pub fn append(&mut self, entry: &WalEntry) -> Result<()> {
         let data = entry.encode();
-        let len = data.len() as u32;
+        let payload = if let Some(ref cipher) = self.cipher {
+            cipher.encrypt_bytes(&data)?
+        } else {
+            data
+        };
+        let len = payload.len() as u32;
         self.file.seek(SeekFrom::End(0))?;
         self.file.write_all(&len.to_le_bytes())?;
-        self.file.write_all(&data)?;
+        self.file.write_all(&payload)?;
         Ok(())
     }
 
@@ -177,34 +252,65 @@ impl VectorWal {
     /// Incomplete transactions (entries after the last Commit) are silently discarded.
     pub fn read_committed(&mut self) -> Result<Vec<Vec<WalEntry>>> {
         self.file.seek(SeekFrom::Start(0))?;
-        let mut reader = BufReader::new(&self.file);
 
         let mut transactions: Vec<Vec<WalEntry>> = Vec::new();
         let mut current_tx: Vec<WalEntry> = Vec::new();
 
-        loop {
-            // Read the length prefix.
-            let mut len_buf = [0u8; 4];
-            match reader.read_exact(&mut len_buf) {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
-                Err(e) => return Err(e.into()),
-            }
-            let _len = u32::from_le_bytes(len_buf);
-
-            // Decode the entry.
-            match WalEntry::decode(&mut reader)? {
-                None => break,
-                Some(WalEntry::Commit) => {
-                    transactions.push(std::mem::take(&mut current_tx));
+        if self.cipher.is_some() {
+            // Encrypted path: read each [len:4][encrypted_payload] and decrypt
+            // before decoding.
+            let mut reader = BufReader::new(&self.file);
+            loop {
+                let mut len_buf = [0u8; 4];
+                match reader.read_exact(&mut len_buf) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                    Err(e) => return Err(e.into()),
                 }
-                Some(entry) => {
-                    current_tx.push(entry);
+                let len = u32::from_le_bytes(len_buf) as usize;
+                let mut encrypted = vec![0u8; len];
+                match reader.read_exact(&mut encrypted) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                    Err(e) => return Err(e.into()),
+                }
+                let plaintext = self.cipher.as_ref().unwrap().decrypt_bytes(&encrypted)?;
+                let entry = decode_from_slice(&plaintext)?;
+                match entry {
+                    Some(WalEntry::Commit) => {
+                        transactions.push(std::mem::take(&mut current_tx));
+                    }
+                    Some(e) => {
+                        current_tx.push(e);
+                    }
+                    None => break,
+                }
+            }
+        } else {
+            // Unencrypted path: original logic.
+            let mut reader = BufReader::new(&self.file);
+            loop {
+                let mut len_buf = [0u8; 4];
+                match reader.read_exact(&mut len_buf) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                    Err(e) => return Err(e.into()),
+                }
+                let _len = u32::from_le_bytes(len_buf);
+
+                match WalEntry::decode(&mut reader)? {
+                    None => break,
+                    Some(WalEntry::Commit) => {
+                        transactions.push(std::mem::take(&mut current_tx));
+                    }
+                    Some(entry) => {
+                        current_tx.push(entry);
+                    }
                 }
             }
         }
 
-        // Discard any incomplete trailing transaction (current_tx not flushed by Commit).
+        // Discard any incomplete trailing transaction.
         Ok(transactions)
     }
 
@@ -229,7 +335,7 @@ mod tests {
     #[test]
     fn test_append_and_read_committed() {
         let tmp = NamedTempFile::new().unwrap();
-        let mut wal = VectorWal::open(tmp.path()).unwrap();
+        let mut wal = VectorWal::open(tmp.path(), None).unwrap();
 
         let entries = vec![
             WalEntry::InsertVector { node_id: 1, layer: 0, vector: vec![0.1, 0.2, 0.3] },
@@ -259,7 +365,7 @@ mod tests {
     #[test]
     fn test_uncommitted_transaction_discarded() {
         let tmp = NamedTempFile::new().unwrap();
-        let mut wal = VectorWal::open(tmp.path()).unwrap();
+        let mut wal = VectorWal::open(tmp.path(), None).unwrap();
 
         // First transaction: committed.
         wal.append_committed(
@@ -285,7 +391,7 @@ mod tests {
     #[test]
     fn test_truncate() {
         let tmp = NamedTempFile::new().unwrap();
-        let mut wal = VectorWal::open(tmp.path()).unwrap();
+        let mut wal = VectorWal::open(tmp.path(), None).unwrap();
 
         wal.append_committed(
             &[WalEntry::DeleteNode { node_id: 1 }],
@@ -304,7 +410,7 @@ mod tests {
     #[test]
     fn test_empty_wal() {
         let tmp = NamedTempFile::new().unwrap();
-        let wal = VectorWal::open(tmp.path()).unwrap();
+        let wal = VectorWal::open(tmp.path(), None).unwrap();
 
         assert!(wal.is_empty().unwrap());
 
@@ -317,7 +423,7 @@ mod tests {
     #[test]
     fn test_multiple_transactions() {
         let tmp = NamedTempFile::new().unwrap();
-        let mut wal = VectorWal::open(tmp.path()).unwrap();
+        let mut wal = VectorWal::open(tmp.path(), None).unwrap();
 
         // Transaction 1.
         wal.append_committed(
