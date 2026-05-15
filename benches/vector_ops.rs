@@ -132,6 +132,7 @@ fn bench_insert_throughput() {
                     metric: DistanceMetric::Cosine,
                     m: 16,
                     ef_construction: 200,
+                    key: None,
                 },
             )
             .unwrap();
@@ -182,6 +183,7 @@ fn bench_insert_throughput() {
                     metric: DistanceMetric::Cosine,
                     m: 16,
                     ef_construction: 200,
+                    key: None,
                 },
             )
             .unwrap();
