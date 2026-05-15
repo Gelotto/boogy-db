@@ -252,7 +252,18 @@ impl VectorCollection {
     }
 
     /// Search for the k nearest vectors to a query.
-    pub fn search(&self, query: &[f32], k: u32, ef_search: u32) -> Result<Vec<VectorResult>> {
+    ///
+    /// When `row_loader` and `filter` are both provided, filtering happens inline
+    /// during HNSW graph traversal (pre-filtering). Nodes that fail the filter are
+    /// still expanded for graph connectivity but excluded from results.
+    pub fn search(
+        &self,
+        query: &[f32],
+        k: u32,
+        ef_search: u32,
+        row_loader: Option<&dyn Fn(u64) -> Option<Vec<(String, crate::value::Value)>>>,
+        filter: Option<&crate::filter::Filter>,
+    ) -> Result<Vec<VectorResult>> {
         let dims = self.vecfile.header().dimensions;
         if query.len() != dims as usize {
             return Err(BoogyError::VectorDimensionMismatch {
@@ -269,6 +280,43 @@ impl VectorCollection {
         let max_layer = self.vecfile.header().max_layer;
         let dist = self.dist_fn;
 
+        // Build the is_allowed closure. When both row_loader and filter are
+        // present, load the row and evaluate the filter. Cache results so each
+        // node is checked at most once.
+        use std::cell::RefCell;
+        let cache: RefCell<std::collections::HashMap<u32, bool>> =
+            RefCell::new(std::collections::HashMap::new());
+
+        let has_filter = row_loader.is_some() && filter.is_some();
+
+        let is_allowed = |node_id: u32| -> bool {
+            if !has_filter {
+                return true;
+            }
+            if let Some(&cached) = cache.borrow().get(&node_id) {
+                return cached;
+            }
+            let result = match self.node_to_rowid.get(&node_id) {
+                Some(&rowid) => {
+                    match row_loader.unwrap()(rowid) {
+                        Some(columns) => {
+                            let f = filter.unwrap();
+                            let val = columns
+                                .iter()
+                                .find(|(name, _)| *name == f.column)
+                                .map(|(_, v)| v.clone())
+                                .unwrap_or(crate::value::Value::Null);
+                            f.matches(&val)
+                        }
+                        None => false,
+                    }
+                }
+                None => false,
+            };
+            cache.borrow_mut().insert(node_id, result);
+            result
+        };
+
         let result = hnsw::search(
             query,
             k,
@@ -279,6 +327,7 @@ impl VectorCollection {
             &|id| self.vecfile.read_vector(id).to_vec(),
             &|id, l| self.vecfile.read_neighbors(id, l),
             &|id| self.vecfile.is_deleted(id),
+            &is_allowed,
         );
 
         let results = result
@@ -401,7 +450,7 @@ mod tests {
         col.insert(300, &[0.0, 0.0, 1.0], false).unwrap();
 
         // Search near [1, 0.1, 0].
-        let results = col.search(&[1.0, 0.1, 0.0], 3, 50).unwrap();
+        let results = col.search(&[1.0, 0.1, 0.0], 3, 50, None, None).unwrap();
         assert!(!results.is_empty(), "search should return results");
         assert_eq!(
             results[0].rowid, 100,
@@ -422,7 +471,7 @@ mod tests {
         // Delete middle vector.
         col.delete(200, false).unwrap();
 
-        let results = col.search(&[0.0, 1.0, 0.0], 3, 50).unwrap();
+        let results = col.search(&[0.0, 1.0, 0.0], 3, 50, None, None).unwrap();
         let rowids: Vec<u64> = results.iter().map(|r| r.rowid).collect();
         assert!(
             !rowids.contains(&200),
@@ -442,7 +491,7 @@ mod tests {
         // Update rowid 200 to be near rowid 100.
         col.update(200, &[0.9, 0.0, 0.0], false).unwrap();
 
-        let results = col.search(&[1.0, 0.0, 0.0], 2, 50).unwrap();
+        let results = col.search(&[1.0, 0.0, 0.0], 2, 50, None, None).unwrap();
         assert_eq!(results.len(), 2);
         let rowids: Vec<u64> = results.iter().map(|r| r.rowid).collect();
         assert!(rowids.contains(&100));
@@ -489,7 +538,7 @@ mod tests {
             let mut col = VectorCollection::open(&vec_path, &wal_path).unwrap();
             col.rebuild_mappings(vec![(100, 0), (200, 1), (300, 2)]);
 
-            let results = col.search(&[1.0, 0.1, 0.0], 3, 50).unwrap();
+            let results = col.search(&[1.0, 0.1, 0.0], 3, 50, None, None).unwrap();
             assert!(!results.is_empty(), "search after reopen should return results");
             assert_eq!(
                 results[0].rowid, 100,
@@ -503,7 +552,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let col = make_collection(&dir, 3);
 
-        let results = col.search(&[1.0, 0.0, 0.0], 5, 50).unwrap();
+        let results = col.search(&[1.0, 0.0, 0.0], 5, 50, None, None).unwrap();
         assert!(results.is_empty(), "empty collection search should return empty vec");
     }
 }

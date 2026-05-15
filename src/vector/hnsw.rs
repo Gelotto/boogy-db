@@ -154,6 +154,7 @@ pub fn search_layer(
     read_vector: &dyn Fn(u32) -> Vec<f32>,
     read_neighbors: &dyn Fn(u32, u32) -> Vec<u32>,
     is_deleted: &dyn Fn(u32) -> bool,
+    is_allowed: &dyn Fn(u32) -> bool,
 ) -> Vec<(u32, f32)> {
     let mut visited = HashSet::new();
     let mut candidates: BinaryHeap<Candidate> = BinaryHeap::new();
@@ -163,7 +164,7 @@ pub fn search_layer(
         if visited.insert(ep) {
             let d = distance_fn(query, &read_vector(ep));
             candidates.push(Candidate { distance: d, node_id: ep });
-            if !is_deleted(ep) {
+            if !is_deleted(ep) && is_allowed(ep) {
                 results.push(FarCandidate { distance: d, node_id: ep });
             }
         }
@@ -186,7 +187,7 @@ pub fn search_layer(
             let worst_dist = results.peek().map(|r| r.distance).unwrap_or(f32::MAX);
             if d < worst_dist || results.len() < ef as usize {
                 candidates.push(Candidate { distance: d, node_id: neighbor });
-                if !is_deleted(neighbor) {
+                if !is_deleted(neighbor) && is_allowed(neighbor) {
                     results.push(FarCandidate { distance: d, node_id: neighbor });
                     // Evict furthest if we exceed ef
                     if results.len() > ef as usize {
@@ -245,6 +246,7 @@ pub fn search(
     read_vector: &dyn Fn(u32) -> Vec<f32>,
     read_neighbors: &dyn Fn(u32, u32) -> Vec<u32>,
     is_deleted: &dyn Fn(u32) -> bool,
+    is_allowed: &dyn Fn(u32) -> bool,
 ) -> SearchResult {
     // Descend upper layers to find a good entry for layer 0
     let ep = if max_layer > 0 {
@@ -273,6 +275,7 @@ pub fn search(
         read_vector,
         read_neighbors,
         is_deleted,
+        is_allowed,
     );
 
     results.truncate(k as usize);
@@ -348,6 +351,7 @@ pub fn insert(
             read_vector,
             read_neighbors,
             is_deleted,
+            &|_| true,
         );
 
         // Select M closest as neighbors for the new node
@@ -535,6 +539,7 @@ mod tests {
             &|id| graph.read_vector(id),
             &|id, layer| graph.read_neighbors(id, layer),
             &|id| graph.is_deleted(id),
+            &|_| true,
         );
 
         // Should find nodes 2 and 3 as closest (distance 0.25 each)
@@ -621,6 +626,7 @@ mod tests {
             &|id| graph.read_vector(id),
             &|id, layer| graph.read_neighbors(id, layer),
             &|id| graph.is_deleted(id),
+            &|_| true,
         );
 
         let ids: Vec<u32> = result.neighbors.iter().map(|r| r.0).collect();
@@ -689,6 +695,7 @@ mod tests {
             &|id| graph.read_vector(id),
             &|id, layer| graph.read_neighbors(id, layer),
             &|id| graph.is_deleted(id),
+            &|_| true,
         );
 
         let ids: Vec<u32> = result.neighbors.iter().map(|r| r.0).collect();
