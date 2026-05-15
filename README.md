@@ -20,6 +20,7 @@ Built from scratch around a B+ tree with per-table concurrency, a redo-log WAL, 
 - [Encryption](#encryption)
 - [Async API](#async-api)
 - [ACID Transactions](#acid-transactions)
+- [Vector Search](#vector-search)
 - [Skills & Guides](#skills--guides)
 - [Architecture](#architecture)
 - [License](#license)
@@ -474,6 +475,101 @@ When ACID mode is on, standalone operations outside `begin()` are automatically 
 ### How It Works
 
 ACID transactions hold a private dirty page buffer. Each operation briefly acquires the global write lock (microseconds), does the B+ tree mutation in the private buffer, and releases. Tables not touched by the transaction are completely unblocked. `commit()` publishes all pages atomically in one batch. Drop without commit discards the buffer — a zero-cost rollback.
+
+## Vector Search
+
+boogy-db includes an optional HNSW-based approximate nearest-neighbor index for dense vector embeddings. Enable it with the `vector` feature flag.
+
+### Setup
+
+```toml
+[dependencies]
+boogy-db = { path = ".", features = ["vector"] }
+```
+
+### Usage
+
+```rust
+use boogy_db::*;
+use boogy_db::vector::{VectorCollectionOptions, VectorSearchOptions, DistanceMetric};
+
+let db = BoogyDb::open("my.boogy")?;
+
+// Create a table and a vector collection on it
+db.create_table("documents", &[
+    ColumnDef::new("title", Type::Text),
+    ColumnDef::new("category", Type::Text),
+])?;
+
+db.create_vector_collection(
+    "documents",
+    "embeddings",
+    VectorCollectionOptions::new(768, DistanceMetric::Cosine),
+)?;
+
+// Insert a row and its embedding
+let id = db.insert("documents", &[
+    ("title", Value::Text("Hello world".into())),
+    ("category", Value::Text("general".into())),
+])?;
+
+let embedding: Vec<f32> = vec![0.1_f32; 768]; // your embedding here
+db.vector_insert("documents", "embeddings", id, &embedding)?;
+
+// Batch insert embeddings
+let batch: Vec<(u64, Vec<f32>)> = vec![
+    (id, embedding.clone()),
+];
+db.vector_insert_batch("documents", "embeddings", &batch)?;
+
+// Basic k-nearest-neighbor search (k=10)
+let query: Vec<f32> = vec![0.1_f32; 768];
+let results = db.vector_search(
+    "documents",
+    "embeddings",
+    &query,
+    VectorSearchOptions::new(10),
+)?;
+
+for (rowid, score) in &results {
+    println!("rowid={rowid}  score={score:.4}");
+}
+
+// Filtered search — only search within a specific category
+let results = db.vector_search(
+    "documents",
+    "embeddings",
+    &query,
+    VectorSearchOptions {
+        k: 10,
+        ef_search: 50,
+        filter: Some(Filter::eq("category", "general")),
+    },
+)?;
+
+// Update an embedding
+let new_embedding: Vec<f32> = vec![0.2_f32; 768];
+db.vector_update("documents", "embeddings", id, &new_embedding)?;
+
+// Delete an embedding
+db.vector_delete("documents", "embeddings", id)?;
+```
+
+### Distance Metrics
+
+| Metric | Constant | Best For |
+|--------|----------|----------|
+| Cosine similarity | `DistanceMetric::Cosine` | Text embeddings (magnitude-independent) |
+| Euclidean distance | `DistanceMetric::Euclidean` | Image features, spatial data |
+| Dot product | `DistanceMetric::DotProduct` | Pre-normalized vectors where magnitude encodes relevance |
+
+### HNSW Parameters
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `m` | 16 | Number of bi-directional links per node. Higher values improve recall at the cost of memory and build time. |
+| `ef_construction` | 200 | Candidate list size during index build. Higher values improve recall; does not affect search speed. |
+| `ef_search` | 10 | Candidate list size during search. Raise this to trade query latency for higher recall. Overridden per-query via `VectorSearchOptions::ef_search`. |
 
 ## Skills & Guides
 
