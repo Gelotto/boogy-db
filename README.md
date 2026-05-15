@@ -593,13 +593,24 @@ Concurrency: per-collection `RwLock`. Searches on different collections never bl
 
 ### Performance (128 dims, AVX2, Durability::None)
 
-| Collection Size | Search Avg | Search p99 | Throughput |
-|-----------------|-----------|-----------|------------|
-| 1K | 97 µs | 104 µs | 10,208/s |
-| 10K | 201 µs | 660 µs | 4,969/s |
-| 50K | 326 µs | 883 µs | 3,059/s |
+**Search Latency** (k=10, ef_search=50):
 
-HNSW is 18-24x faster than brute-force linear scan at 10K vectors.
+| Collection Size | Avg | p50 | p99 | Throughput |
+|-----------------|-----|-----|-----|------------|
+| 1K | 100 µs | 99 µs | 119 µs | 9,992/s |
+| 10K | 168 µs | 166 µs | 208 µs | 5,946/s |
+| 50K | 310 µs | 289 µs | 717 µs | 3,219/s |
+
+Sub-millisecond at all collection sizes. HNSW is **23x faster** than brute-force linear scan at 10K vectors.
+
+**Insert Throughput:**
+
+| Vectors | Single | Batch(100) |
+|---------|--------|------------|
+| 1K | 2,514 v/s | 2,379 v/s |
+| 10K | 1,134 v/s | 1,146 v/s |
+
+**Zero regression** on existing CRUD operations with the vector feature enabled (insert 193K/s, get 3.7M/s, find 187K/s — identical to without the feature).
 
 ## Skills & Guides
 
