@@ -151,10 +151,8 @@ impl VectorCollection {
             current_max_layer,
             m,
             ef_construction,
-            &|a, b| dist(a, b),
-            &|id| self.vecfile.read_vector(id).to_vec(),
-            &|id, l| self.vecfile.read_neighbors(id, l),
-            &|id| self.vecfile.is_deleted(id),
+            dist,
+            &self.vecfile,
         );
 
         // Compute new header values.
@@ -327,10 +325,8 @@ impl VectorCollection {
             ef_search,
             entry_point,
             max_layer,
-            &|a, b| dist(a, b),
-            &|id| self.vecfile.read_vector(id).to_vec(),
-            &|id, l| self.vecfile.read_neighbors(id, l),
-            &|id| self.vecfile.is_deleted(id),
+            dist,
+            &self.vecfile,
             &is_allowed,
         );
 

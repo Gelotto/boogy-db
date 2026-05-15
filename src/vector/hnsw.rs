@@ -66,6 +66,16 @@ impl Ord for FarCandidate {
     }
 }
 
+// --- Trait for vector data access ---
+
+/// Trait for accessing vector data during HNSW operations.
+/// Enables zero-copy reads from mmap'd storage.
+pub trait VectorStorage {
+    fn vector(&self, id: u32) -> &[f32];
+    fn neighbors(&self, id: u32, layer: u32) -> Vec<u32>;
+    fn is_deleted(&self, id: u32) -> bool;
+}
+
 // --- Result types ---
 
 pub struct InsertResult {
@@ -104,13 +114,11 @@ pub fn search_upper_layers(
     query: &[f32],
     current_max_layer: u32,
     target_layer: u32,
-    distance_fn: &dyn Fn(&[f32], &[f32]) -> f32,
-    read_vector: &dyn Fn(u32) -> Vec<f32>,
-    read_neighbors: &dyn Fn(u32, u32) -> Vec<u32>,
-    is_deleted: &dyn Fn(u32) -> bool,
+    distance_fn: fn(&[f32], &[f32]) -> f32,
+    storage: &impl VectorStorage,
 ) -> u32 {
     let mut current = entry_point;
-    let mut current_dist = distance_fn(query, &read_vector(current));
+    let mut current_dist = distance_fn(query, storage.vector(current));
 
     for layer in (target_layer..=current_max_layer).rev() {
         if layer <= target_layer {
@@ -120,12 +128,12 @@ pub fn search_upper_layers(
         let mut improved = true;
         while improved {
             improved = false;
-            let neighbors = read_neighbors(current, layer);
+            let neighbors = storage.neighbors(current, layer);
             for &neighbor in &neighbors {
-                if is_deleted(neighbor) {
+                if storage.is_deleted(neighbor) {
                     continue;
                 }
-                let d = distance_fn(query, &read_vector(neighbor));
+                let d = distance_fn(query, storage.vector(neighbor));
                 if d < current_dist {
                     current = neighbor;
                     current_dist = d;
@@ -150,10 +158,8 @@ pub fn search_layer(
     query: &[f32],
     ef: u32,
     layer: u32,
-    distance_fn: &dyn Fn(&[f32], &[f32]) -> f32,
-    read_vector: &dyn Fn(u32) -> Vec<f32>,
-    read_neighbors: &dyn Fn(u32, u32) -> Vec<u32>,
-    is_deleted: &dyn Fn(u32) -> bool,
+    distance_fn: fn(&[f32], &[f32]) -> f32,
+    storage: &impl VectorStorage,
     is_allowed: &dyn Fn(u32) -> bool,
 ) -> Vec<(u32, f32)> {
     let mut visited = HashSet::new();
@@ -162,9 +168,9 @@ pub fn search_layer(
 
     for &ep in entry_points {
         if visited.insert(ep) {
-            let d = distance_fn(query, &read_vector(ep));
+            let d = distance_fn(query, storage.vector(ep));
             candidates.push(Candidate { distance: d, node_id: ep });
-            if !is_deleted(ep) && is_allowed(ep) {
+            if !storage.is_deleted(ep) && is_allowed(ep) {
                 results.push(FarCandidate { distance: d, node_id: ep });
             }
         }
@@ -177,17 +183,17 @@ pub fn search_layer(
             break;
         }
 
-        let neighbors = read_neighbors(closest.node_id, layer);
+        let neighbors = storage.neighbors(closest.node_id, layer);
         for &neighbor in &neighbors {
             if !visited.insert(neighbor) {
                 continue;
             }
-            let d = distance_fn(query, &read_vector(neighbor));
+            let d = distance_fn(query, storage.vector(neighbor));
 
             let worst_dist = results.peek().map(|r| r.distance).unwrap_or(f32::MAX);
             if d < worst_dist || results.len() < ef as usize {
                 candidates.push(Candidate { distance: d, node_id: neighbor });
-                if !is_deleted(neighbor) && is_allowed(neighbor) {
+                if !storage.is_deleted(neighbor) && is_allowed(neighbor) {
                     results.push(FarCandidate { distance: d, node_id: neighbor });
                     // Evict furthest if we exceed ef
                     if results.len() > ef as usize {
@@ -215,29 +221,27 @@ pub fn search_layer(
 pub fn select_neighbors(
     candidates: &[(u32, f32)],
     m: usize,
-    distance_fn: &dyn Fn(&[f32], &[f32]) -> f32,
-    read_vector: &dyn Fn(u32) -> Vec<f32>,
+    distance_fn: fn(&[f32], &[f32]) -> f32,
+    storage: &impl VectorStorage,
 ) -> Vec<u32> {
     let mut sorted: Vec<(u32, f32)> = candidates.to_vec();
     sorted.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
 
     let mut selected: Vec<u32> = Vec::with_capacity(m);
-    let mut selected_vecs: Vec<Vec<f32>> = Vec::with_capacity(m);
 
     for &(cand_id, cand_dist) in &sorted {
         if selected.len() >= m {
             break;
         }
-        let cand_vec = read_vector(cand_id);
+        let cand_vec = storage.vector(cand_id);
 
         // Check diversity: is this candidate closer to the node than to any
         // already-selected neighbor?
-        let dominated = selected_vecs.iter().any(|sel_vec| {
-            distance_fn(&cand_vec, sel_vec) < cand_dist
+        let dominated = selected.iter().any(|&sel_id| {
+            distance_fn(cand_vec, storage.vector(sel_id)) < cand_dist
         });
 
         if !dominated {
-            selected_vecs.push(cand_vec);
             selected.push(cand_id);
         }
     }
@@ -264,20 +268,19 @@ pub fn prune_neighbors(
     node_id: u32,
     current_neighbors: &[u32],
     max_neighbors: usize,
-    distance_fn: &dyn Fn(&[f32], &[f32]) -> f32,
-    read_vector: &dyn Fn(u32) -> Vec<f32>,
-    is_deleted: &dyn Fn(u32) -> bool,
+    distance_fn: fn(&[f32], &[f32]) -> f32,
+    storage: &impl VectorStorage,
 ) -> Vec<u32> {
-    let node_vec = read_vector(node_id);
+    let node_vec = storage.vector(node_id);
     let scored: Vec<(u32, f32)> = current_neighbors
         .iter()
-        .filter(|&&n| !is_deleted(n))
+        .filter(|&&n| !storage.is_deleted(n))
         .map(|&n| {
-            let d = distance_fn(&node_vec, &read_vector(n));
+            let d = distance_fn(node_vec, storage.vector(n));
             (n, d)
         })
         .collect();
-    select_neighbors(&scored, max_neighbors, distance_fn, read_vector)
+    select_neighbors(&scored, max_neighbors, distance_fn, storage)
 }
 
 /// Full k-NN search: descend upper layers, beam search layer 0, return top k.
@@ -287,10 +290,8 @@ pub fn search(
     ef_search: u32,
     entry_point: u32,
     max_layer: u32,
-    distance_fn: &dyn Fn(&[f32], &[f32]) -> f32,
-    read_vector: &dyn Fn(u32) -> Vec<f32>,
-    read_neighbors: &dyn Fn(u32, u32) -> Vec<u32>,
-    is_deleted: &dyn Fn(u32) -> bool,
+    distance_fn: fn(&[f32], &[f32]) -> f32,
+    storage: &impl VectorStorage,
     is_allowed: &dyn Fn(u32) -> bool,
 ) -> SearchResult {
     // Descend upper layers to find a good entry for layer 0
@@ -301,9 +302,7 @@ pub fn search(
             max_layer,
             0,
             distance_fn,
-            read_vector,
-            read_neighbors,
-            is_deleted,
+            storage,
         )
     } else {
         entry_point
@@ -317,9 +316,7 @@ pub fn search(
         ef,
         0,
         distance_fn,
-        read_vector,
-        read_neighbors,
-        is_deleted,
+        storage,
         is_allowed,
     );
 
@@ -339,10 +336,8 @@ pub fn insert(
     current_max_layer: u32,
     m: u32,
     ef_construction: u32,
-    distance_fn: &dyn Fn(&[f32], &[f32]) -> f32,
-    read_vector: &dyn Fn(u32) -> Vec<f32>,
-    read_neighbors: &dyn Fn(u32, u32) -> Vec<u32>,
-    is_deleted: &dyn Fn(u32) -> bool,
+    distance_fn: fn(&[f32], &[f32]) -> f32,
+    storage: &impl VectorStorage,
 ) -> InsertResult {
     let mut connections: Vec<(u32, u32, Vec<u32>)> = Vec::new();
 
@@ -364,20 +359,18 @@ pub fn insert(
         Some(ep) => ep,
     };
 
-    let query = read_vector(node_id);
+    let query = storage.vector(node_id);
 
     // Descend through upper layers (above this node's level) to find nearest entry
     let mut current_ep = ep;
     if current_max_layer > level {
         current_ep = search_upper_layers(
             ep,
-            &query,
+            query,
             current_max_layer,
             level,
             distance_fn,
-            read_vector,
-            read_neighbors,
-            is_deleted,
+            storage,
         );
     }
 
@@ -389,25 +382,23 @@ pub fn insert(
         // Search for nearest neighbors at this layer
         let candidates = search_layer(
             &[current_ep],
-            &query,
+            query,
             ef_construction,
             layer,
             distance_fn,
-            read_vector,
-            read_neighbors,
-            is_deleted,
+            storage,
             &|_| true,
         );
 
         // Select M neighbors with diversity heuristic
-        let selected = select_neighbors(&candidates, max_neighbors.min(m as usize), distance_fn, read_vector);
+        let selected = select_neighbors(&candidates, max_neighbors.min(m as usize), distance_fn, storage);
 
         // Record the new node's neighbor list at this layer
         connections.push((node_id, layer, selected.clone()));
 
         // Bidirectional connections: add node_id as neighbor of each selected node
         for &neighbor in &selected {
-            let mut neighbor_list = read_neighbors(neighbor, layer);
+            let mut neighbor_list = storage.neighbors(neighbor, layer);
             if !neighbor_list.contains(&node_id) {
                 neighbor_list.push(node_id);
             }
@@ -419,8 +410,7 @@ pub fn insert(
                     &neighbor_list,
                     max_neighbors,
                     distance_fn,
-                    read_vector,
-                    is_deleted,
+                    storage,
                 );
             }
 
@@ -469,6 +459,24 @@ mod tests {
         deleted: Vec<bool>,
     }
 
+    impl VectorStorage for TestGraph {
+        fn vector(&self, id: u32) -> &[f32] {
+            &self.vectors[id as usize]
+        }
+        fn neighbors(&self, id: u32, layer: u32) -> Vec<u32> {
+            let n = id as usize;
+            let l = layer as usize;
+            if n < self.neighbors.len() && l < self.neighbors[n].len() {
+                self.neighbors[n][l].clone()
+            } else {
+                Vec::new()
+            }
+        }
+        fn is_deleted(&self, id: u32) -> bool {
+            self.deleted.get(id as usize).copied().unwrap_or(false)
+        }
+    }
+
     impl TestGraph {
         fn new() -> Self {
             TestGraph {
@@ -510,24 +518,6 @@ mod tests {
                 self.neighbors[n][l] = neighbor_list.clone();
             }
         }
-
-        fn read_vector(&self, id: u32) -> Vec<f32> {
-            self.vectors[id as usize].clone()
-        }
-
-        fn read_neighbors(&self, id: u32, layer: u32) -> Vec<u32> {
-            let n = id as usize;
-            let l = layer as usize;
-            if n < self.neighbors.len() && l < self.neighbors[n].len() {
-                self.neighbors[n][l].clone()
-            } else {
-                Vec::new()
-            }
-        }
-
-        fn is_deleted(&self, id: u32) -> bool {
-            self.deleted.get(id as usize).copied().unwrap_or(false)
-        }
     }
 
     #[test]
@@ -552,9 +542,25 @@ mod tests {
         // Target node is at position 2.5 (implied by the distances)
         // Candidates sorted by distance to target:
         //   node 3 (0.5), node 1 (1.0), node 4 (2.0), node 2 (3.0), node 0 (5.0)
-        let vectors: Vec<Vec<f32>> = vec![
-            vec![0.0], vec![1.0], vec![2.0], vec![3.0], vec![4.0],
-        ];
+        struct InlineStorage {
+            vectors: Vec<Vec<f32>>,
+        }
+        impl VectorStorage for InlineStorage {
+            fn vector(&self, id: u32) -> &[f32] {
+                &self.vectors[id as usize]
+            }
+            fn neighbors(&self, _id: u32, _layer: u32) -> Vec<u32> {
+                Vec::new()
+            }
+            fn is_deleted(&self, _id: u32) -> bool {
+                false
+            }
+        }
+        let storage = InlineStorage {
+            vectors: vec![
+                vec![0.0], vec![1.0], vec![2.0], vec![3.0], vec![4.0],
+            ],
+        };
         let candidates = vec![
             (0, 5.0),
             (1, 1.0),
@@ -565,8 +571,8 @@ mod tests {
         let selected = select_neighbors(
             &candidates,
             3,
-            &euclidean,
-            &|id| vectors[id as usize].clone(),
+            euclidean,
+            &storage,
         );
         // Node 3 (closest) always selected first.
         assert_eq!(selected[0], 3);
@@ -583,9 +589,25 @@ mod tests {
     fn test_select_neighbors_fills_when_diversity_too_aggressive() {
         // If all candidates are in the same direction, diversity filtering
         // might reject too many — the fallback fill should kick in.
-        let vectors: Vec<Vec<f32>> = vec![
-            vec![1.0], vec![2.0], vec![3.0], vec![4.0], vec![5.0],
-        ];
+        struct InlineStorage {
+            vectors: Vec<Vec<f32>>,
+        }
+        impl VectorStorage for InlineStorage {
+            fn vector(&self, id: u32) -> &[f32] {
+                &self.vectors[id as usize]
+            }
+            fn neighbors(&self, _id: u32, _layer: u32) -> Vec<u32> {
+                Vec::new()
+            }
+            fn is_deleted(&self, _id: u32) -> bool {
+                false
+            }
+        }
+        let storage = InlineStorage {
+            vectors: vec![
+                vec![1.0], vec![2.0], vec![3.0], vec![4.0], vec![5.0],
+            ],
+        };
         // All on the same side of the origin, very clustered
         let candidates = vec![
             (0, 1.0), (1, 2.0), (2, 3.0), (3, 4.0), (4, 5.0),
@@ -593,8 +615,8 @@ mod tests {
         let selected = select_neighbors(
             &candidates,
             3,
-            &euclidean,
-            &|id| vectors[id as usize].clone(),
+            euclidean,
+            &storage,
         );
         // Should still return 3 neighbors (fallback fill)
         assert_eq!(selected.len(), 3);
@@ -620,10 +642,8 @@ mod tests {
             &query,
             10,
             0,
-            &euclidean,
-            &|id| graph.read_vector(id),
-            &|id, layer| graph.read_neighbors(id, layer),
-            &|id| graph.is_deleted(id),
+            euclidean,
+            &graph,
             &|_| true,
         );
 
@@ -649,10 +669,8 @@ mod tests {
             0,
             16,
             200,
-            &euclidean,
-            &|id| graph.read_vector(id),
-            &|id, layer| graph.read_neighbors(id, layer),
-            &|id| graph.is_deleted(id),
+            euclidean,
+            &graph,
         );
         assert_eq!(result.new_entry_point, Some(0));
         assert_eq!(result.node_id, 0);
@@ -681,10 +699,8 @@ mod tests {
                 max_layer,
                 m,
                 ef_construction,
-                &euclidean,
-                &|id| graph.read_vector(id),
-                &|id, layer| graph.read_neighbors(id, layer),
-                &|id| graph.is_deleted(id),
+                euclidean,
+                &graph,
             );
             graph.apply_insert(&result);
             if let Some(ep) = result.new_entry_point {
@@ -707,10 +723,8 @@ mod tests {
             16,
             entry_point.unwrap(),
             max_layer,
-            &euclidean,
-            &|id| graph.read_vector(id),
-            &|id, layer| graph.read_neighbors(id, layer),
-            &|id| graph.is_deleted(id),
+            euclidean,
+            &graph,
             &|_| true,
         );
 
@@ -748,10 +762,8 @@ mod tests {
                 max_layer,
                 m,
                 ef_construction,
-                &euclidean,
-                &|id| graph.read_vector(id),
-                &|id, layer| graph.read_neighbors(id, layer),
-                &|id| graph.is_deleted(id),
+                euclidean,
+                &graph,
             );
             graph.apply_insert(&result);
             if let Some(ep) = result.new_entry_point {
@@ -776,10 +788,8 @@ mod tests {
             16,
             entry_point.unwrap(),
             max_layer,
-            &euclidean,
-            &|id| graph.read_vector(id),
-            &|id, layer| graph.read_neighbors(id, layer),
-            &|id| graph.is_deleted(id),
+            euclidean,
+            &graph,
             &|_| true,
         );
 

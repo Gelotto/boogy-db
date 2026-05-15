@@ -709,6 +709,20 @@ fn mmap_write_u64(mmap: &mut MmapMut, off: usize, val: u64) {
     mmap[off..off + 8].copy_from_slice(&val.to_le_bytes());
 }
 
+// ── VectorStorage impl ───────────────────────────────────────────────────────
+
+impl crate::vector::hnsw::VectorStorage for VecFile {
+    fn vector(&self, id: u32) -> &[f32] {
+        self.read_vector(id)
+    }
+    fn neighbors(&self, id: u32, layer: u32) -> Vec<u32> {
+        self.read_neighbors(id, layer)
+    }
+    fn is_deleted(&self, id: u32) -> bool {
+        self.is_deleted(id)
+    }
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
