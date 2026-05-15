@@ -211,3 +211,59 @@ impl<'a> AsyncTransaction<'a> {
         self.inner.delete_where(table, filters)
     }
 }
+
+// ---------------------------------------------------------------------------
+// Vector search (async wrappers)
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "vector")]
+impl AsyncBoogyDb {
+    pub async fn create_vector_collection(
+        &self,
+        table: &str,
+        name: &str,
+        options: &crate::vector::VectorCollectionOptions,
+    ) -> Result<()> {
+        self.inner.create_vector_collection(table, name, options)
+    }
+
+    pub async fn drop_vector_collection(&self, table: &str, name: &str) -> Result<()> {
+        self.inner.drop_vector_collection(table, name)
+    }
+
+    pub async fn vector_insert(
+        &self, table: &str, collection: &str, rowid: u64, vector: &[f32],
+    ) -> Result<()> {
+        self.inner.vector_insert(table, collection, rowid, vector)
+    }
+
+    pub async fn vector_insert_batch(
+        &self, table: &str, collection: &str, entries: &[(u64, Vec<f32>)],
+    ) -> Result<()> {
+        self.inner.vector_insert_batch(table, collection, entries)
+    }
+
+    pub async fn vector_update(
+        &self, table: &str, collection: &str, rowid: u64, vector: &[f32],
+    ) -> Result<()> {
+        self.inner.vector_update(table, collection, rowid, vector)
+    }
+
+    pub async fn vector_delete(
+        &self, table: &str, collection: &str, rowid: u64,
+    ) -> Result<()> {
+        self.inner.vector_delete(table, collection, rowid)
+    }
+
+    pub async fn vector_search(
+        &self, table: &str, collection: &str, query: &[f32], options: &crate::vector::VectorSearchOptions,
+    ) -> Result<Vec<crate::vector::VectorResult>> {
+        self.inner.vector_search(table, collection, query, options)
+    }
+
+    pub async fn unlock_vector_collection(
+        &self, table: &str, name: &str, key: &[u8; 32],
+    ) -> Result<()> {
+        self.inner.unlock_vector_collection(table, name, key)
+    }
+}
