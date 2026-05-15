@@ -41,6 +41,13 @@ Built from scratch around a B+ tree with per-table concurrency, a redo-log WAL, 
 - Zero-copy filter evaluation on raw page bytes
 - Batch bulk operations via single-pass leaf-chain walks
 
+**Vector Search** (opt-in `vector` feature)
+- HNSW approximate nearest-neighbor search with mmap'd storage and dedicated WAL
+- AVX2 SIMD distance computation (cosine, euclidean, dot product) — runtime-detected
+- Pre-filtered search — metadata predicates evaluated inline during graph traversal
+- Diversity-based neighbor selection for high-quality graph construction
+- Per-collection AES-256-GCM encryption and per-collection RwLock concurrency
+
 **Security & Reliability**
 - Per-table AES-256-GCM encryption (opt-in, zero overhead when off)
 - ACID transactions with rollback (opt-in, zero overhead when off)
@@ -478,7 +485,7 @@ ACID transactions hold a private dirty page buffer. Each operation briefly acqui
 
 ## Vector Search
 
-boogy-db includes an optional HNSW-based approximate nearest-neighbor index for dense vector embeddings. Enable it with the `vector` feature flag.
+HNSW-based approximate nearest-neighbor search for dense vector embeddings. Custom mmap'd storage with its own WAL, AVX2 SIMD distance computation, pre-filtered search, diversity-based graph construction, per-collection encryption, and per-collection concurrency. Enable with the `vector` feature flag.
 
 ### Setup
 
@@ -491,20 +498,17 @@ boogy-db = { path = ".", features = ["vector"] }
 
 ```rust
 use boogy_db::*;
-use boogy_db::vector::{VectorCollectionOptions, VectorSearchOptions, DistanceMetric};
 
 let db = BoogyDb::open("my.boogy")?;
 
-// Create a table and a vector collection on it
 db.create_table("documents", &[
     ColumnDef::new("title", Type::Text),
     ColumnDef::new("category", Type::Text),
 ])?;
 
-db.create_vector_collection(
-    "documents",
-    "embeddings",
-    VectorCollectionOptions::new(768, DistanceMetric::Cosine),
+// Create a vector collection linked to the table
+db.create_vector_collection("documents", "embeddings",
+    &VectorCollectionOptions::new(768, DistanceMetric::Cosine),
 )?;
 
 // Insert a row and its embedding
@@ -512,48 +516,56 @@ let id = db.insert("documents", &[
     ("title", Value::Text("Hello world".into())),
     ("category", Value::Text("general".into())),
 ])?;
-
-let embedding: Vec<f32> = vec![0.1_f32; 768]; // your embedding here
 db.vector_insert("documents", "embeddings", id, &embedding)?;
 
-// Batch insert embeddings
-let batch: Vec<(u64, Vec<f32>)> = vec![
-    (id, embedding.clone()),
-];
-db.vector_insert_batch("documents", "embeddings", &batch)?;
+// Batch insert
+db.vector_insert_batch("documents", "embeddings", &[
+    (id1, embedding1),
+    (id2, embedding2),
+])?;
 
-// Basic k-nearest-neighbor search (k=10)
-let query: Vec<f32> = vec![0.1_f32; 768];
-let results = db.vector_search(
-    "documents",
-    "embeddings",
-    &query,
-    VectorSearchOptions::new(10),
+// k-NN search
+let results = db.vector_search("documents", "embeddings", &query,
+    &VectorSearchOptions::new(10),
 )?;
-
-for (rowid, score) in &results {
-    println!("rowid={rowid}  score={score:.4}");
+for r in &results {
+    let row = db.get("documents", r.rowid)?.unwrap();
+    println!("{}: {}", row.get("title").unwrap(), r.distance);
 }
 
-// Filtered search — only search within a specific category
-let results = db.vector_search(
-    "documents",
-    "embeddings",
-    &query,
-    VectorSearchOptions {
+// Filtered search (pre-filtered — inline during HNSW traversal)
+let results = db.vector_search("documents", "embeddings", &query,
+    &VectorSearchOptions {
         k: 10,
         ef_search: 50,
         filter: Some(Filter::eq("category", "general")),
     },
 )?;
 
-// Update an embedding
-let new_embedding: Vec<f32> = vec![0.2_f32; 768];
+// Update / delete
 db.vector_update("documents", "embeddings", id, &new_embedding)?;
-
-// Delete an embedding
 db.vector_delete("documents", "embeddings", id)?;
 ```
+
+### Encrypted Collections
+
+```rust
+let key: [u8; 32] = /* your 256-bit key */;
+
+db.create_vector_collection("documents", "embeddings",
+    &VectorCollectionOptions {
+        dimensions: 768,
+        metric: DistanceMetric::Cosine,
+        key: Some(key),
+        ..Default::default()
+    },
+)?;
+
+// After reopening the database, unlock the encrypted collection
+db.unlock_vector_collection("documents", "embeddings", &key)?;
+```
+
+Plaintext lives in memory (mmap) for zero-copy HNSW traversal. Ciphertext on disk (AES-256-GCM). The WAL is also encrypted. Wrong key on unlock returns `DecryptionFailed`.
 
 ### Distance Metrics
 
@@ -563,13 +575,31 @@ db.vector_delete("documents", "embeddings", id)?;
 | Euclidean distance | `DistanceMetric::Euclidean` | Image features, spatial data |
 | Dot product | `DistanceMetric::DotProduct` | Pre-normalized vectors where magnitude encodes relevance |
 
+All three are AVX2-accelerated on x86-64 (runtime-detected, scalar fallback on other architectures).
+
 ### HNSW Parameters
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `m` | 16 | Number of bi-directional links per node. Higher values improve recall at the cost of memory and build time. |
-| `ef_construction` | 200 | Candidate list size during index build. Higher values improve recall; does not affect search speed. |
-| `ef_search` | 10 | Candidate list size during search. Raise this to trade query latency for higher recall. Overridden per-query via `VectorSearchOptions::ef_search`. |
+| `m` | 16 | Bi-directional links per node. Higher = better recall, more memory. |
+| `ef_construction` | 200 | Candidate list size during index build. Higher = better graph quality. |
+| `ef_search` | 10 | Candidate list size during search. Higher = better recall, slower search. Per-query via `VectorSearchOptions::ef_search`. |
+
+### How It Works
+
+Each vector collection is a separate mmap'd file (`{db}.{table}.{collection}.vec`) with its own WAL. The HNSW graph uses diversity-based neighbor selection (Malkov & Yashunin heuristic) for high-quality graph construction. Filtered search evaluates metadata predicates inline during graph traversal — no post-filter inflation.
+
+Concurrency: per-collection `RwLock`. Searches on different collections never block each other. Writes to one collection don't block searches on another. Rowid-to-node mappings are persisted in internal boogy-db tables and automatically restored on reopen.
+
+### Performance (128 dims, AVX2, Durability::None)
+
+| Collection Size | Search Avg | Search p99 | Throughput |
+|-----------------|-----------|-----------|------------|
+| 1K | 97 µs | 104 µs | 10,208/s |
+| 10K | 201 µs | 660 µs | 4,969/s |
+| 50K | 326 µs | 883 µs | 3,059/s |
+
+HNSW is 18-24x faster than brute-force linear scan at 10K vectors.
 
 ## Skills & Guides
 
