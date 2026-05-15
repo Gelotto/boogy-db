@@ -46,3 +46,7 @@ harness = false
 [[bench]]
 name = "acid_ops"
 harness = false
+[[bench]]
+name = "vector_ops"
+harness = false
+required-features = ["vector"]
