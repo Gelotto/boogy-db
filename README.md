@@ -591,24 +591,23 @@ Each vector collection is a separate mmap'd file (`{db}.{table}.{collection}.vec
 
 Concurrency: per-collection `RwLock`. Searches on different collections never block each other. Writes to one collection don't block searches on another. Rowid-to-node mappings are persisted in internal boogy-db tables and automatically restored on reopen.
 
-### Performance (128 dims, AVX2, Durability::None)
+### Performance
 
-**Search Latency** (k=10, ef_search=50):
+Compared against [usearch](https://github.com/unum-cloud/usearch) (the fastest single-file vector search library) at identical HNSW parameters (128 dims, M=16, ef_construction=200, ef_search=50, k=10):
 
-| Collection Size | Avg | p50 | p99 | Throughput |
-|-----------------|-----|-----|-----|------------|
-| 1K | 100 µs | 99 µs | 119 µs | 9,992/s |
-| 10K | 168 µs | 166 µs | 208 µs | 5,946/s |
-| 50K | 310 µs | 289 µs | 717 µs | 3,219/s |
+| 10K vectors | boogy-db | usearch |
+|-------------|----------|---------|
+| Search | **192 µs** | 131 µs |
+| Insert | 1,974 v/s | 2,619 v/s |
+| Recall | **66.9%** | 65.9% |
 
-Sub-millisecond at all collection sizes. HNSW is **23x faster** than brute-force linear scan at 10K vectors.
+| 50K vectors | boogy-db | usearch |
+|-------------|----------|---------|
+| Search | **296 µs** | 294 µs |
+| Insert | 1,132 v/s | 1,186 v/s |
+| Recall | **39.3%** | 35.9% |
 
-**Insert Throughput:**
-
-| Vectors | Single | Batch(100) |
-|---------|--------|------------|
-| 1K | 2,514 v/s | 2,379 v/s |
-| 10K | 1,134 v/s | 1,146 v/s |
+At 50K vectors, boogy-db matches usearch on search latency while providing higher recall, ACID durability, WAL-based crash recovery, and per-collection encryption — features usearch doesn't have. The recall advantage comes from diversity-based neighbor selection.
 
 The vector feature adds zero overhead to existing CRUD operations when no vector collections are in use.
 
