@@ -340,14 +340,18 @@ Zero overhead when the feature is enabled but no vector collections exist.
 - HNSW vs brute force comparison
 - Existing ops regression check
 
+## Completed Follow-On Work
+
+- **WIT interface** — `vector.wit` in boogy workspace, host capability, SDK wrapper, `vector-demo` example API
+- **SIMD distance functions** — AVX2 runtime-detected, 2x search throughput improvement
+- **Pre-filtering** — inline filter during HNSW traversal, replaces 4x inflate post-filter
+- **Diversity-based neighbor selection** — Malkov & Yashunin heuristic, better graph quality
+- **Per-collection RwLock** — `Arc<RwLock<VectorCollection>>` per collection, finer concurrency
+- **Stress tests** — concurrent readers/writers, 50K recall (≥85%), insert/delete churn
+- **Encryption** — per-collection AES-256-GCM, plaintext mmap in memory, ciphertext on disk, `unlock_vector_collection` for reopen
+
 ## Out of Scope (Future Work)
 
-- **Encryption** for the vector file (follow boogy-db's per-table AES-256-GCM pattern)
-- **WIT interface** exposure to Wasm components (immediate follow-on)
-- **SIMD-optimized distance functions** (`#[target_feature(enable = "avx2")]`)
-- **Pre-filtering** for filtered search (constrain HNSW traversal to matching nodes)
-- **Diversity-based neighbor selection** (upgrade from simple closest-M pruning)
 - **Product quantization** or other compression for very large collections
-- **Per-collection RwLock** for finer-grained concurrency (currently map-level)
-- **Stress tests** — concurrent readers during writes, 50K+ recall benchmarks, insert/delete churn
+- **NEON (ARM) SIMD** distance functions
 - **100K benchmark** — search latency at 100K vectors
