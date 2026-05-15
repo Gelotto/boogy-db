@@ -2300,34 +2300,20 @@ impl BoogyDb {
             BoogyError::VectorCollectionNotFound(format!("{table}.{collection}"))
         })?;
 
-        if options.filter.is_some() {
-            // Filtered search: inflate ef_search and k by 4x, then post-filter.
-            let inflated_k = options.k.saturating_mul(4);
-            let inflated_ef = options.ef_search.saturating_mul(4);
-            let candidates = coll.search(query, inflated_k, inflated_ef)?;
+        let row_loader: Option<Box<dyn Fn(u64) -> Option<Vec<(String, Value)>> + '_>> =
+            options.filter.as_ref().map(|_| {
+                Box::new(|rowid: u64| -> Option<Vec<(String, Value)>> {
+                    self.get(table, rowid).ok().flatten().map(|row| row.columns())
+                }) as Box<dyn Fn(u64) -> Option<Vec<(String, Value)>>>
+            });
 
-            let filter = options.filter.as_ref().unwrap();
-            let mut filtered = Vec::with_capacity(options.k as usize);
-
-            for result in candidates {
-                if filtered.len() >= options.k as usize {
-                    break;
-                }
-                // Load the row from boogy-db and check the filter.
-                if let Ok(Some(row)) = self.get(table, result.rowid) {
-                    let col_val = row
-                        .get(&filter.column)
-                        .unwrap_or(Value::Null);
-                    if filter.matches(&col_val) {
-                        filtered.push(result);
-                    }
-                }
-            }
-
-            Ok(filtered)
-        } else {
-            coll.search(query, options.k, options.ef_search)
-        }
+        coll.search(
+            query,
+            options.k,
+            options.ef_search,
+            row_loader.as_ref().map(|b| b.as_ref()),
+            options.filter.as_ref(),
+        )
     }
 }
 

@@ -633,6 +633,82 @@ fn test_crash_recovery_persistence() {
 }
 
 #[test]
+fn test_prefilter_selective_filter() {
+    let (_dir, db) = setup_db();
+
+    let opts = VectorCollectionOptions::new(4, DistanceMetric::Euclidean);
+    db.create_vector_collection("items", "emb", &opts).unwrap();
+
+    // Insert 100 items: 95 "common", 5 "rare".
+    // Spread vectors across the space so the rare items are not clustered near
+    // the query. A naive post-filter with fixed inflation would likely miss some.
+    let mut rare_ids = Vec::new();
+    for i in 0..100u32 {
+        let cat = if i >= 95 { "rare" } else { "common" };
+        let id = db
+            .insert(
+                "items",
+                &[
+                    ("name", Value::Text(format!("item_{i}"))),
+                    ("category", Value::Text(cat.into())),
+                ],
+            )
+            .unwrap();
+
+        // Place common items near the origin, rare items scattered further out.
+        let angle = i as f32 * 2.0 * std::f32::consts::PI / 100.0;
+        let radius = if i >= 95 { 5.0 + i as f32 } else { 1.0 };
+        let v = [
+            radius * angle.cos(),
+            radius * angle.sin(),
+            (i as f32) * 0.01,
+            0.0,
+        ];
+        db.vector_insert("items", "emb", id, &v).unwrap();
+
+        if i >= 95 {
+            rare_ids.push(id);
+        }
+    }
+
+    // Search with filter category = "rare", k=5.
+    let mut search_opts = VectorSearchOptions::new(5);
+    search_opts.filter = Some(Filter::eq("category", "rare"));
+
+    let results = db
+        .vector_search("items", "emb", &[0.0, 0.0, 0.0, 0.0], &search_opts)
+        .unwrap();
+
+    // All 5 rare items must be found — pre-filter traverses the whole graph.
+    assert_eq!(
+        results.len(),
+        5,
+        "expected all 5 rare items, got {}",
+        results.len()
+    );
+    let result_ids: Vec<u64> = results.iter().map(|r| r.rowid).collect();
+    for &rid in &rare_ids {
+        assert!(
+            result_ids.contains(&rid),
+            "rare rowid {rid} missing from results: {result_ids:?}"
+        );
+    }
+
+    // Every returned row must actually have category "rare".
+    for r in &results {
+        let row = db.get("items", r.rowid).unwrap().unwrap();
+        let cat = row.get("category").unwrap();
+        assert_eq!(
+            cat,
+            Value::Text("rare".into()),
+            "result rowid {} has wrong category: {:?}",
+            r.rowid,
+            cat
+        );
+    }
+}
+
+#[test]
 fn test_rowid_linkage_after_delete() {
     let (_dir, db) = setup_db();
 
