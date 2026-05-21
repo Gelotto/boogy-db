@@ -6,10 +6,10 @@ Embedded storage engine for SpinStack. In-place B+ tree with WAL, per-table conc
 
 | Module | Responsibility |
 |--------|---------------|
-| `db.rs` | Public API (`BoogyDb`). Table registry, system page (de)serialization, locking protocol, WAL commit path, ACID transaction support (`AcidTransaction` with private dirty page buffer). All public methods go here. |
+| `db.rs` | Public API (`BoogyDb`). Table registry, system page (de)serialization, locking protocol, WAL commit path, ACID transaction support (`AcidTransaction` with private dirty page buffer). All public methods go here. New batch/index primitives: `create_index_ex(table, name, &[col], unique)` (composite + enforced unique indexes; inserts and upserts return `BoogyError::UniqueViolation` on duplicate key), `scan_batch(table, filters, or_groups, order, after, limit)` (cursor-based bounded range scan — `ScanOrder::primary_key(dir)` / `ScanOrder::index(name, dir)`, `ScanKey` resume token, `ScanBatch` result), `upsert_increment(table, key, counter, delta, set)` (atomic keyed find-or-insert-then-add, int/real delta). |
 | `file.rs` | `PageFile` (shared read cache + disk I/O) and `WriteGuard` (exclusive dirty overlay). The concurrency boundary. |
 | `btree.rs` | `BTreeReader` (read-only, takes `&PageFile`) and `BTreeWriter` (takes `&mut WriteGuard`). u64-keyed B+ tree with leaf-chain walks. |
-| `index.rs` | `IndexTreeReader`/`IndexTreeWriter`. Composite-key B+ tree for secondary indexes. Key encoding (sortable integers, floats, null-terminated text). |
+| `index.rs` | `IndexTreeReader`/`IndexTreeWriter`. Composite-key B+ tree for secondary indexes. Key encoding (sortable integers, floats, null-terminated text). `encode_composite_index_key` / `encode_composite_value_prefix` for multi-column `(v₁, v₂, …, rowid)` sortable keys. |
 | `page.rs` | `Page` struct (4096-byte buffer). Header layout, row offset array, checksum. Page type flags (leaf/branch/system/free). |
 | `row.rs` | Row binary format: `[rowid:8][num_cols:2][offset_directory][column_data]`. Encode, decode, `extract_column` (binary search), `extract_column_raw` (zero-copy), `patch_row`/`patch_row_multi` (in-place splice). |
 | `filter.rs` | `Filter`, `FilterOp`, `FindOptions` (incl. `or_groups: Vec<Vec<Filter>>` for OR-of-AND — `ALL(filters) AND ANY(group)`), `FindResult`. `eval_filter_raw` for zero-alloc comparison on raw column bytes. |

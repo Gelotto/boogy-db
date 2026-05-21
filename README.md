@@ -116,7 +116,10 @@ tx.commit()?;
 | `insert_many(table, rows)` | Batch insert |
 | `update_where(table, filters, fields)` | Bulk update |
 | `delete_where(table, filters)` | Bulk delete |
-| `create_index(table, name, column)` | Create a secondary index |
+| `create_index(table, name, column)` | Create a single-column secondary index |
+| `create_index_ex(table, name, cols, unique)` | Create a composite (multi-column) index, optionally unique |
+| `scan_batch(table, filters, or_groups, order, after, limit)` | Ordered range-scan cursor — returns one bounded page + a resume token |
+| `upsert_increment(table, key, counter, delta, set)` | Atomic keyed find-or-insert-then-add; integer or real delta |
 | `drop_index(table, name)` | Drop an index |
 | `create_table(table, columns)` | Create a table |
 | `create_table_encrypted(table, columns, key)` | Create an encrypted table (AES-256-GCM) |
@@ -204,6 +207,135 @@ let result = db.find("posts", FindOptions {
 `count` ignores `or_groups` (it takes a plain `&[Filter]`); use `count_with(table, filters, or_groups)` to count with an OR clause.
 
 > Performance note: when `or_groups` is non-empty the query takes the scan + in-memory predicate path — the index/single-filter fast paths only understand the AND `filters`, so they're bypassed. The `filters` AND-prefix still narrows the set; arbitrary OR has no single index to accelerate it.
+
+## Indexes
+
+### Single-column indexes
+
+```rust
+db.create_index("users", "idx_email", "email")?;
+```
+
+`create_index` builds a single-column secondary index. Inserts, updates, and deletes automatically maintain the index. Queries with an equality filter on an indexed column use the index for O(log n) lookup.
+
+### Composite and unique indexes
+
+```rust
+// Composite (multi-column) index — sorts by (user_a, user_b, rowid)
+db.create_index_ex("edges", "by_pair", &["user_a", "user_b"], false)?;
+
+// Enforced unique index — rejects any insert/upsert whose key tuple already exists
+db.create_index_ex("edges", "by_pair", &["user_a", "user_b"], true)?;
+```
+
+`create_index_ex(table, name, columns, unique)` generalizes `create_index`:
+
+- **Composite**: columns are concatenated in key order using sortable byte encodings (integer big-endian, text length-prefixed). The index sorts rows lexicographically by the column tuple, then by rowid as a tiebreaker.
+- **Unique enforcement**: when `unique = true`, any `insert` or `upsert_increment` whose key tuple matches an existing row returns `BoogyError::UniqueViolation { index }`. The check happens before any mutation — a rejected write leaves no partial state.
+- A single-column non-unique index is identical to `create_index(table, name, columns[0])`.
+
+## Streaming / Batch I/O
+
+### `scan_batch` — cursor-based ordered scan
+
+`scan_batch` pages through a table in bounded memory by walking its primary-key tree or a named index tree in order, one batch at a time. It is the primitive for streaming jobs that can't afford to load a full table into memory.
+
+```rust
+use boogy_db::{ScanOrder, ScanKey, SortDir};
+
+// Page through the whole table in PK order, 500 rows at a time.
+let mut after: Option<ScanKey> = None;
+loop {
+    let batch = db.scan_batch(
+        "events",
+        &[],                                          // AND filters (optional)
+        &[],                                          // OR-of-AND groups (optional)
+        ScanOrder::primary_key(SortDir::Asc),
+        after.clone(),
+        500,
+    )?;
+    for row in &batch.rows {
+        // process row
+    }
+    after = batch.last_key;
+    if after.is_none() { break; }  // exhausted
+}
+```
+
+```rust
+// Walk in descending order of a secondary index.
+let batch = db.scan_batch(
+    "posts",
+    &[Filter::eq("deleted_at", "")],
+    &[],
+    ScanOrder::index("by_score", SortDir::Desc),
+    None,   // start from the beginning
+    100,
+)?;
+```
+
+**`ScanOrder` constructors:**
+
+| Constructor | Walks |
+|---|---|
+| `ScanOrder::primary_key(dir)` | Base table in rowid (insertion) order |
+| `ScanOrder::index(name, dir)` | Named secondary index in its sorted order |
+
+**`ScanBatch` fields:**
+
+| Field | Type | Description |
+|---|---|---|
+| `rows` | `Vec<Row>` | Rows in scan order for this page |
+| `last_key` | `Option<ScanKey>` | Opaque resume token — pass as `after` to get the next page; `None` when the scan is exhausted |
+
+**Filters and OR groups** work identically to `find`. `last_key = None` when fewer than `limit` rows were returned — the scan is exhausted and there is nothing more to fetch.
+
+### `upsert_increment` — atomic keyed counter
+
+`upsert_increment` finds a row by a key tuple, adds a numeric delta to a counter column, and writes optional additional columns — or inserts the row if it doesn't exist yet. Pair it with a composite unique index on the key columns so the lookup uses the index and uniqueness is enforced.
+
+```rust
+// Accumulate per-(user_a, user_b) interaction counts.
+db.create_table("edges", &[
+    ColumnDef::new("user_a", Type::Text),
+    ColumnDef::new("user_b", Type::Text),
+    ColumnDef::new("n", Type::Integer),
+    ColumnDef::new("updated_at", Type::Integer),
+])?;
+db.create_index_ex("edges", "by_pair", &["user_a", "user_b"], true)?;
+
+// First call: row does not exist → inserts (user_a="a", user_b="b", n=1, updated_at=now).
+db.upsert_increment(
+    "edges",
+    &[("user_a", Value::Text("a".into())), ("user_b", Value::Text("b".into()))],
+    "n",
+    Value::Integer(1),
+    &[("updated_at", Value::Integer(now))],
+)?;
+
+// Second call: row exists → n becomes 1 + 2 = 3; updated_at is replaced.
+db.upsert_increment(
+    "edges",
+    &[("user_a", Value::Text("a".into())), ("user_b", Value::Text("b".into()))],
+    "n",
+    Value::Integer(2),
+    &[("updated_at", Value::Integer(now))],
+)?;
+```
+
+**Signature:** `upsert_increment(table, key, counter, delta, set) -> Result<u64>`
+
+| Parameter | Type | Description |
+|---|---|---|
+| `key` | `&[(&str, Value)]` | Column-value pairs that identify the row |
+| `counter` | `&str` | Column to accumulate |
+| `delta` | `Value` | `Integer` or `Real` amount to add (first insert uses this value directly) |
+| `set` | `&[(&str, Value)]` | Additional columns to write/overwrite on every call |
+| return | `u64` | Rowid of the inserted or updated row |
+
+**Type rules:** Integer + Integer → Integer; Real + Real → Real; mixed → Real. A null or absent counter is treated as 0 of the delta's type. A non-numeric delta returns `BoogyError::SchemaMismatch`.
+
+`AcidTransaction` also exposes `upsert_increment` so it composes with multi-table atomic transactions.
 
 ## Benchmarks
 

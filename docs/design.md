@@ -194,6 +194,14 @@ boogy-db/
     stress_test.rs
 ```
 
+## Composite Indexes and Bounded-Batch Primitives
+
+Secondary indexes shipped in v1 (single-column `create_index`). Multi-column and unique indexes were added as a follow-on primitive set alongside `scan_batch` and `upsert_increment`.
+
+**Composite and unique indexes** (`create_index_ex(table, name, &[col], unique)`) extend the single-column case to multi-column `(v₁, v₂, …, rowid)` keys encoded with sortable per-type byte representations (big-endian integers, length-prefixed text). Concatenated encodings compose correctly — multi-column ordering is lexicographic over per-column orderings. When `unique = true`, the write path checks for an existing value-prefix entry under the table write lock before any mutation; a rejected `insert` or `upsert_increment` returns `BoogyError::UniqueViolation` with no partial state.
+
+**`scan_batch`** and **`upsert_increment`** are the two bounded-memory streaming primitives. `scan_batch` pages through a table in primary-key or named-index order with a `ScanKey` resume token, applying filters and OR groups per row. The caller loops: fetch a page, process it, pass `last_key` as `after`; `last_key = None` signals exhaustion. `upsert_increment` atomically locates a row by a key tuple, adds an integer or real delta to a counter column, writes any additional `set` columns, and inserts the row if absent — designed to pair with a composite unique index so multi-call accumulation requires no caller-side find-then-insert logic.
+
 ## v1 Scope
 
 ### Core (this spec)
@@ -205,7 +213,12 @@ boogy-db/
 - Crash recovery via WAL
 - Per-table MVCC concurrency
 
-### Deferred (future specs)
-- Secondary indexes (create_index / drop_index)
-- Bulk operations (update_where / delete_where / insert_many)
+### Shipped post-v1
+- Secondary indexes (`create_index` / `drop_index`)
+- Composite + unique indexes (`create_index_ex`)
+- Bulk operations (`update_where` / `delete_where` / `insert_many`)
+- Streaming cursor (`scan_batch`)
+- Atomic keyed counter (`upsert_increment`)
+
+### Deferred
 - Foreign key enforcement
