@@ -708,25 +708,102 @@ impl BoogyDb {
         remove: bool,
     ) -> Result<()> {
         for idx in &mut meta.indexes {
-            // Single-column index maintenance keys on the leading column.
-            let idx_col = &idx.columns[0];
-            let col_id = meta.col_name_to_id.get(idx_col).copied();
-            let col_type = meta
-                .columns
-                .iter()
-                .find(|c| &c.name == idx_col)
-                .map(|c| c.col_type);
-            if let (Some(cid), Some(ct)) = (col_id, col_type) {
-                let val = crate::row::extract_column(row_bytes, cid)?
-                    .unwrap_or(Value::Null);
-                if let Some(key) = index::encode_index_key(ct, &val, rowid) {
-                    let mut tree = IndexTreeWriter::new(guard, idx.root_page);
-                    if remove {
-                        tree.delete(&key)?;
-                    } else {
-                        tree.insert(&key)?;
+            // Resolve every index column to (col_id, col_type); a composite
+            // index maintains the full tuple key. Single-column indexes are the
+            // degenerate one-element case (byte-identical to the old behavior).
+            let mut col_ids: Vec<u16> = Vec::with_capacity(idx.columns.len());
+            let mut col_types: Vec<crate::value::Type> = Vec::with_capacity(idx.columns.len());
+            let mut resolved = true;
+            for idx_col in &idx.columns {
+                match (
+                    meta.col_name_to_id.get(idx_col).copied(),
+                    meta.columns.iter().find(|c| &c.name == idx_col).map(|c| c.col_type),
+                ) {
+                    (Some(cid), Some(ct)) => {
+                        col_ids.push(cid);
+                        col_types.push(ct);
                     }
-                    idx.root_page = tree.root_page();
+                    _ => {
+                        resolved = false;
+                        break;
+                    }
+                }
+            }
+            if !resolved {
+                continue;
+            }
+            let mut col_vals: Vec<Value> = Vec::with_capacity(col_ids.len());
+            for cid in &col_ids {
+                col_vals.push(crate::row::extract_column(row_bytes, *cid)?.unwrap_or(Value::Null));
+            }
+            if let Some(key) = index::encode_composite_index_key(&col_types, &col_vals, rowid) {
+                let mut tree = IndexTreeWriter::new(guard, idx.root_page);
+                if remove {
+                    tree.delete(&key)?;
+                } else {
+                    tree.insert(&key)?;
+                }
+                idx.root_page = tree.root_page();
+            }
+        }
+        Ok(())
+    }
+
+    /// Enforce uniqueness for every `unique` index on `meta` against the
+    /// encoded `row_bytes` of a row about to be inserted.
+    ///
+    /// Returns `Err(UniqueViolation)` if any unique index already holds an
+    /// entry whose value tuple (all index columns, no rowid) matches this row.
+    /// A Null in any index column means the tuple is not indexed (matching the
+    /// single-column convention) and is therefore never a uniqueness conflict.
+    ///
+    /// IMPORTANT — atomicity: this reads the committed index trees via a
+    /// read-only `IndexTreeReader` and performs NO mutation. Callers MUST run
+    /// it under the table write lock and BEFORE opening the write guard (i.e.
+    /// before any main-tree or index-tree write), so a rejected duplicate
+    /// leaves the table byte-for-byte unchanged.
+    fn enforce_unique_indexes(
+        file: &PageFile,
+        meta: &TableMeta,
+        row_bytes: &[u8],
+    ) -> Result<()> {
+        for idx in &meta.indexes {
+            if !idx.unique {
+                continue;
+            }
+            // Resolve all index columns to (col_id, col_type).
+            let mut col_ids: Vec<u16> = Vec::with_capacity(idx.columns.len());
+            let mut col_types: Vec<crate::value::Type> = Vec::with_capacity(idx.columns.len());
+            let mut resolved = true;
+            for idx_col in &idx.columns {
+                match (
+                    meta.col_name_to_id.get(idx_col).copied(),
+                    meta.columns.iter().find(|c| &c.name == idx_col).map(|c| c.col_type),
+                ) {
+                    (Some(cid), Some(ct)) => {
+                        col_ids.push(cid);
+                        col_types.push(ct);
+                    }
+                    _ => {
+                        resolved = false;
+                        break;
+                    }
+                }
+            }
+            if !resolved {
+                continue;
+            }
+            let mut col_vals: Vec<Value> = Vec::with_capacity(col_ids.len());
+            for cid in &col_ids {
+                col_vals.push(crate::row::extract_column(row_bytes, *cid)?.unwrap_or(Value::Null));
+            }
+            // A Null component is not indexed, so it cannot collide.
+            if let Some(prefix) = index::encode_composite_value_prefix(&col_types, &col_vals) {
+                let reader = IndexTreeReader::new(file, idx.root_page);
+                if !reader.scan_prefix(&prefix)?.is_empty() {
+                    return Err(BoogyError::UniqueViolation {
+                        index: idx.name.clone(),
+                    });
                 }
             }
         }
@@ -890,6 +967,20 @@ impl BoogyDb {
             return Err(BoogyError::RowTooLarge(row_bytes.len()));
         }
 
+        // 5b. Unique-index enforcement. Read-only check against committed index
+        //     trees, under the table write lock and BEFORE any write guard is
+        //     opened — a rejection here mutates nothing (no rowid is consumed
+        //     either, since next_rowid is only advanced inside the guard below
+        //     in insert_with_id; here we already bumped it, so undo on reject).
+        if !state.meta.indexes.is_empty() {
+            if let Err(e) = Self::enforce_unique_indexes(&self.file, &state.meta, &row_bytes) {
+                // Roll back the rowid we tentatively consumed in step 4 so a
+                // rejected duplicate leaves table state byte-for-byte unchanged.
+                state.meta.next_rowid -= 1;
+                return Err(e);
+            }
+        }
+
         // 6. WriteGuard for B-tree insert + index maintenance.
         let durability = self.durability();
         {
@@ -935,12 +1026,8 @@ impl BoogyDb {
         // 3. Type enforcement for indexed columns.
         Self::enforce_index_types(&state.meta, data)?;
 
-        // 4. Advance next_rowid if necessary.
-        if rowid >= state.meta.next_rowid {
-            state.meta.next_rowid = rowid + 1;
-        }
-
-        // 5. Encode row.
+        // 5. Encode row. (next_rowid is advanced only after a successful
+        //    uniqueness check, so a rejected duplicate leaves it unchanged.)
         let col_values: Vec<(u16, &Value)> = data
             .iter()
             .filter_map(|(name, val)| state.meta.col_id(name).map(|cid| (cid, val)))
@@ -949,6 +1036,18 @@ impl BoogyDb {
 
         if row_bytes.len() > self.max_row_size() as usize {
             return Err(BoogyError::RowTooLarge(row_bytes.len()));
+        }
+
+        // 5b. Unique-index enforcement: read-only check against committed index
+        //     trees, under the table write lock and BEFORE any write guard or
+        //     metadata mutation. A rejection here leaves table state unchanged.
+        if !state.meta.indexes.is_empty() {
+            Self::enforce_unique_indexes(&self.file, &state.meta, &row_bytes)?;
+        }
+
+        // 4. Advance next_rowid if necessary (only after uniqueness passes).
+        if rowid >= state.meta.next_rowid {
+            state.meta.next_rowid = rowid + 1;
         }
 
         // 6. WriteGuard for B-tree insert + index maintenance.
@@ -1459,6 +1558,30 @@ impl BoogyDb {
 
     /// Create a secondary index on a table column.
     pub fn create_index(&self, table: &str, index_name: &str, column: &str) -> Result<()> {
+        self.create_index_ex(table, index_name, &[column], false)
+    }
+
+    /// Create a (possibly multi-column, possibly unique) secondary index and
+    /// populate it from existing rows.
+    ///
+    /// The index tree is keyed on `encode_composite_index_key` over `columns`
+    /// (in the order given) plus the rowid suffix. When `unique`, the build
+    /// fails with [`BoogyError::UniqueViolation`] if two existing rows already
+    /// share the same value tuple — a unique index cannot be built over data
+    /// that already contains duplicates.
+    pub fn create_index_ex(
+        &self,
+        table: &str,
+        index_name: &str,
+        columns: &[&str],
+        unique: bool,
+    ) -> Result<()> {
+        if columns.is_empty() {
+            return Err(BoogyError::SchemaMismatch(
+                "create_index_ex requires at least one column".to_string(),
+            ));
+        }
+
         // 1. Read-lock registry, clone Arc.
         let table_state = {
             let tables = self.tables.read().unwrap();
@@ -1477,20 +1600,25 @@ impl BoogyDb {
             return Err(BoogyError::IndexExists(index_name.to_string()));
         }
 
-        // Check column exists.
-        let col_id = state.meta.col_id(column).ok_or_else(|| {
-            BoogyError::SchemaMismatch(format!(
-                "column '{column}' not found in table '{table}'"
-            ))
-        })?;
-
-        let col_type = state
-            .meta
-            .columns
-            .iter()
-            .find(|c| c.name == column)
-            .map(|c| c.col_type)
-            .unwrap();
+        // Resolve ALL columns to (col_id, col_type), validating existence.
+        let mut col_ids: Vec<u16> = Vec::with_capacity(columns.len());
+        let mut col_types: Vec<crate::value::Type> = Vec::with_capacity(columns.len());
+        for column in columns {
+            let col_id = state.meta.col_id(column).ok_or_else(|| {
+                BoogyError::SchemaMismatch(format!(
+                    "column '{column}' not found in table '{table}'"
+                ))
+            })?;
+            let col_type = state
+                .meta
+                .columns
+                .iter()
+                .find(|c| &c.name == column)
+                .map(|c| c.col_type)
+                .unwrap();
+            col_ids.push(col_id);
+            col_types.push(col_type);
+        }
 
         // 3. Read all existing rows first (concurrent read, no write guard).
         let all = {
@@ -1499,6 +1627,10 @@ impl BoogyDb {
         };
 
         // 4. Create the index B+ tree and populate via WriteGuard.
+        //    For a unique index, detect existing-data duplicates via the set of
+        //    value-prefixes seen so far (a unique index cannot be built over
+        //    data that already contains a duplicate tuple).
+        let mut seen_prefixes: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
         let idx_root = {
             let durability = self.durability();
             let mut guard = self.file.begin_write();
@@ -1506,9 +1638,24 @@ impl BoogyDb {
 
             let mut current_root = idx_root;
             for (rowid, bytes) in &all {
-                let col_val = row::extract_column(bytes, col_id)?
-                    .unwrap_or(Value::Null);
-                if let Some(key) = index::encode_index_key(col_type, &col_val, *rowid) {
+                let mut col_vals: Vec<Value> = Vec::with_capacity(col_ids.len());
+                for cid in &col_ids {
+                    col_vals.push(row::extract_column(bytes, *cid)?.unwrap_or(Value::Null));
+                }
+                if unique {
+                    if let Some(prefix) =
+                        index::encode_composite_value_prefix(&col_types, &col_vals)
+                    {
+                        if !seen_prefixes.insert(prefix) {
+                            return Err(BoogyError::UniqueViolation {
+                                index: index_name.to_string(),
+                            });
+                        }
+                    }
+                }
+                if let Some(key) =
+                    index::encode_composite_index_key(&col_types, &col_vals, *rowid)
+                {
                     let mut tree = IndexTreeWriter::new(&mut guard, current_root);
                     current_root = tree.insert(&key)?;
                 }
@@ -1521,8 +1668,8 @@ impl BoogyDb {
         // 5. Register the index in table metadata.
         state.meta.indexes.push(IndexMeta {
             name: index_name.to_string(),
-            columns: vec![column.to_string()],
-            unique: false,
+            columns: columns.iter().map(|s| s.to_string()).collect(),
+            unique,
             root_page: idx_root,
         });
 
@@ -4310,5 +4457,65 @@ mod tests {
             3
         );
         tx.commit().unwrap();
+    }
+
+    #[test]
+    fn test_create_composite_index_and_find_by_both_columns() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.boogy");
+        let db = BoogyDb::open(&path).unwrap();
+        db.create_table("edges", &[
+            ColumnDef::new("user_a", Type::Text),
+            ColumnDef::new("user_b", Type::Text),
+            ColumnDef::new("n", Type::Integer),
+        ]).unwrap();
+        db.create_index_ex("edges", "by_pair", &["user_a", "user_b"], true).unwrap();
+        db.insert("edges", &[("user_a", "a".into()), ("user_b", "b".into()), ("n", 1i64.into())]).unwrap();
+        db.insert("edges", &[("user_a", "a".into()), ("user_b", "c".into()), ("n", 2i64.into())]).unwrap();
+        // find by both key columns returns exactly the one row
+        let res = db.find("edges", FindOptions {
+            filters: vec![Filter::eq("user_a", "a"), Filter::eq("user_b", "b")],
+            ..Default::default()
+        }).unwrap();
+        assert_eq!(res.rows.len(), 1);
+    }
+
+    #[test]
+    fn test_unique_composite_index_rejects_duplicate_key() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.boogy");
+        let db = BoogyDb::open(&path).unwrap();
+        db.create_table("edges", &[
+            ColumnDef::new("user_a", Type::Text),
+            ColumnDef::new("user_b", Type::Text),
+            ColumnDef::new("n", Type::Integer),
+        ]).unwrap();
+        db.create_index_ex("edges", "by_pair", &["user_a", "user_b"], true).unwrap();
+        db.insert("edges", &[("user_a","a".into()),("user_b","b".into()),("n",1i64.into())]).unwrap();
+        let dup = db.insert("edges", &[("user_a","a".into()),("user_b","b".into()),("n",9i64.into())]);
+        assert!(matches!(dup, Err(BoogyError::UniqueViolation { .. })));
+        // a different pair is fine
+        assert!(db.insert("edges", &[("user_a","a".into()),("user_b","c".into()),("n",1i64.into())]).is_ok());
+        // a rejected duplicate must leave NO partial state: only the two
+        // accepted rows exist, and re-inserting the unique pair still rejects.
+        let all = db.find("edges", FindOptions::default()).unwrap();
+        assert_eq!(all.rows.len(), 2);
+        let dup2 = db.insert("edges", &[("user_a","a".into()),("user_b","b".into()),("n",7i64.into())]);
+        assert!(matches!(dup2, Err(BoogyError::UniqueViolation { .. })));
+        assert_eq!(db.find("edges", FindOptions::default()).unwrap().rows.len(), 2);
+    }
+
+    #[test]
+    fn test_nonunique_composite_index_allows_duplicate() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.boogy");
+        let db = BoogyDb::open(&path).unwrap();
+        db.create_table("t", &[
+            ColumnDef::new("x", Type::Integer),
+            ColumnDef::new("y", Type::Integer),
+        ]).unwrap();
+        db.create_index_ex("t", "by_xy", &["x", "y"], false).unwrap();
+        db.insert("t", &[("x",1i64.into()),("y",2i64.into())]).unwrap();
+        assert!(db.insert("t", &[("x",1i64.into()),("y",2i64.into())]).is_ok());
     }
 }
