@@ -12,7 +12,7 @@ Embedded storage engine for SpinStack. In-place B+ tree with WAL, per-table conc
 | `index.rs` | `IndexTreeReader`/`IndexTreeWriter`. Composite-key B+ tree for secondary indexes. Key encoding (sortable integers, floats, null-terminated text). |
 | `page.rs` | `Page` struct (4096-byte buffer). Header layout, row offset array, checksum. Page type flags (leaf/branch/system/free). |
 | `row.rs` | Row binary format: `[rowid:8][num_cols:2][offset_directory][column_data]`. Encode, decode, `extract_column` (binary search), `extract_column_raw` (zero-copy), `patch_row`/`patch_row_multi` (in-place splice). |
-| `filter.rs` | `Filter`, `FilterOp`, `FindOptions`, `FindResult`. `eval_filter_raw` for zero-alloc comparison on raw column bytes. |
+| `filter.rs` | `Filter`, `FilterOp`, `FindOptions` (incl. `or_groups: Vec<Vec<Filter>>` for OR-of-AND — `ALL(filters) AND ANY(group)`), `FindResult`. `eval_filter_raw` for zero-alloc comparison on raw column bytes. |
 | `wal.rs` | `Wal` struct. Redo-log (after-image) entries with checksums. Append, read, truncate, fsync. |
 | `table.rs` | `TableMeta`, `IndexMeta`, `TableRegistry`. Column name-to-ID mapping, index lookup. |
 | `crypto.rs` | `Cipher` (AES-256-GCM). Page-level encryption at I/O boundaries. `encrypt_page`/`decrypt_page`. |

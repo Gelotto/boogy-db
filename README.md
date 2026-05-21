@@ -112,6 +112,7 @@ tx.commit()?;
 | `delete(table, id)` | Delete a row |
 | `find(table, opts)` | Query with filters, sort, limit/offset |
 | `count(table, filters)` | Count matching rows |
+| `count_with(table, filters, or_groups)` | Count matching rows with an OR-of-AND clause |
 | `insert_many(table, rows)` | Batch insert |
 | `update_where(table, filters, fields)` | Bulk update |
 | `delete_where(table, filters)` | Bulk delete |
@@ -128,7 +129,7 @@ tx.commit()?;
 
 ### Filters
 
-Queries (`find`, `count`, `delete_where`, `update_where`) accept a list of `Filter` values that are ANDed together. Each filter targets a single column.
+Queries (`find`, `count`, `delete_where`, `update_where`) accept a list of `Filter` values that are ANDed together. Each filter targets a single column. For OR conditions, `FindOptions` also carries an `or_groups` field — see [OR-of-AND groups](#or-of-and-groups) below.
 
 | Constructor | SQL Equivalent | Description |
 |-------------|---------------|-------------|
@@ -173,6 +174,36 @@ let result = db.find("users", FindOptions {
     ..Default::default()
 })?;
 ```
+
+#### OR-of-AND groups
+
+`FindOptions.or_groups: Vec<Vec<Filter>>` adds an OR clause on top of `filters`. The full predicate a row must satisfy is:
+
+```
+ALL(filters)  AND  ( or_groups.is_empty()  OR  ANY(group in or_groups: ALL(group)) )
+```
+
+`filters` stays a mandatory AND-prefix; each group in `or_groups` is itself an AND of its filters, and the groups are ORed together. An empty `or_groups` (the default) is exactly the historical filters-only behavior — fully backward compatible.
+
+This is enough to express composite keyset pagination, e.g. "the page after `(score, id) = (c, cursor)` ordered by `score DESC, id DESC`":
+
+```rust
+// WHERE deleted_at = '' AND ( score < c OR (score = c AND id < cursor) )
+let result = db.find("posts", FindOptions {
+    filters: vec![Filter::eq("deleted_at", "")],          // AND-prefix
+    or_groups: vec![
+        vec![Filter::lt("score", c)],                     // score < c
+        vec![Filter::eq("score", c), Filter::lt("id", cursor)], // OR (score = c AND id < cursor)
+    ],
+    sort: vec![Sort::desc("score"), Sort::desc("id")],
+    limit: Some(page_size),
+    ..Default::default()
+})?;
+```
+
+`count` ignores `or_groups` (it takes a plain `&[Filter]`); use `count_with(table, filters, or_groups)` to count with an OR clause.
+
+> Performance note: when `or_groups` is non-empty the query takes the scan + in-memory predicate path — the index/single-filter fast paths only understand the AND `filters`, so they're bypassed. The `filters` AND-prefix still narrows the set; arbitrary OR has no single index to accelerate it.
 
 ## Benchmarks
 

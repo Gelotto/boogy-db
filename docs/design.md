@@ -120,6 +120,11 @@ let (rows, total) = db.find("posts", FindOptions {
 // Count
 let n = db.count("posts", &[Filter::eq("author_id", "user_42")])?;
 
+// OR-of-AND: `filters` is a mandatory AND-prefix; `or_groups: Vec<Vec<Filter>>`
+// adds an OR clause — a row matches when ALL(filters) AND ANY(group: ALL(group)).
+// Empty or_groups = filters-only (back-compat). count_with(table, filters, or_groups)
+// counts with an OR clause.
+
 // Multi-table transaction
 db.transaction(|tx| {
     tx.insert("posts", &[...])?;
