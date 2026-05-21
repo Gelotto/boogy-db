@@ -62,6 +62,16 @@ fn row_passes(
                 .any(|g| g.iter().all(|f| filter_matches_row(col_name_to_id, bytes, f))))
 }
 
+/// Extract the rowid suffix from an index leaf key. Every index key —
+/// single-column or composite — appends the 8-byte big-endian rowid as its
+/// final bytes, so the rowid is always the last 8 bytes regardless of the
+/// column type(s) the key encodes.
+fn rowid_from_index_key(key: &[u8]) -> u64 {
+    debug_assert!(key.len() >= 8, "index key shorter than rowid suffix");
+    let n = key.len();
+    u64::from_be_bytes(key[n - 8..n].try_into().unwrap())
+}
+
 /// A row returned from queries. Wraps raw bytes; decodes columns on demand.
 #[derive(Debug, Clone)]
 pub struct Row {
@@ -91,6 +101,60 @@ impl Row {
             Err(_) => Vec::new(),
         }
     }
+}
+
+/// Which ordering a [`BoogyDb::scan_batch`] cursor walks.
+#[derive(Debug, Clone)]
+pub enum ScanOrderKind {
+    /// Primary-key (rowid / insertion) order. Walks the base table B+ tree.
+    PrimaryKey,
+    /// A named secondary index's order. Walks that index tree.
+    Index(String),
+}
+
+/// Ordered cursor specification for [`BoogyDb::scan_batch`].
+#[derive(Debug, Clone)]
+pub struct ScanOrder {
+    pub kind: ScanOrderKind,
+    pub dir: SortDir,
+}
+
+impl ScanOrder {
+    /// Walk the table in primary-key (rowid) order.
+    pub fn primary_key(dir: SortDir) -> Self {
+        Self { kind: ScanOrderKind::PrimaryKey, dir }
+    }
+    /// Walk the table in the order of the named secondary index.
+    pub fn index(name: &str, dir: SortDir) -> Self {
+        Self { kind: ScanOrderKind::Index(name.into()), dir }
+    }
+}
+
+/// Opaque resume token for [`BoogyDb::scan_batch`]: identifies the last row a
+/// batch returned so the next batch resumes strictly after it.
+///
+/// - PrimaryKey order: `bytes` is empty, `rowid` is the last rowid returned.
+/// - Index order: `bytes` is the last index key (value-tuple + rowid suffix),
+///   `rowid` is that key's rowid. Both fields together form the exclusive bound
+///   — the index key alone is exclusive (composite keys embed the rowid, so the
+///   key uniquely identifies the row).
+///
+/// The token is **exclusive**: the row it identifies was already returned and
+/// will not reappear in the next batch.
+#[derive(Debug, Clone)]
+pub struct ScanKey {
+    pub(crate) bytes: Vec<u8>,
+    pub(crate) rowid: u64,
+}
+
+/// One page of a [`BoogyDb::scan_batch`] cursor walk.
+pub struct ScanBatch {
+    /// The rows in this batch, in scan order.
+    pub rows: Vec<Row>,
+    /// The resume token to pass as `after` for the next batch, or `None` when
+    /// the scan is exhausted (this batch returned fewer than `limit` rows / no
+    /// more rows remain).
+    pub last_key: Option<ScanKey>,
 }
 
 /// Durability level for write operations.
@@ -1474,6 +1538,107 @@ impl BoogyDb {
         };
 
         Ok(FindResult { rows, total })
+    }
+
+    /// Ordered range-scan-from-a-key: the cursor primitive for paging through a
+    /// table in bounded memory.
+    ///
+    /// Returns up to `limit` rows in `order`, starting strictly after the row
+    /// identified by `after` (the resume token is **exclusive** — the row it
+    /// names was already returned and does not reappear). `after = None` starts
+    /// from the beginning of the ordering. The full predicate
+    /// `ALL(filters) AND (or_groups.is_empty() OR ANY(group: ALL(group)))` is
+    /// applied per row (same semantics as [`find`]).
+    ///
+    /// The returned [`ScanBatch::last_key`] is the exclusive resume token for the
+    /// next call, or `None` when the scan is exhausted. Threading
+    /// `after = previous.last_key` visits every matching row exactly once, in
+    /// order, with no gaps or duplicates, and terminates.
+    ///
+    /// `order`:
+    /// - [`ScanOrderKind::PrimaryKey`] walks the base table B+ tree by rowid
+    ///   (both directions; leaves are doubly-linked). `last_key.bytes` is empty;
+    ///   `last_key.rowid` is the bound.
+    /// - [`ScanOrderKind::Index`] walks the named index tree by key order (both
+    ///   directions). `last_key.bytes` is the last index key; an unknown index
+    ///   name is an error.
+    pub fn scan_batch(
+        &self,
+        table: &str,
+        filters: &[Filter],
+        or_groups: &[Vec<Filter>],
+        order: ScanOrder,
+        after: Option<ScanKey>,
+        limit: u32,
+    ) -> Result<ScanBatch> {
+        // 1. Read-lock registry, clone Arc.
+        let table_state = {
+            let tables = self.tables.read().unwrap();
+            tables
+                .get(table)
+                .ok_or_else(|| BoogyError::TableNotFound(table.to_string()))?
+                .clone()
+        };
+        // 2. Read-lock the specific table.
+        let state = table_state.read().unwrap();
+        Self::check_table_accessible(&state.meta, table)?;
+
+        let col_names = state.meta.col_names.clone();
+        let col_name_to_id = &state.meta.col_name_to_id;
+
+        match order.kind {
+            ScanOrderKind::PrimaryKey => {
+                let after_rowid = after.as_ref().map(|k| k.rowid);
+                let reader = BTreeReader::new(&self.file, state.meta.root_page);
+                let (raw, last_rowid) = reader.scan_from(after_rowid, order.dir, limit, |bytes| {
+                    row_passes(col_name_to_id, bytes, filters, or_groups)
+                })?;
+                let mut rows = Vec::with_capacity(raw.len());
+                for (_, bytes) in &raw {
+                    rows.push(Row::from_raw(bytes, col_names.clone())?);
+                }
+                let last_key = last_rowid.map(|rowid| ScanKey { bytes: Vec::new(), rowid });
+                Ok(ScanBatch { rows, last_key })
+            }
+            ScanOrderKind::Index(ref idx_name) => {
+                let idx_meta = state
+                    .meta
+                    .find_index(idx_name)
+                    .ok_or_else(|| {
+                        BoogyError::SchemaMismatch(format!(
+                            "scan_batch: no index named '{idx_name}' on table '{table}'"
+                        ))
+                    })?
+                    .clone();
+
+                let after_bytes = after.as_ref().map(|k| k.bytes.as_slice());
+                let idx_reader = IndexTreeReader::new(&self.file, idx_meta.root_page);
+                let (keys, _more) = idx_reader.scan_from_key(after_bytes, order.dir, limit as usize)?;
+
+                // Fetch each row by rowid, apply the predicate, preserve index order.
+                let btree_reader = BTreeReader::new(&self.file, state.meta.root_page);
+                let mut rows = Vec::with_capacity(keys.len());
+                let mut last_key: Option<ScanKey> = None;
+                for key in &keys {
+                    let rowid = rowid_from_index_key(key);
+                    // Advance the cursor for EVERY key the index returned, even
+                    // when the row fails the predicate — the bound must stay
+                    // exclusive regardless of filter outcome.
+                    last_key = Some(ScanKey { bytes: key.clone(), rowid });
+                    if let Some(bytes) = btree_reader.search(rowid)? {
+                        if row_passes(col_name_to_id, &bytes, filters, or_groups) {
+                            rows.push(Row::from_raw(&bytes, col_names.clone())?);
+                        }
+                    }
+                }
+                // If the index returned fewer than `limit` keys, the scan is
+                // exhausted: no more pages to walk, so drop the resume token.
+                if keys.len() < limit as usize {
+                    last_key = None;
+                }
+                Ok(ScanBatch { rows, last_key })
+            }
+        }
     }
 
     /// Count rows matching filters (implicit AND).
@@ -4762,5 +4927,82 @@ mod tests {
         ]).unwrap();
         assert_eq!(ok.len(), 2);
         assert_eq!(db.find("edges", FindOptions::default()).unwrap().rows.len(), 2);
+    }
+
+    // ----- scan_batch (cursor primitive) -----
+
+    #[test]
+    fn test_scan_batch_tiles_primary_key_order_no_gaps_or_dups() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.boogy");
+        let db = BoogyDb::open(&path).unwrap();
+        db.create_table("t", &[ColumnDef::new("v", Type::Integer)]).unwrap();
+        for v in 0..25i64 { db.insert("t", &[("v", v.into())]).unwrap(); }
+        // Page through in primary-key (rowid) order in batches of 10; concatenation
+        // must equal the full ordered set exactly once.
+        let mut seen = Vec::new();
+        let mut after: Option<ScanKey> = None;
+        loop {
+            let b = db.scan_batch("t", &[], &[], ScanOrder::primary_key(SortDir::Asc), after.clone(), 10).unwrap();
+            if b.rows.is_empty() { break; }
+            for r in &b.rows { seen.push(r.get("v").unwrap().clone()); }
+            after = b.last_key;
+            if after.is_none() { break; }
+        }
+        assert_eq!(seen.len(), 25);
+        // strictly increasing rowids ⇒ values 0..25 in order
+        let got: Vec<i64> = seen.iter().map(|v| if let Value::Integer(n)=v {*n} else {-1}).collect();
+        assert_eq!(got, (0..25).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn test_scan_batch_with_filter() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.boogy");
+        let db = BoogyDb::open(&path).unwrap();
+        db.create_table("t", &[ColumnDef::new("v", Type::Integer)]).unwrap();
+        for v in 0..20i64 { db.insert("t", &[("v", v.into())]).unwrap(); }
+        // Only v >= 10, batches of 3.
+        let mut seen = Vec::new();
+        let mut after = None;
+        loop {
+            let b = db.scan_batch("t", &[Filter::ge("v", 10i64)], &[], ScanOrder::primary_key(SortDir::Asc), after.clone(), 3).unwrap();
+            if b.rows.is_empty() { break; }
+            for r in &b.rows { if let Some(Value::Integer(n)) = r.get("v") { seen.push(n); } }
+            after = b.last_key;
+            if after.is_none() { break; }
+        }
+        assert_eq!(seen, (10..20).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn test_scan_batch_index_order_desc() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.boogy");
+        let db = BoogyDb::open(&path).unwrap();
+        db.create_table("t", &[ColumnDef::new("score", Type::Integer)]).unwrap();
+        db.create_index("t", "by_score", "score").unwrap();
+        for s in [3i64,1,4,1,5,9,2,6] { db.insert("t", &[("score", s.into())]).unwrap(); }
+        let mut seen = Vec::new();
+        let mut after = None;
+        loop {
+            let b = db.scan_batch("t", &[], &[], ScanOrder::index("by_score", SortDir::Desc), after.clone(), 3).unwrap();
+            if b.rows.is_empty() { break; }
+            for r in &b.rows { if let Some(Value::Integer(n)) = r.get("score") { seen.push(n); } }
+            after = b.last_key;
+            if after.is_none() { break; }
+        }
+        assert_eq!(seen, vec![9,6,5,4,3,2,1,1]); // descending, dups preserved
+    }
+
+    #[test]
+    fn test_scan_batch_no_index_for_order_errors() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.boogy");
+        let db = BoogyDb::open(&path).unwrap();
+        db.create_table("t", &[ColumnDef::new("v", Type::Integer)]).unwrap();
+        db.insert("t", &[("v", 1i64.into())]).unwrap();
+        let r = db.scan_batch("t", &[], &[], ScanOrder::index("nonexistent", SortDir::Asc), None, 10);
+        assert!(r.is_err());
     }
 }

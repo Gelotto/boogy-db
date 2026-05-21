@@ -332,6 +332,142 @@ impl<'a> IndexTreeReader<'a> {
             "index B+ tree depth exceeds maximum in find_leaf_for_key".into(),
         ))
     }
+
+    /// Navigate to the leftmost leaf page in the index tree (lowest keys).
+    fn find_leftmost_leaf(&self, mut page_no: u32) -> Result<u32> {
+        for _ in 0..MAX_TREE_DEPTH {
+            let page = self.file.read_page(page_no)?;
+            if page.is_leaf() {
+                return Ok(page_no);
+            }
+            page_no = get_idx_branch_child(&page, 0);
+        }
+        Err(crate::error::BoogyError::Corruption(
+            "index B+ tree depth exceeds maximum in find_leftmost_leaf".into(),
+        ))
+    }
+
+    /// Navigate to the rightmost leaf page in the index tree (highest keys).
+    fn find_rightmost_leaf(&self, mut page_no: u32) -> Result<u32> {
+        for _ in 0..MAX_TREE_DEPTH {
+            let page = self.file.read_page(page_no)?;
+            if page.is_leaf() {
+                return Ok(page_no);
+            }
+            let num_keys = page.num_rows() as usize;
+            page_no = get_idx_branch_child(&page, num_keys);
+        }
+        Err(crate::error::BoogyError::Corruption(
+            "index B+ tree depth exceeds maximum in find_rightmost_leaf".into(),
+        ))
+    }
+
+    /// Ordered range-scan-from-a-key: the index-order cursor for `scan_batch`.
+    ///
+    /// Returns up to `limit` full index keys in key order — ascending for
+    /// [`SortDir::Asc`], descending for [`SortDir::Desc`]. The scan starts
+    /// strictly after `after` (exclusive: `Asc` yields keys `> after`, `Desc`
+    /// yields keys `< after`). `after = None` starts from the smallest (Asc) or
+    /// largest (Desc) key.
+    ///
+    /// Returns `(keys, more)` where `more` is true iff the batch was filled and
+    /// at least one further key exists past it. Each returned `Vec<u8>` is a
+    /// complete leaf key including its rowid suffix; the caller extracts the
+    /// rowid and threads the key bytes back as the next batch's exclusive bound.
+    pub fn scan_from_key(
+        &self,
+        after: Option<&[u8]>,
+        dir: crate::filter::SortDir,
+        limit: usize,
+    ) -> Result<(Vec<Vec<u8>>, bool)> {
+        use crate::filter::SortDir;
+        if limit == 0 {
+            return Ok((Vec::new(), false));
+        }
+        let max_pages = self.file.page_count();
+        let mut results: Vec<Vec<u8>> = Vec::with_capacity(limit.min(256));
+
+        match dir {
+            SortDir::Asc => {
+                let start_leaf = match after {
+                    Some(k) => self.find_leaf_for_key(self.root, k)?,
+                    None => self.find_leftmost_leaf(self.root)?,
+                };
+                let mut current = start_leaf;
+                let mut pages_visited = 0u32;
+                loop {
+                    pages_visited += 1;
+                    if pages_visited > max_pages {
+                        return Err(crate::error::BoogyError::Corruption(
+                            "index leaf chain cycle detected in scan_from_key(Asc)".into(),
+                        ));
+                    }
+                    let page = self.file.read_page(current)?;
+                    let num_entries = page.num_rows() as usize;
+                    let next = page.next_leaf();
+                    for i in 0..num_entries {
+                        if let Some(k) = decode_leaf_entry(&page, i, num_entries) {
+                            // Exclusive lower bound.
+                            if let Some(a) = after {
+                                if k <= a {
+                                    continue;
+                                }
+                            }
+                            if results.len() >= limit {
+                                // Batch full and another key exists ⇒ more pages.
+                                return Ok((results, true));
+                            }
+                            results.push(k.to_vec());
+                        }
+                    }
+                    if next == 0 {
+                        break;
+                    }
+                    current = next;
+                }
+            }
+            SortDir::Desc => {
+                let start_leaf = match after {
+                    Some(k) => self.find_leaf_for_key(self.root, k)?,
+                    None => self.find_rightmost_leaf(self.root)?,
+                };
+                let mut current = start_leaf;
+                let mut pages_visited = 0u32;
+                loop {
+                    pages_visited += 1;
+                    if pages_visited > max_pages {
+                        return Err(crate::error::BoogyError::Corruption(
+                            "index leaf chain cycle detected in scan_from_key(Desc)".into(),
+                        ));
+                    }
+                    let page = self.file.read_page(current)?;
+                    let num_entries = page.num_rows() as usize;
+                    let prev = page.prev_leaf();
+                    for i in (0..num_entries).rev() {
+                        if let Some(k) = decode_leaf_entry(&page, i, num_entries) {
+                            // Exclusive upper bound (Desc yields keys strictly < after).
+                            if let Some(a) = after {
+                                if k >= a {
+                                    continue;
+                                }
+                            }
+                            if results.len() >= limit {
+                                return Ok((results, true));
+                            }
+                            results.push(k.to_vec());
+                        }
+                    }
+                    if prev == 0 {
+                        break;
+                    }
+                    current = prev;
+                }
+            }
+        }
+
+        // Reached the end of the index without filling the batch ⇒ exhausted.
+        Ok((results, false))
+    }
 }
 
 // ---------------------------------------------------------------------------

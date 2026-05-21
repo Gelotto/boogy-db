@@ -417,6 +417,162 @@ impl<'a> BTreeReader<'a> {
             "B+ tree depth exceeds maximum in find_leaf_for_rowid".into(),
         ))
     }
+
+    /// Navigate to the rightmost (last) leaf page in the tree.
+    fn find_rightmost_leaf(&self, mut page_no: u32) -> Result<u32> {
+        for _ in 0..MAX_TREE_DEPTH {
+            let page = self.file.read_page(page_no)?;
+            if page.is_leaf() {
+                return Ok(page_no);
+            }
+            // The rightmost child of a branch is reached by routing the maximal
+            // key (u64::MAX) through the same branch-navigation logic.
+            let (_, child) = find_child(&page, u64::MAX);
+            page_no = child;
+        }
+        Err(BoogyError::Corruption(
+            "B+ tree depth exceeds maximum in find_rightmost_leaf".into(),
+        ))
+    }
+
+    /// Ordered range-scan-from-a-rowid: the cursor primitive for `scan_batch`.
+    ///
+    /// Returns up to `limit` rows in rowid order (ascending for [`SortDir::Asc`],
+    /// descending for [`SortDir::Desc`]), starting strictly after `after_rowid`
+    /// — the row identified by `after_rowid` is NOT returned (the resume token
+    /// is **exclusive**). `after_rowid = None` starts from the very first (Asc)
+    /// or last (Desc) row. `keep(full_row_bytes)` is the per-row predicate; only
+    /// rows for which it returns true are collected.
+    ///
+    /// Returns `(rows, last_rowid)` where each row is `(rowid, full_bytes)`.
+    /// `last_rowid` is the rowid of the last collected row when the batch was
+    /// filled AND at least one further candidate exists; it is `None` when the
+    /// scan reached the end of the tree (nothing more to page through). This is
+    /// the exclusive bound the caller threads into the next batch's `after`.
+    pub fn scan_from<F>(
+        &self,
+        after_rowid: Option<u64>,
+        dir: crate::filter::SortDir,
+        limit: u32,
+        keep: F,
+    ) -> Result<(Vec<(u64, Vec<u8>)>, Option<u64>)>
+    where
+        F: Fn(&[u8]) -> bool,
+    {
+        use crate::filter::SortDir;
+        if limit == 0 {
+            return Ok((Vec::new(), None));
+        }
+        let max_pages = self.file.page_count();
+        let mut results: Vec<(u64, Vec<u8>)> = Vec::new();
+        let limit = limit as usize;
+
+        match dir {
+            SortDir::Asc => {
+                let start_leaf = match after_rowid {
+                    Some(rid) => self.find_leaf_for_rowid(self.root, rid)?,
+                    None => self.find_leftmost_leaf(self.root)?,
+                };
+                let mut current = start_leaf;
+                let mut pages_visited = 0u32;
+                loop {
+                    pages_visited += 1;
+                    if pages_visited > max_pages {
+                        return Err(BoogyError::Corruption(
+                            "leaf chain cycle detected in scan_from(Asc)".into(),
+                        ));
+                    }
+                    let page = self.file.read_page(current)?;
+                    let num_rows = page.num_rows() as usize;
+                    let next = page.next_leaf();
+                    for i in 0..num_rows {
+                        let (start, end) = row_bounds(&page, i, num_rows);
+                        if start >= end || end > PAGE_SIZE {
+                            continue;
+                        }
+                        let data = &page.data[start..end];
+                        let id = match row::extract_id(data) {
+                            Ok(id) => id,
+                            Err(_) => continue,
+                        };
+                        // Exclusive lower bound.
+                        if let Some(rid) = after_rowid {
+                            if id <= rid {
+                                continue;
+                            }
+                        }
+                        if results.len() >= limit {
+                            // Batch already full and we found another candidate
+                            // ⇒ more rows remain; return the last collected rowid
+                            // as the exclusive resume bound.
+                            let last = results.last().map(|(rid, _)| *rid);
+                            return Ok((results, last));
+                        }
+                        let full = reassemble_row_reader(data, self.file)?;
+                        if keep(&full) {
+                            results.push((id, full));
+                        }
+                    }
+                    if next == 0 {
+                        break;
+                    }
+                    current = next;
+                }
+            }
+            SortDir::Desc => {
+                let start_leaf = match after_rowid {
+                    Some(rid) => self.find_leaf_for_rowid(self.root, rid)?,
+                    None => self.find_rightmost_leaf(self.root)?,
+                };
+                let mut current = start_leaf;
+                let mut pages_visited = 0u32;
+                loop {
+                    pages_visited += 1;
+                    if pages_visited > max_pages {
+                        return Err(BoogyError::Corruption(
+                            "leaf chain cycle detected in scan_from(Desc)".into(),
+                        ));
+                    }
+                    let page = self.file.read_page(current)?;
+                    let num_rows = page.num_rows() as usize;
+                    let prev = page.prev_leaf();
+                    // Walk rows in reverse within this leaf.
+                    for i in (0..num_rows).rev() {
+                        let (start, end) = row_bounds(&page, i, num_rows);
+                        if start >= end || end > PAGE_SIZE {
+                            continue;
+                        }
+                        let data = &page.data[start..end];
+                        let id = match row::extract_id(data) {
+                            Ok(id) => id,
+                            Err(_) => continue,
+                        };
+                        // Exclusive upper bound (Desc emits rowids strictly < after).
+                        if let Some(rid) = after_rowid {
+                            if id >= rid {
+                                continue;
+                            }
+                        }
+                        if results.len() >= limit {
+                            let last = results.last().map(|(rid, _)| *rid);
+                            return Ok((results, last));
+                        }
+                        let full = reassemble_row_reader(data, self.file)?;
+                        if keep(&full) {
+                            results.push((id, full));
+                        }
+                    }
+                    if prev == 0 {
+                        break;
+                    }
+                    current = prev;
+                }
+            }
+        }
+
+        // Reached the end of the tree without filling the batch ⇒ exhausted.
+        Ok((results, None))
+    }
 }
 
 // ===========================================================================
