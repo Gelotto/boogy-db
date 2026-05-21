@@ -9,8 +9,10 @@ use crate::value::ColumnDef;
 pub struct IndexMeta {
     /// Name of this index (e.g. "idx_author").
     pub name: String,
-    /// Column name this index covers.
-    pub column: String,
+    /// Columns this index covers, in key order. Length 1 = single-column (back-compat).
+    pub columns: Vec<String>,
+    /// When true, inserts/upserts whose key tuple already exists are rejected.
+    pub unique: bool,
     /// B+ tree root page number for the index tree.
     pub root_page: u32,
 }
@@ -71,9 +73,11 @@ impl TableMeta {
         self.indexes.iter().find(|idx| idx.name == name)
     }
 
-    /// Find an index on a given column.
+    /// Find an index whose leading column matches `column`.
     pub fn find_index_for_column(&self, column: &str) -> Option<&IndexMeta> {
-        self.indexes.iter().find(|idx| idx.column == column)
+        self.indexes
+            .iter()
+            .find(|idx| idx.columns.first().map(|c| c == column).unwrap_or(false))
     }
 }
 

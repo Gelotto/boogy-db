@@ -262,13 +262,25 @@ fn serialize_system_page(
             data[offset..offset + idx_name.len()].copy_from_slice(idx_name);
             offset += idx_name.len();
 
-            let idx_col = idx.column.as_bytes();
-            check_sys_page_bounds(offset, 2 + idx_col.len() + 4)?;
-            data[offset..offset + 2].copy_from_slice(&(idx_col.len() as u16).to_le_bytes());
+            // columns: count (u16) + each (len-prefixed name)
+            check_sys_page_bounds(offset, 2)?;
+            data[offset..offset + 2].copy_from_slice(&(idx.columns.len() as u16).to_le_bytes());
             offset += 2;
-            data[offset..offset + idx_col.len()].copy_from_slice(idx_col);
-            offset += idx_col.len();
+            for col in &idx.columns {
+                let col_bytes = col.as_bytes();
+                check_sys_page_bounds(offset, 2 + col_bytes.len())?;
+                data[offset..offset + 2].copy_from_slice(&(col_bytes.len() as u16).to_le_bytes());
+                offset += 2;
+                data[offset..offset + col_bytes.len()].copy_from_slice(col_bytes);
+                offset += col_bytes.len();
+            }
 
+            // unique byte
+            check_sys_page_bounds(offset, 1)?;
+            data[offset] = if idx.unique { 1 } else { 0 };
+            offset += 1;
+
+            check_sys_page_bounds(offset, 4)?;
             data[offset..offset + 4].copy_from_slice(&idx.root_page.to_le_bytes());
             offset += 4;
         }
@@ -401,25 +413,47 @@ fn deserialize_system_page(
                 .map_err(|_| BoogyError::Corruption("invalid utf8 in index name".into()))?;
             offset += idx_name_len;
 
+            // columns: count (u16) + each (len-prefixed name)
             if offset + 2 > SYSTEM_PAGE_PAYLOAD {
-                return Err(BoogyError::Corruption("system page truncated at index column length".into()));
+                return Err(BoogyError::Corruption("system page truncated at index column count".into()));
             }
-            let idx_col_len =
+            let num_idx_cols =
                 u16::from_le_bytes(data[offset..offset + 2].try_into().unwrap()) as usize;
             offset += 2;
-            if offset + idx_col_len + 4 > SYSTEM_PAGE_PAYLOAD {
-                return Err(BoogyError::Corruption("system page truncated at index column".into()));
+            let mut idx_columns = Vec::with_capacity(num_idx_cols);
+            for _ in 0..num_idx_cols {
+                if offset + 2 > SYSTEM_PAGE_PAYLOAD {
+                    return Err(BoogyError::Corruption("system page truncated at index column length".into()));
+                }
+                let idx_col_len =
+                    u16::from_le_bytes(data[offset..offset + 2].try_into().unwrap()) as usize;
+                offset += 2;
+                if offset + idx_col_len > SYSTEM_PAGE_PAYLOAD {
+                    return Err(BoogyError::Corruption("system page truncated at index column".into()));
+                }
+                let idx_col = String::from_utf8(data[offset..offset + idx_col_len].to_vec())
+                    .map_err(|_| BoogyError::Corruption("invalid utf8 in index column".into()))?;
+                offset += idx_col_len;
+                idx_columns.push(idx_col);
             }
-            let idx_col = String::from_utf8(data[offset..offset + idx_col_len].to_vec())
-                .map_err(|_| BoogyError::Corruption("invalid utf8 in index column".into()))?;
-            offset += idx_col_len;
 
+            // unique byte
+            if offset + 1 > SYSTEM_PAGE_PAYLOAD {
+                return Err(BoogyError::Corruption("system page truncated at index unique flag".into()));
+            }
+            let idx_unique = data[offset] != 0;
+            offset += 1;
+
+            if offset + 4 > SYSTEM_PAGE_PAYLOAD {
+                return Err(BoogyError::Corruption("system page truncated at index root page".into()));
+            }
             let idx_root_page = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
             offset += 4;
 
             meta.indexes.push(IndexMeta {
                 name: idx_name,
-                column: idx_col,
+                columns: idx_columns,
+                unique: idx_unique,
                 root_page: idx_root_page,
             });
         }
@@ -674,11 +708,13 @@ impl BoogyDb {
         remove: bool,
     ) -> Result<()> {
         for idx in &mut meta.indexes {
-            let col_id = meta.col_name_to_id.get(&idx.column).copied();
+            // Single-column index maintenance keys on the leading column.
+            let idx_col = &idx.columns[0];
+            let col_id = meta.col_name_to_id.get(idx_col).copied();
             let col_type = meta
                 .columns
                 .iter()
-                .find(|c| c.name == idx.column)
+                .find(|c| &c.name == idx_col)
                 .map(|c| c.col_type);
             if let (Some(cid), Some(ct)) = (col_id, col_type) {
                 let val = crate::row::extract_column(row_bytes, cid)?
@@ -703,20 +739,22 @@ impl BoogyDb {
         data: &[(&str, Value)],
     ) -> Result<()> {
         for idx in &meta.indexes {
-            if let Some((_, val)) = data.iter().find(|(name, _)| *name == idx.column) {
+            // Single-column index type enforcement keys on the leading column.
+            let idx_col = &idx.columns[0];
+            if let Some((_, val)) = data.iter().find(|(name, _)| name == idx_col) {
                 if val.is_null() {
                     continue;
                 }
                 let col_type = meta
                     .columns
                     .iter()
-                    .find(|c| c.name == idx.column)
+                    .find(|c| &c.name == idx_col)
                     .map(|c| c.col_type);
                 if let Some(ct) = col_type {
                     if val.value_type() != Some(ct) {
                         return Err(BoogyError::TypeMismatch(format!(
                             "column '{}' expects {:?}, got {:?}",
-                            idx.column,
+                            idx_col,
                             ct,
                             val.value_type()
                         )));
@@ -725,7 +763,7 @@ impl BoogyDb {
                         if f.is_nan() {
                             return Err(BoogyError::TypeMismatch(format!(
                                 "column '{}': NaN not allowed in indexed columns",
-                                idx.column
+                                idx_col
                             )));
                         }
                     }
@@ -733,7 +771,7 @@ impl BoogyDb {
                         if s.as_bytes().contains(&0x00) {
                             return Err(BoogyError::TypeMismatch(format!(
                                 "column '{}': null bytes not allowed in indexed text columns",
-                                idx.column
+                                idx_col
                             )));
                         }
                     }
@@ -1483,7 +1521,8 @@ impl BoogyDb {
         // 5. Register the index in table metadata.
         state.meta.indexes.push(IndexMeta {
             name: index_name.to_string(),
-            column: column.to_string(),
+            columns: vec![column.to_string()],
+            unique: false,
             root_page: idx_root,
         });
 
@@ -2616,10 +2655,11 @@ impl<'a> AcidTransaction<'a> {
             .indexes
             .iter()
             .filter_map(|idx| {
-                let cid = state.meta.col_name_to_id.get(&idx.column).copied()?;
-                let ct = state.meta.columns.iter().find(|c| c.name == idx.column)?.col_type;
-                let root = self.current_index_root(table, &idx.column, idx.root_page);
-                Some((idx.column.clone(), cid, ct, root))
+                let idx_col = &idx.columns[0];
+                let cid = state.meta.col_name_to_id.get(idx_col).copied()?;
+                let ct = state.meta.columns.iter().find(|c| &c.name == idx_col)?.col_type;
+                let root = self.current_index_root(table, idx_col, idx.root_page);
+                Some((idx_col.clone(), cid, ct, root))
             })
             .collect();
         let table_id = state.meta.table_id;
@@ -2687,10 +2727,11 @@ impl<'a> AcidTransaction<'a> {
             .indexes
             .iter()
             .filter_map(|idx| {
-                let cid = state.meta.col_name_to_id.get(&idx.column).copied()?;
-                let ct = state.meta.columns.iter().find(|c| c.name == idx.column)?.col_type;
-                let root = self.current_index_root(table, &idx.column, idx.root_page);
-                Some((idx.column.clone(), cid, ct, root))
+                let idx_col = &idx.columns[0];
+                let cid = state.meta.col_name_to_id.get(idx_col).copied()?;
+                let ct = state.meta.columns.iter().find(|c| &c.name == idx_col)?.col_type;
+                let root = self.current_index_root(table, idx_col, idx.root_page);
+                Some((idx_col.clone(), cid, ct, root))
             })
             .collect();
         let table_id = state.meta.table_id;
@@ -2777,10 +2818,11 @@ impl<'a> AcidTransaction<'a> {
             .indexes
             .iter()
             .filter_map(|idx| {
-                let cid = state.meta.col_name_to_id.get(&idx.column).copied()?;
-                let ct = state.meta.columns.iter().find(|c| c.name == idx.column)?.col_type;
-                let root = self.current_index_root(table, &idx.column, idx.root_page);
-                Some((idx.column.clone(), cid, ct, root))
+                let idx_col = &idx.columns[0];
+                let cid = state.meta.col_name_to_id.get(idx_col).copied()?;
+                let ct = state.meta.columns.iter().find(|c| &c.name == idx_col)?.col_type;
+                let root = self.current_index_root(table, idx_col, idx.root_page);
+                Some((idx_col.clone(), cid, ct, root))
             })
             .collect();
         drop(state);
@@ -2878,10 +2920,11 @@ impl<'a> AcidTransaction<'a> {
             .indexes
             .iter()
             .filter_map(|idx| {
-                let cid = state.meta.col_name_to_id.get(&idx.column).copied()?;
-                let ct = state.meta.columns.iter().find(|c| c.name == idx.column)?.col_type;
-                let root = self.current_index_root(table, &idx.column, idx.root_page);
-                Some((idx.column.clone(), cid, ct, root))
+                let idx_col = &idx.columns[0];
+                let cid = state.meta.col_name_to_id.get(idx_col).copied()?;
+                let ct = state.meta.columns.iter().find(|c| &c.name == idx_col)?.col_type;
+                let root = self.current_index_root(table, idx_col, idx.root_page);
+                Some((idx_col.clone(), cid, ct, root))
             })
             .collect();
         drop(state);
@@ -3230,7 +3273,12 @@ impl<'a> AcidTransaction<'a> {
                 }
                 // Apply index root pages from delta.
                 for (col, root) in &delta.index_roots {
-                    if let Some(idx) = state.meta.indexes.iter_mut().find(|i| &i.column == col) {
+                    if let Some(idx) = state
+                        .meta
+                        .indexes
+                        .iter_mut()
+                        .find(|i| i.columns.first() == Some(col))
+                    {
                         idx.root_page = *root;
                     }
                 }
@@ -3763,6 +3811,40 @@ mod tests {
         let result = db.find("t", opts).unwrap();
         assert_eq!(result.total, Some(1));
         assert_eq!(result.rows.len(), 1);
+    }
+
+    #[test]
+    fn test_index_meta_survives_reopen() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.boogy");
+        {
+            let db = BoogyDb::open(&path).unwrap();
+            db.create_table("t", &[ColumnDef::new("v", Type::Text)]).unwrap();
+            db.create_index("t", "idx_v", "v").unwrap();
+            db.insert("t", &[("v", Value::Text("hello".into()))]).unwrap();
+        }
+        {
+            let db = BoogyDb::open(&path).unwrap();
+            // IndexMeta round-trips through the system page: name, columns, unique.
+            {
+                let tables = db.tables.read().unwrap();
+                let state = tables.get("t").unwrap().read().unwrap();
+                assert_eq!(state.meta.indexes.len(), 1);
+                let idx = &state.meta.indexes[0];
+                assert_eq!(idx.name, "idx_v");
+                assert_eq!(idx.columns, vec!["v".to_string()]);
+                assert!(!idx.unique);
+            }
+            // And the index is still functional after reopen.
+            let opts = crate::filter::FindOptions {
+                filters: vec![crate::filter::Filter::eq("v", "hello")],
+                include_total: true,
+                ..Default::default()
+            };
+            let result = db.find("t", opts).unwrap();
+            assert_eq!(result.total, Some(1));
+            assert_eq!(result.rows.len(), 1);
+        }
     }
 
     #[test]
