@@ -2688,8 +2688,10 @@ struct MetaDelta {
     next_rowid: u64,
     table_id: u32,
     cipher: Option<crate::crypto::Cipher>,
-    /// Tracked index root pages: (index_column, root_page).
-    /// Updated during operations; applied on commit.
+    /// Tracked index root pages: (index_name, root_page).
+    /// Updated during operations; applied on commit. Keyed by index NAME (not
+    /// leading column) so composite indexes — and two indexes sharing a leading
+    /// column — track independently.
     index_roots: Vec<(String, u32)>,
 }
 
@@ -2702,6 +2704,15 @@ pub struct AcidTransaction<'a> {
     private_dirty: StdHashMap<u32, Box<Page>>,
     new_page_count: u32,
     meta_deltas: StdHashMap<String, MetaDelta>,
+    /// Within-transaction unique-index witness set, keyed by
+    /// `(table, index_name)` → set of composite value-prefixes inserted so far
+    /// in THIS uncommitted transaction. The committed-tree scan in
+    /// [`Self::enforce_unique_indexes_acid`] cannot see writes made earlier in
+    /// the same tx (they live in `private_dirty`, not the committed index
+    /// tree), so multi-insert duplicates (`insert_many`, explicit `begin()`
+    /// batches) are caught here instead. Empty/unused on the host's dominant
+    /// single-insert-per-tx path.
+    unique_seen: StdHashMap<(String, String), std::collections::HashSet<Vec<u8>>>,
     committed: bool,
 }
 
@@ -2712,6 +2723,7 @@ impl<'a> AcidTransaction<'a> {
             private_dirty: StdHashMap::new(),
             new_page_count: 0,
             meta_deltas: StdHashMap::new(),
+            unique_seen: StdHashMap::new(),
             committed: false,
         }
     }
@@ -2762,16 +2774,167 @@ impl<'a> AcidTransaction<'a> {
             .unwrap_or(meta.next_rowid)
     }
 
-    /// Get the current index root page for a column, preferring meta_deltas.
-    fn current_index_root(&self, table: &str, column: &str, original_root: u32) -> u32 {
+    /// Get the current root page for the named index, preferring meta_deltas.
+    fn current_index_root(&self, table: &str, index_name: &str, original_root: u32) -> u32 {
         if let Some(delta) = self.meta_deltas.get(table) {
-            for (col, root) in &delta.index_roots {
-                if col == column {
+            for (name, root) in &delta.index_roots {
+                if name == index_name {
                     return *root;
                 }
             }
         }
         original_root
+    }
+
+    /// Enforce uniqueness for every `unique` index on `meta` against the
+    /// encoded `row_bytes` of a row about to be inserted in THIS transaction.
+    ///
+    /// Returns `Err(UniqueViolation)` if the row's composite value-tuple (all
+    /// index columns, no rowid) collides with either:
+    ///   1. a row already committed (read-only `IndexTreeReader::scan_prefix`
+    ///      over the committed index tree — covers the host's dominant
+    ///      single-insert-per-tx case), or
+    ///   2. a row inserted earlier in this same uncommitted tx (the committed
+    ///      tree can't see it; checked against `self.unique_seen`).
+    ///
+    /// A Null in any index column means the tuple is not indexed (matching the
+    /// single-column convention) and is therefore never a uniqueness conflict.
+    ///
+    /// This performs NO mutation of database state. On the Ok path it records
+    /// each unique index's value-prefix into `self.unique_seen` so a later
+    /// insert in the same tx sees it. The caller MUST run this BEFORE any write
+    /// guard / meta_delta mutation, so a rejection leaves the tx unchanged.
+    fn enforce_unique_indexes_acid(
+        &mut self,
+        table: &str,
+        meta: &TableMeta,
+        row_bytes: &[u8],
+    ) -> Result<()> {
+        for idx in &meta.indexes {
+            if !idx.unique {
+                continue;
+            }
+            // Resolve all index columns to (col_id, col_type).
+            let mut col_ids: Vec<u16> = Vec::with_capacity(idx.columns.len());
+            let mut col_types: Vec<crate::value::Type> = Vec::with_capacity(idx.columns.len());
+            let mut resolved = true;
+            for idx_col in &idx.columns {
+                match (
+                    meta.col_name_to_id.get(idx_col).copied(),
+                    meta.columns.iter().find(|c| &c.name == idx_col).map(|c| c.col_type),
+                ) {
+                    (Some(cid), Some(ct)) => {
+                        col_ids.push(cid);
+                        col_types.push(ct);
+                    }
+                    _ => {
+                        resolved = false;
+                        break;
+                    }
+                }
+            }
+            if !resolved {
+                continue;
+            }
+            let mut col_vals: Vec<Value> = Vec::with_capacity(col_ids.len());
+            for cid in &col_ids {
+                col_vals.push(crate::row::extract_column(row_bytes, *cid)?.unwrap_or(Value::Null));
+            }
+            // A Null component is not indexed, so it cannot collide.
+            let Some(prefix) = index::encode_composite_value_prefix(&col_types, &col_vals) else {
+                continue;
+            };
+
+            // (1) vs committed data. Read the CURRENT (delta-aware) root for
+            // this index, but scan the COMMITTED tree image via the PageFile:
+            // uncommitted writes live in private_dirty, not the file, so this
+            // sees only durably-committed entries — exactly the rows from prior
+            // transactions. Within-tx dups are handled by (2).
+            let committed_root = idx.root_page;
+            let reader = IndexTreeReader::new(&self.db.file, committed_root);
+            if !reader.scan_prefix(&prefix)?.is_empty() {
+                return Err(BoogyError::UniqueViolation {
+                    index: idx.name.clone(),
+                });
+            }
+
+            // (2) vs earlier inserts in THIS tx.
+            if let Some(seen) = self.unique_seen.get(&(table.to_string(), idx.name.clone())) {
+                if seen.contains(&prefix) {
+                    return Err(BoogyError::UniqueViolation {
+                        index: idx.name.clone(),
+                    });
+                }
+            }
+        }
+
+        // All unique indexes passed — now record this row's prefixes so a later
+        // insert in the same tx collides. Done in a second pass so a rejection
+        // above records nothing.
+        for idx in &meta.indexes {
+            if !idx.unique {
+                continue;
+            }
+            let mut col_ids: Vec<u16> = Vec::with_capacity(idx.columns.len());
+            let mut col_types: Vec<crate::value::Type> = Vec::with_capacity(idx.columns.len());
+            let mut resolved = true;
+            for idx_col in &idx.columns {
+                match (
+                    meta.col_name_to_id.get(idx_col).copied(),
+                    meta.columns.iter().find(|c| &c.name == idx_col).map(|c| c.col_type),
+                ) {
+                    (Some(cid), Some(ct)) => {
+                        col_ids.push(cid);
+                        col_types.push(ct);
+                    }
+                    _ => {
+                        resolved = false;
+                        break;
+                    }
+                }
+            }
+            if !resolved {
+                continue;
+            }
+            let mut col_vals: Vec<Value> = Vec::with_capacity(col_ids.len());
+            for cid in &col_ids {
+                col_vals.push(crate::row::extract_column(row_bytes, *cid)?.unwrap_or(Value::Null));
+            }
+            if let Some(prefix) = index::encode_composite_value_prefix(&col_types, &col_vals) {
+                self.unique_seen
+                    .entry((table.to_string(), idx.name.clone()))
+                    .or_default()
+                    .insert(prefix);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Resolve every index on `meta` to the composite descriptor the ACID
+    /// write loop needs: `(index_name, [col_id], [col_type], current_root)`.
+    /// Keying on the index NAME (not leading column) lets composite indexes and
+    /// indexes sharing a leading column track their root pages independently.
+    fn composite_index_info(
+        &self,
+        table: &str,
+        meta: &TableMeta,
+    ) -> Vec<(String, Vec<u16>, Vec<crate::value::Type>, u32)> {
+        meta.indexes
+            .iter()
+            .filter_map(|idx| {
+                let mut col_ids: Vec<u16> = Vec::with_capacity(idx.columns.len());
+                let mut col_types: Vec<crate::value::Type> = Vec::with_capacity(idx.columns.len());
+                for idx_col in &idx.columns {
+                    let cid = meta.col_name_to_id.get(idx_col).copied()?;
+                    let ct = meta.columns.iter().find(|c| &c.name == idx_col)?.col_type;
+                    col_ids.push(cid);
+                    col_types.push(ct);
+                }
+                let root = self.current_index_root(table, &idx.name, idx.root_page);
+                Some((idx.name.clone(), col_ids, col_types, root))
+            })
+            .collect()
     }
 
     /// Insert a row with auto-increment rowid.
@@ -2794,21 +2957,19 @@ impl<'a> AcidTransaction<'a> {
             return Err(BoogyError::RowTooLarge(row_bytes.len()));
         }
 
-        // Extract index info before entering with_guard.
-        // Use delta roots when available so subsequent operations within the
-        // same transaction see the correct index tree.
-        let index_info: Vec<(String, u16, crate::value::Type, u32)> = state
-            .meta
-            .indexes
-            .iter()
-            .filter_map(|idx| {
-                let idx_col = &idx.columns[0];
-                let cid = state.meta.col_name_to_id.get(idx_col).copied()?;
-                let ct = state.meta.columns.iter().find(|c| &c.name == idx_col)?.col_type;
-                let root = self.current_index_root(table, idx_col, idx.root_page);
-                Some((idx_col.clone(), cid, ct, root))
-            })
-            .collect();
+        // Unique-index enforcement. Read-only (committed-tree scan + within-tx
+        // witness set) and runs BEFORE any write guard or meta_delta mutation,
+        // so a rejection leaves the transaction byte-for-byte unchanged: no
+        // dirty page, no rowid consumed (the rowid lives in the delta we never
+        // write below), nothing to roll back beyond dropping the tx.
+        if !state.meta.indexes.is_empty() {
+            self.enforce_unique_indexes_acid(table, &state.meta, &row_bytes)?;
+        }
+
+        // Extract composite index info before entering with_guard. Keyed by
+        // index name; delta-aware roots so subsequent ops in this tx see the
+        // correct (uncommitted) index tree.
+        let index_info = self.composite_index_info(table, &state.meta);
         let table_id = state.meta.table_id;
         let cipher = state.meta.cipher.clone();
         drop(state);
@@ -2818,15 +2979,19 @@ impl<'a> AcidTransaction<'a> {
             let new_root = tree.insert(rowid, &row_bytes)?;
 
             let mut idx_roots = Vec::new();
-            for (col, cid, ct, idx_root) in &index_info {
-                let val = crate::row::extract_column(&row_bytes, *cid)?
-                    .unwrap_or(Value::Null);
-                if let Some(key) = index::encode_index_key(*ct, &val, rowid) {
+            for (name, col_ids, col_types, idx_root) in &index_info {
+                let mut col_vals: Vec<Value> = Vec::with_capacity(col_ids.len());
+                for cid in col_ids {
+                    col_vals.push(
+                        crate::row::extract_column(&row_bytes, *cid)?.unwrap_or(Value::Null),
+                    );
+                }
+                if let Some(key) = index::encode_composite_index_key(col_types, &col_vals, rowid) {
                     let mut itree = IndexTreeWriter::new(guard, *idx_root);
                     let r = itree.insert(&key)?;
-                    idx_roots.push((col.clone(), r));
+                    idx_roots.push((name.clone(), r));
                 } else {
-                    idx_roots.push((col.clone(), *idx_root));
+                    idx_roots.push((name.clone(), *idx_root));
                 }
             }
 
@@ -2869,18 +3034,13 @@ impl<'a> AcidTransaction<'a> {
             return Err(BoogyError::RowTooLarge(row_bytes.len()));
         }
 
-        let index_info: Vec<(String, u16, crate::value::Type, u32)> = state
-            .meta
-            .indexes
-            .iter()
-            .filter_map(|idx| {
-                let idx_col = &idx.columns[0];
-                let cid = state.meta.col_name_to_id.get(idx_col).copied()?;
-                let ct = state.meta.columns.iter().find(|c| &c.name == idx_col)?.col_type;
-                let root = self.current_index_root(table, idx_col, idx.root_page);
-                Some((idx_col.clone(), cid, ct, root))
-            })
-            .collect();
+        // Unique-index enforcement BEFORE any write guard / meta_delta change
+        // (see insert() for the atomicity argument — identical here).
+        if !state.meta.indexes.is_empty() {
+            self.enforce_unique_indexes_acid(table, &state.meta, &row_bytes)?;
+        }
+
+        let index_info = self.composite_index_info(table, &state.meta);
         let table_id = state.meta.table_id;
         let cipher = state.meta.cipher.clone();
         let current_next = self.current_next_rowid(table, &state.meta);
@@ -2891,15 +3051,19 @@ impl<'a> AcidTransaction<'a> {
             let new_root = tree.insert(rowid, &row_bytes)?;
 
             let mut idx_roots = Vec::new();
-            for (col, cid, ct, idx_root) in &index_info {
-                let val = crate::row::extract_column(&row_bytes, *cid)?
-                    .unwrap_or(Value::Null);
-                if let Some(key) = index::encode_index_key(*ct, &val, rowid) {
+            for (name, col_ids, col_types, idx_root) in &index_info {
+                let mut col_vals: Vec<Value> = Vec::with_capacity(col_ids.len());
+                for cid in col_ids {
+                    col_vals.push(
+                        crate::row::extract_column(&row_bytes, *cid)?.unwrap_or(Value::Null),
+                    );
+                }
+                if let Some(key) = index::encode_composite_index_key(col_types, &col_vals, rowid) {
                     let mut itree = IndexTreeWriter::new(guard, *idx_root);
                     let r = itree.insert(&key)?;
-                    idx_roots.push((col.clone(), r));
+                    idx_roots.push((name.clone(), r));
                 } else {
-                    idx_roots.push((col.clone(), *idx_root));
+                    idx_roots.push((name.clone(), *idx_root));
                 }
             }
 
@@ -2960,18 +3124,7 @@ impl<'a> AcidTransaction<'a> {
         // Extract column info for merge
         let col_name_to_id = state.meta.col_name_to_id.clone();
 
-        let index_info: Vec<(String, u16, crate::value::Type, u32)> = state
-            .meta
-            .indexes
-            .iter()
-            .filter_map(|idx| {
-                let idx_col = &idx.columns[0];
-                let cid = state.meta.col_name_to_id.get(idx_col).copied()?;
-                let ct = state.meta.columns.iter().find(|c| &c.name == idx_col)?.col_type;
-                let root = self.current_index_root(table, idx_col, idx.root_page);
-                Some((idx_col.clone(), cid, ct, root))
-            })
-            .collect();
+        let index_info = self.composite_index_info(table, &state.meta);
         drop(state);
 
         // Prepare field mappings
@@ -2999,26 +3152,33 @@ impl<'a> AcidTransaction<'a> {
             let col_values: Vec<(u16, &Value)> = col_map.iter().map(|(k, v)| (*k, v)).collect();
             let new_row = row::encode_row(id, &col_values);
 
-            // Remove old index entries
+            // Remove old composite index entries, then insert the new tuple.
             let mut idx_roots = Vec::new();
-            for (col, cid, ct, idx_root) in &index_info {
-                let old_val = crate::row::extract_column(&existing_bytes, *cid)?
-                    .unwrap_or(Value::Null);
+            for (name, col_ids, col_types, idx_root) in &index_info {
                 let mut current_root = *idx_root;
-                if let Some(key) = index::encode_index_key(*ct, &old_val, id) {
+                let mut old_vals: Vec<Value> = Vec::with_capacity(col_ids.len());
+                for cid in col_ids {
+                    old_vals.push(
+                        crate::row::extract_column(&existing_bytes, *cid)?.unwrap_or(Value::Null),
+                    );
+                }
+                if let Some(key) = index::encode_composite_index_key(col_types, &old_vals, id) {
                     let mut itree = IndexTreeWriter::new(guard, current_root);
                     itree.delete(&key)?;
                     current_root = itree.root_page();
                 }
-                // Insert new index entries
-                let new_val = crate::row::extract_column(&new_row, *cid)?
-                    .unwrap_or(Value::Null);
-                if let Some(key) = index::encode_index_key(*ct, &new_val, id) {
+                let mut new_vals: Vec<Value> = Vec::with_capacity(col_ids.len());
+                for cid in col_ids {
+                    new_vals.push(
+                        crate::row::extract_column(&new_row, *cid)?.unwrap_or(Value::Null),
+                    );
+                }
+                if let Some(key) = index::encode_composite_index_key(col_types, &new_vals, id) {
                     let mut itree = IndexTreeWriter::new(guard, current_root);
                     let r = itree.insert(&key)?;
-                    idx_roots.push((col.clone(), r));
+                    idx_roots.push((name.clone(), r));
                 } else {
-                    idx_roots.push((col.clone(), current_root));
+                    idx_roots.push((name.clone(), current_root));
                 }
             }
 
@@ -3062,18 +3222,7 @@ impl<'a> AcidTransaction<'a> {
         let current_next = self.current_next_rowid(table, &state.meta);
 
         let has_indexes = !state.meta.indexes.is_empty();
-        let index_info: Vec<(String, u16, crate::value::Type, u32)> = state
-            .meta
-            .indexes
-            .iter()
-            .filter_map(|idx| {
-                let idx_col = &idx.columns[0];
-                let cid = state.meta.col_name_to_id.get(idx_col).copied()?;
-                let ct = state.meta.columns.iter().find(|c| &c.name == idx_col)?.col_type;
-                let root = self.current_index_root(table, idx_col, idx.root_page);
-                Some((idx_col.clone(), cid, ct, root))
-            })
-            .collect();
+        let index_info = self.composite_index_info(table, &state.meta);
         drop(state);
 
         let result = self.with_guard(|guard| {
@@ -3092,15 +3241,21 @@ impl<'a> AcidTransaction<'a> {
             let mut idx_roots = Vec::new();
             if deleted {
                 if let Some(ref bytes) = row_bytes_for_index {
-                    for (col, cid, ct, idx_root) in &index_info {
-                        let val = crate::row::extract_column(bytes, *cid)?
-                            .unwrap_or(Value::Null);
-                        if let Some(key) = index::encode_index_key(*ct, &val, id) {
+                    for (name, col_ids, col_types, idx_root) in &index_info {
+                        let mut col_vals: Vec<Value> = Vec::with_capacity(col_ids.len());
+                        for cid in col_ids {
+                            col_vals.push(
+                                crate::row::extract_column(bytes, *cid)?.unwrap_or(Value::Null),
+                            );
+                        }
+                        if let Some(key) =
+                            index::encode_composite_index_key(col_types, &col_vals, id)
+                        {
                             let mut itree = IndexTreeWriter::new(guard, *idx_root);
                             itree.delete(&key)?;
-                            idx_roots.push((col.clone(), itree.root_page()));
+                            idx_roots.push((name.clone(), itree.root_page()));
                         } else {
-                            idx_roots.push((col.clone(), *idx_root));
+                            idx_roots.push((name.clone(), *idx_root));
                         }
                     }
                 }
@@ -3418,13 +3573,13 @@ impl<'a> AcidTransaction<'a> {
                 if delta.next_rowid > state.meta.next_rowid {
                     state.meta.next_rowid = delta.next_rowid;
                 }
-                // Apply index root pages from delta.
-                for (col, root) in &delta.index_roots {
+                // Apply index root pages from delta (keyed by index name).
+                for (name, root) in &delta.index_roots {
                     if let Some(idx) = state
                         .meta
                         .indexes
                         .iter_mut()
-                        .find(|i| i.columns.first() == Some(col))
+                        .find(|i| &i.name == name)
                     {
                         idx.root_page = *root;
                     }
@@ -4517,5 +4672,95 @@ mod tests {
         db.create_index_ex("t", "by_xy", &["x", "y"], false).unwrap();
         db.insert("t", &[("x",1i64.into()),("y",2i64.into())]).unwrap();
         assert!(db.insert("t", &[("x",1i64.into()),("y",2i64.into())]).is_ok());
+    }
+
+    // ----- ACID-path index correctness (the path the host actually runs) -----
+    // The host opens every per-API store with set_acid(true), so BoogyDb::insert
+    // routes through AcidTransaction::insert. These mirror the non-ACID tests
+    // above but assert the enforcement happens on the ACID write path.
+
+    #[test]
+    fn test_acid_unique_composite_index_rejects_duplicate() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.boogy");
+        let db = BoogyDb::open(&path).unwrap();
+        db.set_acid(true);
+        db.create_table("edges", &[
+            ColumnDef::new("user_a", Type::Text),
+            ColumnDef::new("user_b", Type::Text),
+            ColumnDef::new("n", Type::Integer),
+        ]).unwrap();
+        db.create_index_ex("edges", "by_pair", &["user_a", "user_b"], true).unwrap();
+        db.insert("edges", &[("user_a","a".into()),("user_b","b".into()),("n",1i64.into())]).unwrap();
+        let dup = db.insert("edges", &[("user_a","a".into()),("user_b","b".into()),("n",9i64.into())]);
+        assert!(matches!(dup, Err(BoogyError::UniqueViolation { .. })));
+        // a different pair is fine
+        assert!(db.insert("edges", &[("user_a","a".into()),("user_b","c".into()),("n",1i64.into())]).is_ok());
+        // the rejected duplicate left NO partial state: exactly the two
+        // accepted rows exist.
+        let all = db.find("edges", FindOptions::default()).unwrap();
+        assert_eq!(all.rows.len(), 2);
+        // and re-inserting the unique pair still rejects (no rowid leak / no
+        // half-applied index entry).
+        let dup2 = db.insert("edges", &[("user_a","a".into()),("user_b","b".into()),("n",7i64.into())]);
+        assert!(matches!(dup2, Err(BoogyError::UniqueViolation { .. })));
+        assert_eq!(db.find("edges", FindOptions::default()).unwrap().rows.len(), 2);
+    }
+
+    #[test]
+    fn test_acid_composite_index_find_by_both_columns() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.boogy");
+        let db = BoogyDb::open(&path).unwrap();
+        db.set_acid(true);
+        db.create_table("edges", &[
+            ColumnDef::new("user_a", Type::Text),
+            ColumnDef::new("user_b", Type::Text),
+            ColumnDef::new("n", Type::Integer),
+        ]).unwrap();
+        db.create_index_ex("edges", "by_pair", &["user_a", "user_b"], true).unwrap();
+        db.insert("edges", &[("user_a","a".into()),("user_b","b".into()),("n",1i64.into())]).unwrap();
+        db.insert("edges", &[("user_a","a".into()),("user_b","c".into()),("n",2i64.into())]).unwrap();
+        // filter on BOTH index columns returns exactly the one matching row.
+        let res = db.find("edges", FindOptions {
+            filters: vec![Filter::eq("user_a", "a"), Filter::eq("user_b", "b")],
+            ..Default::default()
+        }).unwrap();
+        assert_eq!(res.rows.len(), 1);
+        assert_eq!(res.rows[0].get("user_b"), Some(Value::Text("b".to_string())));
+    }
+
+    #[test]
+    fn test_acid_insert_many_rejects_duplicate_within_same_tx() {
+        // Two inserts of the same composite key within ONE AcidTransaction:
+        // the committed-tree scan can't see the first (uncommitted) insert, so
+        // this exercises the within-tx duplicate set. The whole tx must reject
+        // and, being dropped without commit, leave the table empty.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.boogy");
+        let db = BoogyDb::open(&path).unwrap();
+        db.set_acid(true);
+        db.create_table("edges", &[
+            ColumnDef::new("user_a", Type::Text),
+            ColumnDef::new("user_b", Type::Text),
+            ColumnDef::new("n", Type::Integer),
+        ]).unwrap();
+        db.create_index_ex("edges", "by_pair", &["user_a", "user_b"], true).unwrap();
+
+        let res = db.insert_many("edges", &[
+            vec![("user_a","a".into()),("user_b","b".into()),("n",1i64.into())],
+            vec![("user_a","a".into()),("user_b","b".into()),("n",2i64.into())],
+        ]);
+        assert!(matches!(res, Err(BoogyError::UniqueViolation { .. })));
+        // The aborted multi-insert tx committed nothing.
+        assert_eq!(db.find("edges", FindOptions::default()).unwrap().rows.len(), 0);
+
+        // A non-conflicting batch then commits cleanly.
+        let ok = db.insert_many("edges", &[
+            vec![("user_a","a".into()),("user_b","b".into()),("n",1i64.into())],
+            vec![("user_a","a".into()),("user_b","c".into()),("n",2i64.into())],
+        ]).unwrap();
+        assert_eq!(ok.len(), 2);
+        assert_eq!(db.find("edges", FindOptions::default()).unwrap().rows.len(), 2);
     }
 }
