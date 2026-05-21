@@ -62,6 +62,30 @@ fn row_passes(
                 .any(|g| g.iter().all(|f| filter_matches_row(col_name_to_id, bytes, f))))
 }
 
+/// Add a numeric `delta` to a `current` counter value, preserving type:
+/// Integer+Integer→Integer, Real+Real→Real, mixed→Real. A Null/absent
+/// `current` is treated as zero of `delta`'s type. `delta` is assumed numeric
+/// (callers validate before this point). Integer addition wraps (matching the
+/// platform's i64 semantics) rather than panicking on overflow.
+fn add_counter(current: &Value, delta: &Value) -> Result<Value> {
+    match (current, delta) {
+        // Integer accumulation.
+        (Value::Null, Value::Integer(d)) => Ok(Value::Integer(*d)),
+        (Value::Integer(c), Value::Integer(d)) => Ok(Value::Integer(c.wrapping_add(*d))),
+        // Real accumulation.
+        (Value::Null, Value::Real(d)) => Ok(Value::Real(*d)),
+        (Value::Real(c), Value::Real(d)) => Ok(Value::Real(c + d)),
+        // Mixed numeric → Real.
+        (Value::Integer(c), Value::Real(d)) => Ok(Value::Real(*c as f64 + d)),
+        (Value::Real(c), Value::Integer(d)) => Ok(Value::Real(c + *d as f64)),
+        // Current is present but non-numeric → type error.
+        (other, _) => Err(BoogyError::SchemaMismatch(format!(
+            "upsert_increment counter is not numeric: current value {:?}",
+            other.value_type()
+        ))),
+    }
+}
+
 /// Extract the rowid suffix from an index leaf key. Every index key —
 /// single-column or composite — appends the 8-byte big-endian rowid as its
 /// final bytes, so the rowid is always the last 8 bytes regardless of the
@@ -2160,6 +2184,33 @@ impl BoogyDb {
         Ok(ids)
     }
 
+    /// Atomic keyed counter: find-or-insert-and-add. Finds the single row
+    /// matching the `key` tuple; if found, adds the numeric `delta` to its
+    /// `counter` column (Integer+Integer→Integer, Real+Real→Real, mixed→Real;
+    /// a null/absent counter is treated as zero of `delta`'s type) and applies
+    /// the `set` columns. If absent, inserts a row with the key columns,
+    /// `counter = delta`, and `set`. Returns the affected rowid.
+    ///
+    /// Atomicity: the find + the write run inside a SINGLE `AcidTransaction`
+    /// (one private dirty overlay, one commit), so there is no find→write
+    /// window in which another writer could insert the same key. A composite
+    /// `unique` index on the key columns (when present) is the durable backstop
+    /// that turns any racing double-insert into a `UniqueViolation` rather than
+    /// a duplicate row. `delta` must be `Integer` or `Real`.
+    pub fn upsert_increment(
+        &self,
+        table: &str,
+        key: &[(&str, Value)],
+        counter: &str,
+        delta: Value,
+        set: &[(&str, Value)],
+    ) -> Result<u64> {
+        let mut tx = AcidTransaction::new(self);
+        let rowid = tx.upsert_increment(table, key, counter, delta, set)?;
+        tx.commit()?;
+        Ok(rowid)
+    }
+
     /// Run a multi-table transaction.
     pub fn transaction<F, R>(&self, f: F) -> Result<R>
     where
@@ -3251,6 +3302,65 @@ impl<'a> AcidTransaction<'a> {
         delta.index_roots = idx_roots;
 
         Ok(())
+    }
+
+    /// Atomic keyed find-or-insert-and-add. Finds the single row matching the
+    /// `key` tuple; if found, adds `delta` to its `counter` column (preserving
+    /// type) and applies `set`; if absent, inserts a row carrying the key
+    /// columns, `counter = delta`, and `set`. Returns the affected rowid.
+    ///
+    /// The find and the subsequent insert/update both run inside THIS
+    /// transaction (against the same private dirty overlay) and commit as one
+    /// unit, so there is no find→write gap visible to another writer.
+    pub fn upsert_increment(
+        &mut self,
+        table: &str,
+        key: &[(&str, Value)],
+        counter: &str,
+        delta: Value,
+        set: &[(&str, Value)],
+    ) -> Result<u64> {
+        // Delta must be numeric (Integer or Real).
+        if !matches!(delta, Value::Integer(_) | Value::Real(_)) {
+            return Err(BoogyError::SchemaMismatch(format!(
+                "upsert_increment delta for '{counter}' must be Integer or Real, got {:?}",
+                delta.value_type()
+            )));
+        }
+
+        // Locate the existing row by the full key tuple. This find runs through
+        // the same uncommitted overlay as the write below.
+        let filters: Vec<Filter> = key.iter().map(|(c, v)| Filter::eq(*c, v.clone())).collect();
+        let existing = self.find(
+            table,
+            FindOptions { filters, limit: Some(1), ..Default::default() },
+        )?;
+
+        if let Some(row) = existing.rows.into_iter().next() {
+            // Found: read current counter, add delta preserving type.
+            let current = row.get(counter).unwrap_or(Value::Null);
+            let new_value = add_counter(&current, &delta)?;
+            let rowid = row.id;
+
+            let mut fields: Vec<(&str, Value)> = Vec::with_capacity(1 + set.len());
+            fields.push((counter, new_value));
+            for (c, v) in set {
+                fields.push((*c, v.clone()));
+            }
+            self.update(table, rowid, &fields)?;
+            Ok(rowid)
+        } else {
+            // Absent: insert key cols + (counter = delta) + set cols.
+            let mut data: Vec<(&str, Value)> = Vec::with_capacity(key.len() + 1 + set.len());
+            for (c, v) in key {
+                data.push((*c, v.clone()));
+            }
+            data.push((counter, delta));
+            for (c, v) in set {
+                data.push((*c, v.clone()));
+            }
+            self.insert(table, &data)
+        }
     }
 
     /// Get a row by rowid (sees dirty overlay).
@@ -5004,5 +5114,89 @@ mod tests {
         db.insert("t", &[("v", 1i64.into())]).unwrap();
         let r = db.scan_batch("t", &[], &[], ScanOrder::index("nonexistent", SortDir::Asc), None, 10);
         assert!(r.is_err());
+    }
+
+    // ----- upsert_increment (atomic keyed counter) -----
+
+    #[test]
+    fn test_upsert_increment_inserts_then_increments_integer() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.boogy");
+        let db = BoogyDb::open(&path).unwrap();
+        db.create_table("edges", &[
+            ColumnDef::new("user_a", Type::Text),
+            ColumnDef::new("user_b", Type::Text),
+            ColumnDef::new("n", Type::Integer),
+            ColumnDef::new("updated_at", Type::Integer),
+        ]).unwrap();
+        db.create_index_ex("edges", "by_pair", &["user_a", "user_b"], true).unwrap();
+        // first call inserts n=1
+        db.upsert_increment("edges", &[("user_a", "a".into()), ("user_b", "b".into())], "n", Value::Integer(1),
+            &[("updated_at", Value::Integer(100))]).unwrap();
+        // second call increments to n=3 (delta 2) and updates set col
+        db.upsert_increment("edges", &[("user_a", "a".into()), ("user_b", "b".into())], "n", Value::Integer(2),
+            &[("updated_at", Value::Integer(200))]).unwrap();
+        let res = db.find("edges", FindOptions {
+            filters: vec![Filter::eq("user_a", "a"), Filter::eq("user_b", "b")], ..Default::default() }).unwrap();
+        assert_eq!(res.rows.len(), 1);
+        assert_eq!(res.rows[0].get("n"), Some(Value::Integer(3)));
+        assert_eq!(res.rows[0].get("updated_at"), Some(Value::Integer(200)));
+    }
+
+    #[test]
+    fn test_upsert_increment_real_counter() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.boogy");
+        let db = BoogyDb::open(&path).unwrap();
+        db.create_table("w", &[
+            ColumnDef::new("k", Type::Text),
+            ColumnDef::new("weight", Type::Real),
+        ]).unwrap();
+        db.create_index_ex("w", "by_k", &["k"], true).unwrap();
+        db.upsert_increment("w", &[("k", "x".into())], "weight", Value::Real(0.5), &[]).unwrap();
+        db.upsert_increment("w", &[("k", "x".into())], "weight", Value::Real(0.25), &[]).unwrap();
+        let res = db.find("w", FindOptions { filters: vec![Filter::eq("k", "x")], ..Default::default() }).unwrap();
+        if let Some(Value::Real(f)) = res.rows[0].get("weight") { assert!((f - 0.75).abs() < 1e-9); } else { panic!(); }
+    }
+
+    // The host opens every per-API store with set_acid(true); upsert_increment
+    // must be atomic + type-correct on the ACID write path it actually runs on.
+    #[test]
+    fn test_acid_upsert_increment_inserts_then_increments_integer() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.boogy");
+        let db = BoogyDb::open(&path).unwrap();
+        db.set_acid(true);
+        db.create_table("edges", &[
+            ColumnDef::new("user_a", Type::Text),
+            ColumnDef::new("user_b", Type::Text),
+            ColumnDef::new("n", Type::Integer),
+            ColumnDef::new("updated_at", Type::Integer),
+        ]).unwrap();
+        db.create_index_ex("edges", "by_pair", &["user_a", "user_b"], true).unwrap();
+        db.upsert_increment("edges", &[("user_a", "a".into()), ("user_b", "b".into())], "n", Value::Integer(1),
+            &[("updated_at", Value::Integer(100))]).unwrap();
+        db.upsert_increment("edges", &[("user_a", "a".into()), ("user_b", "b".into())], "n", Value::Integer(2),
+            &[("updated_at", Value::Integer(200))]).unwrap();
+        let res = db.find("edges", FindOptions {
+            filters: vec![Filter::eq("user_a", "a"), Filter::eq("user_b", "b")], ..Default::default() }).unwrap();
+        // Exactly one row — the increment updated in place rather than inserting
+        // a second row (which the unique index would have rejected anyway).
+        assert_eq!(res.rows.len(), 1);
+        assert_eq!(res.rows[0].get("n"), Some(Value::Integer(3)));
+        assert_eq!(res.rows[0].get("updated_at"), Some(Value::Integer(200)));
+    }
+
+    #[test]
+    fn test_upsert_increment_rejects_non_numeric_delta() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.boogy");
+        let db = BoogyDb::open(&path).unwrap();
+        db.create_table("t", &[
+            ColumnDef::new("k", Type::Text),
+            ColumnDef::new("n", Type::Integer),
+        ]).unwrap();
+        let r = db.upsert_increment("t", &[("k", "x".into())], "n", Value::Text("nope".into()), &[]);
+        assert!(matches!(r, Err(BoogyError::SchemaMismatch(_))));
     }
 }
