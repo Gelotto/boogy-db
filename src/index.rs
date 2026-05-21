@@ -36,6 +36,41 @@ pub fn encode_value_prefix(col_type: Type, val: &Value) -> Option<Vec<u8>> {
     }
 }
 
+/// Encode a composite (multi-column) index key: each column's sortable
+/// value-encoding in column order, then the 8-byte big-endian rowid suffix.
+/// Returns `None` if ANY component is Null (nulls are not indexed — matches
+/// the single-column behavior of `encode_index_key`).
+///
+/// Ordering: because every per-column encoding is self-delimiting — integers
+/// and reals are fixed 8-byte sortable encodings, text is null-terminated
+/// (and `0x00` is rejected inside text values) — concatenation preserves the
+/// nesting of the per-column orderings, so byte comparison sorts by col1, then
+/// col2, …, then rowid. The big-endian rowid suffix makes byte order match
+/// numeric order for the tiebreaker.
+pub fn encode_composite_index_key(col_types: &[Type], vals: &[Value], rowid: u64) -> Option<Vec<u8>> {
+    let mut out = encode_composite_value_prefix(col_types, vals)?;
+    out.extend_from_slice(&rowid.to_be_bytes());
+    Some(out)
+}
+
+/// Composite value prefix (no rowid) for range/equality scans. Concatenates
+/// each column's `encode_value_prefix` bytes in column order. Returns `None`
+/// if any component is Null.
+pub fn encode_composite_value_prefix(col_types: &[Type], vals: &[Value]) -> Option<Vec<u8>> {
+    debug_assert_eq!(col_types.len(), vals.len());
+    let mut out = Vec::new();
+    for (t, v) in col_types.iter().zip(vals.iter()) {
+        // Reuse the existing per-type value encoding so multi-column ordering
+        // is the nesting of the per-column orderings. Each part is
+        // self-delimiting (fixed-width int/real, null-terminated text), so
+        // concatenation stays prefix-unambiguous and no extra length prefix
+        // is needed.
+        let part = encode_value_prefix(*t, v)?;
+        out.extend_from_slice(&part);
+    }
+    Some(out)
+}
+
 /// Extract the rowid from a composite index key.
 /// The rowid is always the last 8 bytes, stored big-endian.
 pub fn extract_rowid(col_type: Type, key: &[u8]) -> u64 {
@@ -965,6 +1000,48 @@ mod tests {
     use tempfile::NamedTempFile;
 
     // --- Key encoding tests ---
+
+    #[test]
+    fn test_composite_key_orders_lexicographically_by_column() {
+        use crate::value::{Type, Value};
+        // (Integer, Integer) composite. Keys must sort by col1 then col2 then rowid.
+        let types = [Type::Integer, Type::Integer];
+        let k = |a: i64, b: i64, rid: u64|
+            encode_composite_index_key(&types, &[Value::Integer(a), Value::Integer(b)], rid).unwrap();
+        let mut keys = vec![k(5, 9, 1), k(5, 2, 2), k(4, 100, 3), k(5, 9, 0)];
+        keys.sort();
+        // Expected order: (4,100,r3) < (5,2,r2) < (5,9,r0) < (5,9,r1)
+        assert_eq!(keys, vec![k(4,100,3), k(5,2,2), k(5,9,0), k(5,9,1)]);
+    }
+
+    #[test]
+    fn test_composite_key_text_then_integer() {
+        use crate::value::{Type, Value};
+        let types = [Type::Text, Type::Integer];
+        let k = |s: &str, n: i64, rid: u64|
+            encode_composite_index_key(&types, &[Value::Text(s.into()), Value::Integer(n)], rid).unwrap();
+        let mut keys = vec![k("bob", 1, 1), k("alice", 9, 2), k("alice", 1, 3)];
+        keys.sort();
+        assert_eq!(keys, vec![k("alice",1,3), k("alice",9,2), k("bob",1,1)]);
+    }
+
+    #[test]
+    fn test_composite_key_null_component_not_indexed() {
+        use crate::value::{Type, Value};
+        let types = [Type::Integer, Type::Integer];
+        // A null in any key component → None (consistent with single-column null handling).
+        assert!(encode_composite_index_key(&types, &[Value::Integer(1), Value::Null], 1).is_none());
+    }
+
+    #[test]
+    fn test_composite_prefix_is_key_without_rowid() {
+        use crate::value::{Type, Value};
+        let types = [Type::Integer, Type::Integer];
+        let full = encode_composite_index_key(&types, &[Value::Integer(5), Value::Integer(9)], 7).unwrap();
+        let prefix = encode_composite_value_prefix(&types, &[Value::Integer(5), Value::Integer(9)]).unwrap();
+        assert!(full.starts_with(&prefix));
+        assert_eq!(full.len(), prefix.len() + 8); // rowid is 8 bytes appended
+    }
 
     #[test]
     fn test_integer_key_sort_order() {
