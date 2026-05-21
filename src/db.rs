@@ -19,6 +19,49 @@ use crate::vector::VectorCollection;
 #[cfg(feature = "vector")]
 use crate::vector::{VectorCollectionOptions, VectorResult, VectorSearchOptions};
 
+/// Evaluate a single filter against one row's raw bytes.
+///
+/// Resolves the filter's column via `col_name_to_id`, then takes the raw-byte
+/// fast path (`eval_filter_raw_full`) when possible, falling back to decoding
+/// the column to a `Value` and `Filter::matches`. A filter on an unknown column
+/// matches against `Value::Null` (mirroring the historical inline logic).
+///
+/// This is the single home for the per-row predicate that used to be copy-pasted
+/// across the find/count scan branches.
+fn filter_matches_row(col_name_to_id: &HashMap<String, u16>, bytes: &[u8], f: &Filter) -> bool {
+    if let Some(col_id) = col_name_to_id.get(&f.column).copied() {
+        if let Ok(Some(raw)) = row::extract_column_raw(bytes, col_id) {
+            if let Some(result) = crate::filter::eval_filter_raw_full(raw, f) {
+                return result;
+            }
+        }
+        let col_val = row::extract_column(bytes, col_id).ok().flatten();
+        let actual = col_val.as_ref().unwrap_or(&Value::Null);
+        f.matches(actual)
+    } else {
+        f.matches(&Value::Null)
+    }
+}
+
+/// Evaluate the full find predicate against one row's raw bytes:
+/// `ALL(filters) AND (or_groups.is_empty() OR ANY(group: ALL(group)))`.
+///
+/// `filters` is the mandatory AND-prefix; `or_groups` adds an OR-of-AND clause
+/// when non-empty. With an empty `or_groups` this is exactly the historical
+/// `filters.iter().all(...)` behavior.
+fn row_passes(
+    col_name_to_id: &HashMap<String, u16>,
+    bytes: &[u8],
+    filters: &[Filter],
+    or_groups: &[Vec<Filter>],
+) -> bool {
+    filters.iter().all(|f| filter_matches_row(col_name_to_id, bytes, f))
+        && (or_groups.is_empty()
+            || or_groups
+                .iter()
+                .any(|g| g.iter().all(|f| filter_matches_row(col_name_to_id, bytes, f))))
+}
+
 /// A row returned from queries. Wraps raw bytes; decodes columns on demand.
 #[derive(Debug, Clone)]
 pub struct Row {
@@ -1067,10 +1110,18 @@ impl BoogyDb {
         let can_short_circuit = opts.sort.is_empty() && !opts.include_total;
 
         // 3. Check for index-accelerated path (Eq or In filter on an indexed column).
-        let index_candidate = opts.filters.iter().find(|f| {
-            (f.op == FilterOp::Eq || f.op == FilterOp::In)
-                && state.meta.find_index_for_column(&f.column).is_some()
-        });
+        // The index/single-filter/empty-filter fast paths only know about `filters`;
+        // when `or_groups` is non-empty we must fall through to the scan-all branch
+        // (which applies the full predicate via `row_passes`) or those paths would
+        // silently ignore the OR groups and return wrong rows.
+        let index_candidate = if opts.or_groups.is_empty() {
+            opts.filters.iter().find(|f| {
+                (f.op == FilterOp::Eq || f.op == FilterOp::In)
+                    && state.meta.find_index_for_column(&f.column).is_some()
+            })
+        } else {
+            None
+        };
 
         // Track whether the scan path already applied pagination (so we don't double-paginate).
         let mut pagination_applied = false;
@@ -1149,20 +1200,12 @@ impl BoogyDb {
             let mut rows = Vec::with_capacity(raw_rows.len());
             for bytes in &raw_rows {
                 if has_extra_filters {
-                    let passes = opts.filters.iter().all(|f| {
-                        if let Some(col_id) = state.meta.col_id(&f.column) {
-                            if let Ok(Some(raw)) = row::extract_column_raw(bytes, col_id) {
-                                if let Some(result) = crate::filter::eval_filter_raw_full(raw, f) {
-                                    return result;
-                                }
-                            }
-                            let col_val = row::extract_column(bytes, col_id).ok().flatten();
-                            let actual = col_val.as_ref().unwrap_or(&Value::Null);
-                            f.matches(actual)
-                        } else {
-                            f.matches(&Value::Null)
-                        }
-                    });
+                    // or_groups is guaranteed empty here (index path is gated on it),
+                    // so the index filter + extra `filters` are the entire predicate.
+                    let passes = opts
+                        .filters
+                        .iter()
+                        .all(|f| filter_matches_row(&state.meta.col_name_to_id, bytes, f));
                     if passes {
                         rows.push(Row::from_raw(bytes, col_names.clone())?);
                     }
@@ -1187,8 +1230,12 @@ impl BoogyDb {
             }
 
             (rows, total)
-        } else if opts.filters.len() == 1 && opts.filters[0].op != FilterOp::In {
+        } else if opts.or_groups.is_empty()
+            && opts.filters.len() == 1
+            && opts.filters[0].op != FilterOp::In
+        {
             // Single filter (non-IN): use scan_filtered (extract_column on raw bytes, no full decode)
+            // Gated on empty or_groups: scan_filtered only applies the one filter.
             let f = &opts.filters[0];
             if let Some(col_id) = state.meta.col_id(&f.column) {
                 let reader = BTreeReader::new(&self.file, state.meta.root_page);
@@ -1226,8 +1273,10 @@ impl BoogyDb {
                 let total = if opts.include_total { Some(0) } else { None };
                 (Vec::new(), total)
             }
-        } else if opts.filters.is_empty() {
-            // No filters: full scan but skip decode, just collect raw
+        } else if opts.filters.is_empty() && opts.or_groups.is_empty() {
+            // No predicate at all: full scan but skip decode, just collect raw.
+            // Gated on empty or_groups: an OR-only query (empty filters, non-empty
+            // or_groups) must fall through to the scan + row_passes branch.
             let reader = BTreeReader::new(&self.file, state.meta.root_page);
             let all = reader.scan_all()?;
             let total = if opts.include_total { Some(all.len() as u64) } else { None };
@@ -1237,27 +1286,14 @@ impl BoogyDb {
                 .collect();
             (matching, total)
         } else {
-            // Multi-filter (or single IN filter): scan all, raw-byte filter, lazy Row
+            // Multi-filter, single-IN filter, or any query with or_groups present:
+            // scan all, apply the full predicate (filters AND or-of-groups), lazy Row.
             let reader = BTreeReader::new(&self.file, state.meta.root_page);
             let all = reader.scan_all()?;
             let col_names = state.meta.col_names.clone();
             let mut matching = Vec::new();
             for (_, bytes) in &all {
-                let passes = opts.filters.iter().all(|f| {
-                    if let Some(col_id) = state.meta.col_id(&f.column) {
-                        if let Ok(Some(raw)) = row::extract_column_raw(bytes, col_id) {
-                            if let Some(result) = crate::filter::eval_filter_raw_full(raw, f) {
-                                return result;
-                            }
-                        }
-                        let col_val = row::extract_column(bytes, col_id).ok().flatten();
-                        let actual = col_val.as_ref().unwrap_or(&Value::Null);
-                        f.matches(actual)
-                    } else {
-                        f.matches(&Value::Null)
-                    }
-                });
-                if passes {
+                if row_passes(&state.meta.col_name_to_id, bytes, &opts.filters, &opts.or_groups) {
                     matching.push(Row::from_raw(bytes, col_names.clone())?);
                 }
             }
@@ -1303,8 +1339,26 @@ impl BoogyDb {
         Ok(FindResult { rows, total })
     }
 
-    /// Count rows matching filters.
+    /// Count rows matching filters (implicit AND).
+    ///
+    /// Back-compatible signature. For OR-of-AND counting use [`count_with`].
     pub fn count(&self, table: &str, filters: &[Filter]) -> Result<u64> {
+        self.count_with(table, filters, &[])
+    }
+
+    /// Count rows matching the full predicate
+    /// `ALL(filters) AND (or_groups.is_empty() OR ANY(group: ALL(group)))`.
+    ///
+    /// With empty `or_groups` this is identical to [`count`] and keeps all the
+    /// cached-count / index / single-filter fast paths. When `or_groups` is
+    /// non-empty those fast paths only know about `filters`, so we fall through
+    /// to a full scan that applies the complete predicate via `row_passes`.
+    pub fn count_with(
+        &self,
+        table: &str,
+        filters: &[Filter],
+        or_groups: &[Vec<Filter>],
+    ) -> Result<u64> {
         // 1. Read-lock registry, clone Arc.
         let table_state = {
             let tables = self.tables.read().unwrap();
@@ -1318,57 +1372,48 @@ impl BoogyDb {
         let state = table_state.read().unwrap();
         Self::check_table_accessible(&state.meta, table)?;
 
-        // Fast path: no filters, just return the cached count.
-        if filters.is_empty() {
-            return Ok(state.meta.row_count);
-        }
+        if or_groups.is_empty() {
+            // Fast path: no filters, just return the cached count.
+            if filters.is_empty() {
+                return Ok(state.meta.row_count);
+            }
 
-        // Index path: Eq filter on indexed column
-        if filters.len() == 1 && filters[0].op == FilterOp::Eq {
-            if let Some(idx_meta) = state.meta.find_index_for_column(&filters[0].column) {
-                let col_type = state.meta.columns.iter()
-                    .find(|c| c.name == filters[0].column)
-                    .map(|c| c.col_type);
-                if let Some(ct) = col_type {
-                    if let Some(prefix) = index::encode_value_prefix(ct, &filters[0].value) {
-                        let reader = IndexTreeReader::new(&self.file, idx_meta.root_page);
-                        return reader.count_prefix(&prefix);
+            // Index path: Eq filter on indexed column
+            if filters.len() == 1 && filters[0].op == FilterOp::Eq {
+                if let Some(idx_meta) = state.meta.find_index_for_column(&filters[0].column) {
+                    let col_type = state.meta.columns.iter()
+                        .find(|c| c.name == filters[0].column)
+                        .map(|c| c.col_type);
+                    if let Some(ct) = col_type {
+                        if let Some(prefix) = index::encode_value_prefix(ct, &filters[0].value) {
+                            let reader = IndexTreeReader::new(&self.file, idx_meta.root_page);
+                            return reader.count_prefix(&prefix);
+                        }
                     }
                 }
             }
-        }
 
-        // Single filter (non-IN): use count_filtered (extract_column on raw bytes)
-        if filters.len() == 1 && filters[0].op != FilterOp::In {
-            let f = &filters[0];
-            if let Some(col_id) = state.meta.col_id(&f.column) {
-                let reader = BTreeReader::new(&self.file, state.meta.root_page);
-                return reader.count_filtered(col_id, f.op, &f.value);
+            // Single filter (non-IN): use count_filtered (extract_column on raw bytes)
+            if filters.len() == 1 && filters[0].op != FilterOp::In {
+                let f = &filters[0];
+                if let Some(col_id) = state.meta.col_id(&f.column) {
+                    let reader = BTreeReader::new(&self.file, state.meta.root_page);
+                    return reader.count_filtered(col_id, f.op, &f.value);
+                }
+                return Ok(0);
             }
-            return Ok(0);
         }
 
-        // Multi-filter (or IN filter): scan all, raw-byte filter
+        // Multi-filter, IN filter, or any query with or_groups present:
+        // scan all and apply the full predicate.
         let reader = BTreeReader::new(&self.file, state.meta.root_page);
         let all = reader.scan_all()?;
 
         let mut count = 0u64;
         for (_, bytes) in &all {
-            let passes = filters.iter().all(|f| {
-                if let Some(col_id) = state.meta.col_id(&f.column) {
-                    if let Ok(Some(raw)) = row::extract_column_raw(bytes, col_id) {
-                        if let Some(result) = crate::filter::eval_filter_raw_full(raw, f) {
-                            return result;
-                        }
-                    }
-                    let col_val = row::extract_column(bytes, col_id).ok().flatten();
-                    let actual = col_val.as_ref().unwrap_or(&Value::Null);
-                    f.matches(actual)
-                } else {
-                    f.matches(&Value::Null)
-                }
-            });
-            if passes { count += 1; }
+            if row_passes(&state.meta.col_name_to_id, bytes, filters, or_groups) {
+                count += 1;
+            }
         }
 
         Ok(count)
@@ -2910,24 +2955,12 @@ impl<'a> AcidTransaction<'a> {
             tree.scan_all_w()
         })?;
 
-        // Filter in memory
+        // Filter in memory (full predicate: filters AND or-of-groups).
+        // This path always scans every row, so there are no index/single-filter
+        // fast paths to gate — `row_passes` simply incorporates or_groups.
         let mut matching = Vec::new();
         for (_, bytes) in &all {
-            let passes = opts.filters.iter().all(|f| {
-                if let Some(col_id) = col_name_to_id.get(&f.column).copied() {
-                    if let Ok(Some(raw)) = row::extract_column_raw(bytes, col_id) {
-                        if let Some(result) = crate::filter::eval_filter_raw_full(raw, f) {
-                            return result;
-                        }
-                    }
-                    let col_val = row::extract_column(bytes, col_id).ok().flatten();
-                    let actual = col_val.as_ref().unwrap_or(&Value::Null);
-                    f.matches(actual)
-                } else {
-                    f.matches(&Value::Null)
-                }
-            });
-            if passes {
+            if row_passes(&col_name_to_id, bytes, &opts.filters, &opts.or_groups) {
                 matching.push(Row::from_raw(bytes, col_names.clone())?);
             }
         }
@@ -2961,14 +2994,29 @@ impl<'a> AcidTransaction<'a> {
     }
 
     /// Count rows matching filters (scans all rows through dirty overlay).
+    ///
+    /// Back-compatible signature. For OR-of-AND counting use [`count_with`].
     pub fn count(&mut self, table: &str, filters: &[Filter]) -> Result<u64> {
+        self.count_with(table, filters, &[])
+    }
+
+    /// Count rows matching the full predicate
+    /// `ALL(filters) AND (or_groups.is_empty() OR ANY(group: ALL(group)))`,
+    /// through the dirty overlay. Mirrors [`BoogyDb::count_with`].
+    pub fn count_with(
+        &mut self,
+        table: &str,
+        filters: &[Filter],
+        or_groups: &[Vec<Filter>],
+    ) -> Result<u64> {
         let table_state = self.table_state(table)?;
         let state = table_state.read().unwrap();
         BoogyDb::check_table_accessible(&state.meta, table)?;
 
         let root_page = self.current_root(table, &state.meta);
 
-        if filters.is_empty() {
+        // Cached-count fast path only valid for a truly unfiltered count.
+        if filters.is_empty() && or_groups.is_empty() {
             // Use cached count + delta
             let base_count = state.meta.row_count;
             let delta_adj = self.meta_deltas
@@ -2988,21 +3036,7 @@ impl<'a> AcidTransaction<'a> {
 
         let mut count = 0u64;
         for (_, bytes) in &all {
-            let passes = filters.iter().all(|f| {
-                if let Some(col_id) = col_name_to_id.get(&f.column).copied() {
-                    if let Ok(Some(raw)) = row::extract_column_raw(bytes, col_id) {
-                        if let Some(result) = crate::filter::eval_filter_raw_full(raw, f) {
-                            return result;
-                        }
-                    }
-                    let col_val = row::extract_column(bytes, col_id).ok().flatten();
-                    let actual = col_val.as_ref().unwrap_or(&Value::Null);
-                    f.matches(actual)
-                } else {
-                    f.matches(&Value::Null)
-                }
-            });
-            if passes {
+            if row_passes(&col_name_to_id, bytes, filters, or_groups) {
                 count += 1;
             }
         }
@@ -3283,6 +3317,18 @@ impl<'a> Transaction<'a> {
         match self {
             Transaction::Light(t) => t.db.count(table, filters),
             Transaction::Acid(t) => t.count(table, filters),
+        }
+    }
+
+    pub fn count_with(
+        &mut self,
+        table: &str,
+        filters: &[Filter],
+        or_groups: &[Vec<Filter>],
+    ) -> Result<u64> {
+        match self {
+            Transaction::Light(t) => t.db.count_with(table, filters, or_groups),
+            Transaction::Acid(t) => t.count_with(table, filters, or_groups),
         }
     }
 
@@ -3843,5 +3889,344 @@ mod tests {
             db.insert("t", &[("v", Value::Text(format!("val_{}", i % 5)))]).unwrap();
         }
         assert_eq!(db.count("t", &[Filter::eq("v", "val_2")]).unwrap(), 20);
+    }
+
+    // --- or_groups (OR-of-AND filter groups) ---
+
+    /// Helper: fetch the sorted list of `id` integer-column values from a result.
+    fn ids(result: &FindResult) -> Vec<i64> {
+        let mut v: Vec<i64> = result
+            .rows
+            .iter()
+            .map(|r| match r.get("id").unwrap() {
+                Value::Integer(i) => i,
+                other => panic!("expected integer id, got {:?}", other),
+            })
+            .collect();
+        v.sort_unstable();
+        v
+    }
+
+    #[test]
+    fn test_or_groups_empty_is_back_compat() {
+        // Empty or_groups must behave exactly like a plain filters-only query.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.boogy");
+        let db = BoogyDb::open(&path).unwrap();
+        db.create_table("t", &[ColumnDef::new("id", Type::Integer), ColumnDef::new("v", Type::Integer)]).unwrap();
+        for i in 0..5 {
+            db.insert("t", &[("id", Value::Integer(i)), ("v", Value::Integer(i))]).unwrap();
+        }
+        let with_empty = db.find("t", FindOptions {
+            filters: vec![Filter::gt("v", 1i64)],
+            or_groups: vec![],
+            include_total: true,
+            ..Default::default()
+        }).unwrap();
+        let baseline = db.find("t", FindOptions {
+            filters: vec![Filter::gt("v", 1i64)],
+            include_total: true,
+            ..Default::default()
+        }).unwrap();
+        assert_eq!(ids(&with_empty), ids(&baseline));
+        assert_eq!(with_empty.total, baseline.total);
+        assert_eq!(ids(&with_empty), vec![2, 3, 4]);
+    }
+
+    #[test]
+    fn test_or_groups_pure_or() {
+        // filters=[], or_groups=[[a],[b]] returns rows matching a OR b only.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.boogy");
+        let db = BoogyDb::open(&path).unwrap();
+        db.create_table("t", &[ColumnDef::new("id", Type::Integer), ColumnDef::new("v", Type::Integer)]).unwrap();
+        for i in 0..6 {
+            db.insert("t", &[("id", Value::Integer(i)), ("v", Value::Integer(i))]).unwrap();
+        }
+        // v == 1 OR v == 4
+        let result = db.find("t", FindOptions {
+            filters: vec![],
+            or_groups: vec![
+                vec![Filter::eq("v", 1i64)],
+                vec![Filter::eq("v", 4i64)],
+            ],
+            include_total: true,
+            ..Default::default()
+        }).unwrap();
+        assert_eq!(ids(&result), vec![1, 4]);
+        assert_eq!(result.total, Some(2));
+    }
+
+    #[test]
+    fn test_or_groups_and_prefix_with_or_keyset_shape() {
+        // The composite keyset shape:
+        //   filters=[k eq "x"]
+        //   or_groups=[[score lt 5], [score eq 5, id lt 10]]
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.boogy");
+        let db = BoogyDb::open(&path).unwrap();
+        db.create_table("t", &[
+            ColumnDef::new("id", Type::Integer),
+            ColumnDef::new("k", Type::Text),
+            ColumnDef::new("score", Type::Integer),
+        ]).unwrap();
+        // Rows we want to assert precisely:
+        let insert = |db: &BoogyDb, id: i64, k: &str, score: i64| {
+            db.insert("t", &[
+                ("id", Value::Integer(id)),
+                ("k", Value::Text(k.into())),
+                ("score", Value::Integer(score)),
+            ]).unwrap();
+        };
+        insert(&db, 1, "x", 3);   // score < 5 -> in
+        insert(&db, 2, "x", 4);   // score < 5 -> in
+        insert(&db, 9, "x", 5);   // score == 5, id < 10 -> in (boundary included)
+        insert(&db, 10, "x", 5);  // score == 5, id == 10 -> excluded (id not < 10)
+        insert(&db, 11, "x", 6);  // score == 6 -> excluded
+        insert(&db, 3, "y", 3);   // wrong k -> excluded by AND-prefix even though score<5
+        insert(&db, 4, "x", 5);   // score == 5, id < 10 -> in
+
+        let result = db.find("t", FindOptions {
+            filters: vec![Filter::eq("k", "x")],
+            or_groups: vec![
+                vec![Filter::lt("score", 5i64)],
+                vec![Filter::eq("score", 5i64), Filter::lt("id", 10i64)],
+            ],
+            include_total: true,
+            ..Default::default()
+        }).unwrap();
+        assert_eq!(ids(&result), vec![1, 2, 4, 9]);
+        assert_eq!(result.total, Some(4));
+    }
+
+    #[test]
+    fn test_or_groups_with_sort_and_limit() {
+        // Sort desc + limit returns the top N of the OR-matched set.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.boogy");
+        let db = BoogyDb::open(&path).unwrap();
+        db.create_table("t", &[ColumnDef::new("id", Type::Integer), ColumnDef::new("v", Type::Integer)]).unwrap();
+        for i in 0..10 {
+            db.insert("t", &[("id", Value::Integer(i)), ("v", Value::Integer(i))]).unwrap();
+        }
+        // OR-match v < 2 (ids 0,1) OR v > 6 (ids 7,8,9) -> matched set {0,1,7,8,9}
+        let result = db.find("t", FindOptions {
+            filters: vec![],
+            or_groups: vec![
+                vec![Filter::lt("v", 2i64)],
+                vec![Filter::gt("v", 6i64)],
+            ],
+            sort: vec![crate::filter::Sort::desc("v")],
+            limit: Some(3),
+            ..Default::default()
+        }).unwrap();
+        // Top 3 by v desc of {0,1,7,8,9} = 9,8,7
+        let got: Vec<i64> = result.rows.iter().map(|r| match r.get("v").unwrap() {
+            Value::Integer(i) => i,
+            o => panic!("{:?}", o),
+        }).collect();
+        assert_eq!(got, vec![9, 8, 7]);
+    }
+
+    #[test]
+    fn test_or_groups_include_total_counts_full_matched_set() {
+        // include_total reflects the whole OR-matched set, not just the page.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.boogy");
+        let db = BoogyDb::open(&path).unwrap();
+        db.create_table("t", &[ColumnDef::new("id", Type::Integer), ColumnDef::new("v", Type::Integer)]).unwrap();
+        for i in 0..10 {
+            db.insert("t", &[("id", Value::Integer(i)), ("v", Value::Integer(i))]).unwrap();
+        }
+        // matched set {0,1,7,8,9} = 5 rows, page limited to 2
+        let result = db.find("t", FindOptions {
+            filters: vec![],
+            or_groups: vec![
+                vec![Filter::lt("v", 2i64)],
+                vec![Filter::gt("v", 6i64)],
+            ],
+            sort: vec![crate::filter::Sort::asc("v")],
+            limit: Some(2),
+            include_total: true,
+            ..Default::default()
+        }).unwrap();
+        assert_eq!(result.rows.len(), 2);
+        assert_eq!(result.total, Some(5));
+    }
+
+    #[test]
+    fn test_or_groups_multi_filter_group_partial_vs_full_match() {
+        // A group of multiple filters passes only when ALL its filters match.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.boogy");
+        let db = BoogyDb::open(&path).unwrap();
+        db.create_table("t", &[
+            ColumnDef::new("id", Type::Integer),
+            ColumnDef::new("a", Type::Integer),
+            ColumnDef::new("b", Type::Integer),
+        ]).unwrap();
+        let ins = |id: i64, a: i64, b: i64| {
+            db.insert("t", &[
+                ("id", Value::Integer(id)),
+                ("a", Value::Integer(a)),
+                ("b", Value::Integer(b)),
+            ]).unwrap();
+        };
+        ins(1, 1, 1); // a matches, b doesn't -> group fails
+        ins(2, 1, 2); // a matches AND b matches -> group passes
+        ins(3, 9, 2); // a doesn't match -> group fails
+        // single group [a == 1, b == 2]
+        let result = db.find("t", FindOptions {
+            filters: vec![],
+            or_groups: vec![vec![Filter::eq("a", 1i64), Filter::eq("b", 2i64)]],
+            include_total: true,
+            ..Default::default()
+        }).unwrap();
+        assert_eq!(ids(&result), vec![2]);
+        assert_eq!(result.total, Some(1));
+    }
+
+    #[test]
+    fn test_or_groups_bypasses_index_fast_path() {
+        // With an index present on the AND-prefix column, the index fast path
+        // must be bypassed when or_groups is non-empty, and the OR clause still
+        // applied correctly (regression guard against the silent-wrong-rows bug).
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.boogy");
+        let db = BoogyDb::open(&path).unwrap();
+        db.create_table("t", &[
+            ColumnDef::new("id", Type::Integer),
+            ColumnDef::new("k", Type::Text),
+            ColumnDef::new("v", Type::Integer),
+        ]).unwrap();
+        db.create_index("t", "idx_k", "k").unwrap();
+        let ins = |id: i64, k: &str, v: i64| {
+            db.insert("t", &[
+                ("id", Value::Integer(id)),
+                ("k", Value::Text(k.into())),
+                ("v", Value::Integer(v)),
+            ]).unwrap();
+        };
+        ins(1, "x", 1);
+        ins(2, "x", 2);
+        ins(3, "x", 9);
+        ins(4, "y", 1); // wrong k, excluded by AND-prefix
+        // filters=[k eq "x"] (indexed Eq), or_groups=[[v eq 1],[v eq 9]]
+        let result = db.find("t", FindOptions {
+            filters: vec![Filter::eq("k", "x")],
+            or_groups: vec![
+                vec![Filter::eq("v", 1i64)],
+                vec![Filter::eq("v", 9i64)],
+            ],
+            include_total: true,
+            ..Default::default()
+        }).unwrap();
+        assert_eq!(ids(&result), vec![1, 3]);
+        assert_eq!(result.total, Some(2));
+    }
+
+    #[test]
+    fn test_or_groups_bypasses_single_filter_fast_path() {
+        // A single AND-prefix filter would normally hit the scan_filtered path;
+        // with or_groups present it must fall through to the full predicate.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.boogy");
+        let db = BoogyDb::open(&path).unwrap();
+        db.create_table("t", &[
+            ColumnDef::new("id", Type::Integer),
+            ColumnDef::new("k", Type::Integer),
+            ColumnDef::new("v", Type::Integer),
+        ]).unwrap();
+        let ins = |id: i64, k: i64, v: i64| {
+            db.insert("t", &[
+                ("id", Value::Integer(id)),
+                ("k", Value::Integer(k)),
+                ("v", Value::Integer(v)),
+            ]).unwrap();
+        };
+        ins(1, 1, 10);
+        ins(2, 1, 20);
+        ins(3, 1, 30);
+        ins(4, 2, 10); // k != 1 excluded
+        // filters=[k eq 1] (single, non-IN), or_groups=[[v eq 10],[v eq 30]]
+        let result = db.find("t", FindOptions {
+            filters: vec![Filter::eq("k", 1i64)],
+            or_groups: vec![
+                vec![Filter::eq("v", 10i64)],
+                vec![Filter::eq("v", 30i64)],
+            ],
+            ..Default::default()
+        }).unwrap();
+        assert_eq!(ids(&result), vec![1, 3]);
+    }
+
+    #[test]
+    fn test_count_with_or_groups() {
+        // count_with applies the full predicate; plain count is unaffected.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.boogy");
+        let db = BoogyDb::open(&path).unwrap();
+        db.create_table("t", &[ColumnDef::new("id", Type::Integer), ColumnDef::new("v", Type::Integer)]).unwrap();
+        for i in 0..10 {
+            db.insert("t", &[("id", Value::Integer(i)), ("v", Value::Integer(i))]).unwrap();
+        }
+        // v < 2 OR v > 6 -> {0,1,7,8,9} = 5
+        let or_groups = vec![
+            vec![Filter::lt("v", 2i64)],
+            vec![Filter::gt("v", 6i64)],
+        ];
+        assert_eq!(db.count_with("t", &[], &or_groups).unwrap(), 5);
+        // AND-prefix + OR: v even AND (v<2 OR v>6) -> {0,8} = 2
+        let with_prefix = db.count_with(
+            "t",
+            &[Filter::eq("v", 8i64)],
+            &or_groups,
+        ).unwrap();
+        // 8 satisfies prefix and group2 -> 1
+        assert_eq!(with_prefix, 1);
+        // plain count unaffected by or_groups (no groups passed)
+        assert_eq!(db.count("t", &[]).unwrap(), 10);
+        assert_eq!(db.count("t", &[Filter::eq("v", 5i64)]).unwrap(), 1);
+    }
+
+    #[test]
+    fn test_or_groups_acid_transaction_find() {
+        // The transactional (AcidTransaction) find path must apply or_groups too,
+        // including over uncommitted overlay rows.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.boogy");
+        let db = BoogyDb::open(&path).unwrap();
+        db.set_acid(true); // ensure begin() yields an AcidTransaction (overlay path)
+        db.create_table("t", &[ColumnDef::new("id", Type::Integer), ColumnDef::new("v", Type::Integer)]).unwrap();
+        // committed rows
+        for i in 0..4 {
+            db.insert("t", &[("id", Value::Integer(i)), ("v", Value::Integer(i))]).unwrap();
+        }
+        let mut tx = db.begin().unwrap();
+        assert!(matches!(&tx, Transaction::Acid(_)), "test must exercise AcidTransaction::find");
+        // uncommitted overlay rows
+        tx.insert("t", &[("id", Value::Integer(8)), ("v", Value::Integer(8))]).unwrap();
+        tx.insert("t", &[("id", Value::Integer(9)), ("v", Value::Integer(9))]).unwrap();
+        // v < 1 OR v > 7 -> {0, 8, 9}
+        let result = tx.find("t", FindOptions {
+            filters: vec![],
+            or_groups: vec![
+                vec![Filter::lt("v", 1i64)],
+                vec![Filter::gt("v", 7i64)],
+            ],
+            include_total: true,
+            ..Default::default()
+        }).unwrap();
+        assert_eq!(ids(&result), vec![0, 8, 9]);
+        assert_eq!(result.total, Some(3));
+        // count_with through the tx
+        assert_eq!(
+            tx.count_with("t", &[], &[
+                vec![Filter::lt("v", 1i64)],
+                vec![Filter::gt("v", 7i64)],
+            ]).unwrap(),
+            3
+        );
+        tx.commit().unwrap();
     }
 }

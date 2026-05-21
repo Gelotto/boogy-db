@@ -439,6 +439,7 @@ fn test_existing_ops_unaffected() {
             "items",
             FindOptions {
                 filters: vec![Filter::eq("category", "general")],
+                or_groups: vec![],
                 sort: vec![],
                 limit: Some(10),
                 offset: None,

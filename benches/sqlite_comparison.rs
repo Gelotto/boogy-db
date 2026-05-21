@@ -176,6 +176,7 @@ fn run_boogy(db: &BoogyDb, ids: &mut Vec<u64>, duration: Duration) -> Results {
                 let owner = format!("user_{}", (rng_state >> 8) % 10);
                 let _ = db.find("notes", FindOptions {
                     filters: vec![Filter::eq("owner", owner)],
+                    or_groups: vec![],
                     sort: vec![],
                     limit: Some(20),
                     offset: None,

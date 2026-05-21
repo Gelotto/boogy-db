@@ -277,6 +277,22 @@ impl Sort {
 #[derive(Debug, Clone, Default)]
 pub struct FindOptions {
     pub filters: Vec<Filter>,
+    /// OR-of-AND filter groups, layered on top of `filters`.
+    ///
+    /// A row matches when:
+    /// ```text
+    /// ALL(filters) AND (or_groups.is_empty() OR ANY(group in or_groups: ALL(group)))
+    /// ```
+    /// `filters` is always a mandatory AND-prefix. When `or_groups` is
+    /// non-empty the row must additionally satisfy at least one group, where
+    /// each group is itself an AND of its filters. An empty `or_groups`
+    /// (the `Default`) reproduces today's pure-AND behavior exactly.
+    ///
+    /// This is enough to express composite keyset pagination, e.g.
+    /// `WHERE deleted_at = '' AND ((score < c) OR (score = c AND id < cursor))`
+    /// becomes `filters = [deleted_at eq '']`,
+    /// `or_groups = [[score lt c], [score eq c, id lt cursor]]`.
+    pub or_groups: Vec<Vec<Filter>>,
     pub sort: Vec<Sort>,
     pub limit: Option<u32>,
     pub offset: Option<u32>,
@@ -294,6 +310,14 @@ pub struct FindResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_find_options_default_or_groups_empty() {
+        // Default FindOptions has an empty or_groups (full back-compat).
+        let opts = FindOptions::default();
+        assert!(opts.or_groups.is_empty());
+        assert!(opts.filters.is_empty());
+    }
 
     #[test]
     fn test_filter_eq() {

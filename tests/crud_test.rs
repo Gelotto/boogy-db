@@ -114,6 +114,7 @@ fn test_find_with_filter() {
             "posts",
             FindOptions {
                 filters: vec![Filter::eq("author", "alice")],
+                or_groups: vec![],
                 sort: vec![],
                 limit: Some(5),
                 offset: None,
@@ -141,6 +142,7 @@ fn test_find_with_sort_and_pagination() {
             "items",
             FindOptions {
                 filters: vec![],
+                or_groups: vec![],
                 sort: vec![Sort::desc("value")],
                 limit: Some(3),
                 offset: Some(2),

@@ -510,6 +510,7 @@ fn bench_regression() {
         let owner = format!("user_{}", rng.next_u64() % 10);
         let _ = db.find("notes", FindOptions {
             filters: vec![Filter::eq("owner", owner)],
+            or_groups: vec![],
             sort: vec![],
             limit: Some(20),
             offset: None,

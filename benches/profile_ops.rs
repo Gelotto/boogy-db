@@ -53,6 +53,7 @@ fn main() {
             let owner = format!("user_{}", i % 10);
             let _ = db.find("notes", FindOptions {
                 filters: vec![Filter::eq("owner", owner)],
+                or_groups: vec![],
                 sort: vec![],
                 limit: Some(20),
                 offset: None,
@@ -198,6 +199,7 @@ fn main() {
             let owner = format!("user_{}", i % 10);
             let _ = db.find("notes", FindOptions {
                 filters: vec![Filter::eq("owner", owner)],
+                or_groups: vec![],
                 sort: vec![],
                 limit: Some(20),
                 offset: None,

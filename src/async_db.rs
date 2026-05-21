@@ -97,6 +97,15 @@ impl AsyncBoogyDb {
         self.inner.count(table, filters)
     }
 
+    pub async fn count_with(
+        &self,
+        table: &str,
+        filters: &[Filter],
+        or_groups: &[Vec<Filter>],
+    ) -> Result<u64> {
+        self.inner.count_with(table, filters, or_groups)
+    }
+
     pub async fn insert_many(
         &self,
         table: &str,
@@ -197,6 +206,15 @@ impl<'a> AsyncTransaction<'a> {
 
     pub async fn count(&mut self, table: &str, filters: &[Filter]) -> Result<u64> {
         self.inner.count(table, filters)
+    }
+
+    pub async fn count_with(
+        &mut self,
+        table: &str,
+        filters: &[Filter],
+        or_groups: &[Vec<Filter>],
+    ) -> Result<u64> {
+        self.inner.count_with(table, filters, or_groups)
     }
 
     pub async fn insert_many(&mut self, table: &str, rows: &[Vec<(&str, Value)>]) -> Result<Vec<u64>> {
