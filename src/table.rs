@@ -25,8 +25,10 @@ pub struct TableMeta {
     pub columns: Vec<ColumnDef>,
     /// Column name -> column ID mapping.
     pub col_name_to_id: HashMap<String, u16>,
-    /// Shared column names for lazy Row decoding.
+    /// Shared column names for lazy Row decoding (positional, indexed by col_id).
     pub col_names: Arc<Vec<String>>,
+    /// Shared column definitions for default-at-read (positional, in lockstep with col_names).
+    pub col_defs: Arc<Vec<ColumnDef>>,
     /// B+ tree root page number.
     pub root_page: u32,
     /// Number of rows (maintained by insert/delete).
@@ -49,12 +51,14 @@ impl TableMeta {
             .map(|(i, c)| (c.name.clone(), i as u16))
             .collect();
         let col_names = Arc::new(columns.iter().map(|c| c.name.clone()).collect());
+        let col_defs = Arc::new(columns.clone());
         Self {
             name,
             table_id,
             columns,
             col_name_to_id,
             col_names,
+            col_defs,
             root_page,
             row_count: 0,
             next_rowid: 1,
@@ -78,6 +82,20 @@ impl TableMeta {
         self.indexes
             .iter()
             .find(|idx| idx.columns.first().map(|c| c == column).unwrap_or(false))
+    }
+
+    /// Append a new column. Its col_id is the new last index (vec position).
+    /// Caller has already validated name-uniqueness and NOT-NULL-needs-default.
+    pub fn add_column(&mut self, col: ColumnDef) {
+        let col_id = self.columns.len() as u16;
+        self.col_name_to_id.insert(col.name.clone(), col_id);
+        // col_names is positional (indexed by col_id) — push in lockstep.
+        let mut names = (*self.col_names).clone();
+        names.push(col.name.clone());
+        self.col_names = std::sync::Arc::new(names);
+        self.columns.push(col);
+        // col_defs is also positional — rebuild from columns to stay in sync.
+        self.col_defs = std::sync::Arc::new(self.columns.clone());
     }
 }
 

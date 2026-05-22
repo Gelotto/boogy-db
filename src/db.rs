@@ -102,28 +102,81 @@ pub struct Row {
     pub id: u64,
     data: Vec<u8>,
     col_names: Arc<Vec<String>>,
+    /// Column definitions (parallel to col_names) for default-at-read and
+    /// dropped-column skipping. Shared Arc from the table meta snapshot.
+    col_defs: Arc<Vec<crate::value::ColumnDef>>,
 }
 
 impl Row {
-    fn from_raw(bytes: &[u8], col_names: Arc<Vec<String>>) -> Result<Self> {
+    fn from_raw(
+        bytes: &[u8],
+        col_names: Arc<Vec<String>>,
+        col_defs: Arc<Vec<crate::value::ColumnDef>>,
+    ) -> Result<Self> {
         let id = row::extract_id(bytes)?;
-        Ok(Self { id, data: bytes.to_vec(), col_names })
+        Ok(Self { id, data: bytes.to_vec(), col_names, col_defs })
     }
 
-    /// Get a single column value by name. Decodes only that column.
+    /// Get a single column value by name.
+    ///
+    /// - Returns `None` when the column name is unknown, or when the column is
+    ///   dropped.
+    /// - For columns that are physically absent from the row bytes AND that have
+    ///   a stored `default` (e.g. they were added via `add_column` after this row
+    ///   was written), returns `Some(default)`.
+    /// - For columns that are physically absent AND have no stored default (e.g.
+    ///   the column was part of the original schema but simply not set during the
+    ///   insert), returns `None` — preserving the historical contract.
     pub fn get(&self, column: &str) -> Option<Value> {
         let col_id = self.col_names.iter().position(|n| n == column)? as u16;
-        row::extract_column(&self.data, col_id).ok().flatten()
+        // Skip dropped columns — they are invisible.
+        if let Some(def) = self.col_defs.get(col_id as usize) {
+            if def.dropped {
+                return None;
+            }
+        }
+        let stored = row::extract_column(&self.data, col_id).ok().flatten();
+        match stored {
+            Some(v) => Some(v),
+            None => {
+                // Apply the stored default only when one is explicitly set;
+                // otherwise propagate None (historically: column was omitted).
+                self.col_defs
+                    .get(col_id as usize)
+                    .and_then(|d| d.default.clone())
+                    .map(Some)
+                    .unwrap_or(None)
+            }
+        }
     }
 
-    /// Decode all columns.
+    /// Decode all live (non-dropped) columns.
+    ///
+    /// For columns that are physically absent from the row bytes AND have a
+    /// stored `default`, returns the default value. Columns absent with no stored
+    /// default are omitted (matching `Row::get` semantics).
     pub fn columns(&self) -> Vec<(String, Value)> {
-        match row::decode_row(&self.data) {
-            Ok(decoded) => decoded.columns.into_iter().filter_map(|(col_id, val)| {
-                self.col_names.get(col_id as usize).map(|name| (name.clone(), val))
-            }).collect(),
-            Err(_) => Vec::new(),
+        let mut result = Vec::with_capacity(self.col_names.len());
+        for (idx, def) in self.col_defs.iter().enumerate() {
+            if def.dropped {
+                continue;
+            }
+            let name = match self.col_names.get(idx) {
+                Some(n) => n.clone(),
+                None => continue,
+            };
+            let col_id = idx as u16;
+            let stored = row::extract_column(&self.data, col_id).ok().flatten();
+            let val = match stored {
+                Some(v) => v,
+                None => match def.default.clone() {
+                    Some(d) => d,
+                    None => continue, // absent + no default → omit from result
+                },
+            };
+            result.push((name, val));
         }
+        result
     }
 }
 
@@ -1238,7 +1291,7 @@ impl BoogyDb {
         // 4. Decode.
         match result {
             Some(bytes) => {
-                Ok(Some(Row::from_raw(&bytes, state.meta.col_names.clone())?))
+                Ok(Some(Row::from_raw(&bytes, state.meta.col_names.clone(), state.meta.col_defs.clone())?))
             }
             None => Ok(None),
         }
@@ -1479,6 +1532,7 @@ impl BoogyDb {
             let has_extra_filters = opts.filters.len() > 1;
 
             let col_names = state.meta.col_names.clone();
+            let col_defs = state.meta.col_defs.clone();
             let mut rows = Vec::with_capacity(raw_rows.len());
             for bytes in &raw_rows {
                 if has_extra_filters {
@@ -1489,10 +1543,10 @@ impl BoogyDb {
                         .iter()
                         .all(|f| filter_matches_row(&state.meta.col_name_to_id, bytes, f));
                     if passes {
-                        rows.push(Row::from_raw(bytes, col_names.clone())?);
+                        rows.push(Row::from_raw(bytes, col_names.clone(), col_defs.clone())?);
                     }
                 } else {
-                    rows.push(Row::from_raw(bytes, col_names.clone())?);
+                    rows.push(Row::from_raw(bytes, col_names.clone(), col_defs.clone())?);
                 }
             }
 
@@ -1541,8 +1595,9 @@ impl BoogyDb {
                 };
                 let (raw_rows, count) = reader.scan_filtered(col_id, f.op, &f.value, lim, off, stop)?;
                 let col_names = state.meta.col_names.clone();
+                let col_defs = state.meta.col_defs.clone();
                 let matching: Vec<Row> = raw_rows.iter()
-                    .map(|(_, bytes)| Row::from_raw(bytes, col_names.clone()).unwrap())
+                    .map(|(_, bytes)| Row::from_raw(bytes, col_names.clone(), col_defs.clone()).unwrap())
                     .collect();
                 let total = if opts.include_total { Some(count) } else { None };
                 // scan_filtered already handled limit/offset when sort is empty.
@@ -1563,8 +1618,9 @@ impl BoogyDb {
             let all = reader.scan_all()?;
             let total = if opts.include_total { Some(all.len() as u64) } else { None };
             let col_names = state.meta.col_names.clone();
+            let col_defs = state.meta.col_defs.clone();
             let matching: Vec<Row> = all.iter()
-                .map(|(_, bytes)| Row::from_raw(bytes, col_names.clone()).unwrap())
+                .map(|(_, bytes)| Row::from_raw(bytes, col_names.clone(), col_defs.clone()).unwrap())
                 .collect();
             (matching, total)
         } else {
@@ -1573,10 +1629,11 @@ impl BoogyDb {
             let reader = BTreeReader::new(&self.file, state.meta.root_page);
             let all = reader.scan_all()?;
             let col_names = state.meta.col_names.clone();
+            let col_defs = state.meta.col_defs.clone();
             let mut matching = Vec::new();
             for (_, bytes) in &all {
                 if row_passes(&state.meta.col_name_to_id, bytes, &opts.filters, &opts.or_groups) {
-                    matching.push(Row::from_raw(bytes, col_names.clone())?);
+                    matching.push(Row::from_raw(bytes, col_names.clone(), col_defs.clone())?);
                 }
             }
             let total = if opts.include_total { Some(matching.len() as u64) } else { None };
@@ -1665,6 +1722,7 @@ impl BoogyDb {
         Self::check_table_accessible(&state.meta, table)?;
 
         let col_names = state.meta.col_names.clone();
+        let col_defs = state.meta.col_defs.clone();
         let col_name_to_id = &state.meta.col_name_to_id;
 
         match order.kind {
@@ -1676,7 +1734,7 @@ impl BoogyDb {
                 })?;
                 let mut rows = Vec::with_capacity(raw.len());
                 for (_, bytes) in &raw {
-                    rows.push(Row::from_raw(bytes, col_names.clone())?);
+                    rows.push(Row::from_raw(bytes, col_names.clone(), col_defs.clone())?);
                 }
                 let last_key = last_rowid.map(|rowid| ScanKey { bytes: Vec::new(), rowid });
                 Ok(ScanBatch { rows, last_key })
@@ -1708,7 +1766,7 @@ impl BoogyDb {
                     last_key = Some(ScanKey { bytes: key.clone(), rowid });
                     if let Some(bytes) = btree_reader.search(rowid)? {
                         if row_passes(col_name_to_id, &bytes, filters, or_groups) {
-                            rows.push(Row::from_raw(&bytes, col_names.clone())?);
+                            rows.push(Row::from_raw(&bytes, col_names.clone(), col_defs.clone())?);
                         }
                     }
                 }
@@ -1953,6 +2011,70 @@ impl BoogyDb {
         state.meta.indexes.remove(pos);
 
         // 3. Persist registry.
+        drop(state);
+        let (metas, next_id) = self.snapshot_table_metas();
+        let durability = self.durability();
+        Self::persist_registry(&self.file, &self.wal, &metas, next_id, durability)?;
+
+        Ok(())
+    }
+
+    /// Add a new column to an existing table (metadata-only, no row rewrite).
+    ///
+    /// The column is appended with the next available `col_id`. Rows that predate
+    /// the column (or new inserts that omit it) will read the column's stored
+    /// `default` (or `Null` if none was given) via the default-at-read path.
+    ///
+    /// Validation:
+    /// - The column name must not collide with any live column.
+    /// - A NOT-NULL column without a default cannot be added to a non-empty table
+    ///   (there is no way to backfill existing rows).
+    pub fn add_column(&self, table: &str, column: ColumnDef) -> Result<()> {
+        // Validate the column name as an identifier (no NUL bytes, non-empty).
+        if column.name.is_empty() {
+            return Err(BoogyError::SchemaMismatch(
+                "column name must not be empty".to_string(),
+            ));
+        }
+        if column.name.contains('\0') {
+            return Err(BoogyError::SchemaMismatch(
+                "column name must not contain null bytes".to_string(),
+            ));
+        }
+
+        // 1. Read-lock registry, clone Arc.
+        let table_state = {
+            let tables = self.tables.read().unwrap();
+            tables
+                .get(table)
+                .ok_or_else(|| BoogyError::TableNotFound(table.to_string()))?
+                .clone()
+        };
+
+        // 2. Write-lock the specific table.
+        let mut state = table_state.write().unwrap();
+        Self::check_table_accessible(&state.meta, table)?;
+
+        // 3. Reject if a LIVE column already has this name.
+        if state.meta.col_name_to_id.contains_key(&column.name) {
+            return Err(BoogyError::SchemaMismatch(format!(
+                "column '{}' already exists on table '{}'",
+                column.name, table
+            )));
+        }
+
+        // 4. Reject NOT-NULL column without a default on a non-empty table.
+        if !column.nullable && column.default.is_none() && state.meta.row_count > 0 {
+            return Err(BoogyError::SchemaMismatch(format!(
+                "cannot add NOT-NULL column '{}' without a default to non-empty table '{}' ({} rows)",
+                column.name, table, state.meta.row_count
+            )));
+        }
+
+        // 5. Append the column to the table metadata.
+        state.meta.add_column(column);
+
+        // 6. Persist registry atomically (mirrors create_index / drop_index).
         drop(state);
         let (metas, next_id) = self.snapshot_table_metas();
         let durability = self.durability();
@@ -3460,6 +3582,7 @@ impl<'a> AcidTransaction<'a> {
 
         let root_page = self.current_root(table, &state.meta);
         let col_names = state.meta.col_names.clone();
+        let col_defs = state.meta.col_defs.clone();
         drop(state);
 
         let result = self.with_guard(|guard| {
@@ -3468,7 +3591,7 @@ impl<'a> AcidTransaction<'a> {
         })?;
 
         match result {
-            Some(bytes) => Ok(Some(Row::from_raw(&bytes, col_names)?)),
+            Some(bytes) => Ok(Some(Row::from_raw(&bytes, col_names, col_defs)?)),
             None => Ok(None),
         }
     }
@@ -3656,6 +3779,7 @@ impl<'a> AcidTransaction<'a> {
 
         let root_page = self.current_root(table, &state.meta);
         let col_names = state.meta.col_names.clone();
+        let col_defs = state.meta.col_defs.clone();
         let col_name_to_id = state.meta.col_name_to_id.clone();
         drop(state);
 
@@ -3670,7 +3794,7 @@ impl<'a> AcidTransaction<'a> {
         let mut matching = Vec::new();
         for (_, bytes) in &all {
             if row_passes(&col_name_to_id, bytes, &opts.filters, &opts.or_groups) {
-                matching.push(Row::from_raw(bytes, col_names.clone())?);
+                matching.push(Row::from_raw(bytes, col_names.clone(), col_defs.clone())?);
             }
         }
 
@@ -3738,6 +3862,7 @@ impl<'a> AcidTransaction<'a> {
 
         let root_page = self.current_root(table, &state.meta);
         let col_names = state.meta.col_names.clone();
+        let col_defs = state.meta.col_defs.clone();
         let col_name_to_id = state.meta.col_name_to_id.clone();
 
         match order.kind {
@@ -3802,7 +3927,7 @@ impl<'a> AcidTransaction<'a> {
 
                 let mut rows = Vec::with_capacity(results.len());
                 for (_, bytes) in &results {
-                    rows.push(Row::from_raw(bytes, col_names.clone())?);
+                    rows.push(Row::from_raw(bytes, col_names.clone(), col_defs.clone())?);
                 }
                 let last_key = last_rowid.map(|rowid| ScanKey { bytes: Vec::new(), rowid });
                 Ok(ScanBatch { rows, last_key })
@@ -3912,7 +4037,7 @@ impl<'a> AcidTransaction<'a> {
                     }
                     if rows.len() < limit_usize {
                         // Collect this row and record it as the current last key.
-                        rows.push(Row::from_raw(bytes, col_names.clone())?);
+                        rows.push(Row::from_raw(bytes, col_names.clone(), col_defs.clone())?);
                         last_key = Some(ScanKey {
                             bytes: key.clone(),
                             rowid: rowid_from_index_key(key),
