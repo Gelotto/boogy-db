@@ -24,7 +24,7 @@ pub use filter::{Filter, FilterOp, FindOptions, FindResult, Sort, SortDir};
 pub use db::{BoogyDb, Durability, Row, Transaction, AcidTransaction, ScanOrder, ScanOrderKind, ScanKey, ScanBatch};
 
 #[cfg(feature = "tokio")]
-pub use async_db::{AsyncBoogyDb, AsyncTransaction};
+pub use async_db::{AsyncBoogyDb, AsyncTransaction, OwnedAsyncTransaction};
 
 #[cfg(feature = "vector")]
 pub use vector::{DistanceMetric, VectorCollectionOptions, VectorResult, VectorSearchOptions};
