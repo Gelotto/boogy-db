@@ -38,6 +38,8 @@ fn main() {
         println!("{:>8} {:>14} {:>14} {:>14} {:>7.2}x ({winner})",
             threads, boogy_none, boogy_normal, sqlite, ratio_none);
     }
+
+    bench_write_tx_section();
 }
 
 fn bench_boogy(num_threads: usize, duration: Duration, with_index: bool, durability: Durability) -> u64 {
@@ -187,4 +189,150 @@ fn bench_sqlite(num_threads: usize, duration: Duration, with_index: bool) -> u64
     }).collect();
 
     handles.into_iter().map(|h| h.join().unwrap()).sum::<u64>() / duration.as_secs()
+}
+
+// ---------------------------------------------------------------------------
+// Concurrent write-transaction throughput (serialize-writers)
+// ---------------------------------------------------------------------------
+//
+// Two scenarios at N concurrent tasks:
+//   A) Interactive write-tx: begin_interactive → 2 inserts + 1 upsert_increment → commit
+//   B) Non-tx baseline:      same 3 writes as separate AsyncBoogyDb calls
+//
+// A vs B shows the cost of the serialize-writers gate across the whole tx
+// lifetime vs per-op serialization (the gate is still held per-op in B, but
+// released immediately after each call).
+
+async fn run_interactive_tx_tasks(db: Arc<AsyncBoogyDb>, tasks: usize, txs_per_task: usize) -> Duration {
+    let start = Instant::now();
+    let mut handles = Vec::with_capacity(tasks);
+    for task_id in 0..tasks {
+        let db = Arc::clone(&db);
+        handles.push(tokio::spawn(async move {
+            for i in 0..txs_per_task {
+                let mut tx = db.begin_interactive().await.unwrap();
+                tx.insert("t", &[
+                    ("name", Value::Text(format!("task{task_id}_tx{i}_a"))),
+                    ("v", Value::Integer((task_id * txs_per_task + i) as i64)),
+                ]).await.unwrap();
+                tx.insert("t", &[
+                    ("name", Value::Text(format!("task{task_id}_tx{i}_b"))),
+                    ("v", Value::Integer(i as i64 + 1000)),
+                ]).await.unwrap();
+                tx.upsert_increment(
+                    "counters",
+                    &[("key", Value::Text(format!("task{task_id}")))],
+                    "n",
+                    Value::Integer(1),
+                    &[],
+                ).await.unwrap();
+                tx.commit().await.unwrap();
+            }
+        }));
+    }
+    for h in handles { h.await.unwrap(); }
+    start.elapsed()
+}
+
+async fn run_nontx_tasks(db: Arc<AsyncBoogyDb>, tasks: usize, txs_per_task: usize) -> Duration {
+    let start = Instant::now();
+    let mut handles = Vec::with_capacity(tasks);
+    for task_id in 0..tasks {
+        let db = Arc::clone(&db);
+        handles.push(tokio::spawn(async move {
+            for i in 0..txs_per_task {
+                db.insert("t", &[
+                    ("name", Value::Text(format!("task{task_id}_tx{i}_a"))),
+                    ("v", Value::Integer((task_id * txs_per_task + i) as i64)),
+                ]).await.unwrap();
+                db.insert("t", &[
+                    ("name", Value::Text(format!("task{task_id}_tx{i}_b"))),
+                    ("v", Value::Integer(i as i64 + 1000)),
+                ]).await.unwrap();
+                db.upsert_increment(
+                    "counters",
+                    &[("key", Value::Text(format!("task{task_id}")))],
+                    "n",
+                    Value::Integer(1),
+                    &[],
+                ).await.unwrap();
+            }
+        }));
+    }
+    for h in handles { h.await.unwrap(); }
+    start.elapsed()
+}
+
+fn open_async_db(acid: bool) -> Arc<AsyncBoogyDb> {
+    // Single-thread runtime just for setup; the bench uses multi-thread.
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    // Leak the TempDir so the DB file outlives the setup runtime.
+    let dir = Box::leak(Box::new(tempfile::TempDir::new().unwrap()));
+    let db = rt.block_on(async {
+        let db = AsyncBoogyDb::open(dir.path().join("bench.boogy")).await.unwrap();
+        db.set_acid(acid);
+        db.set_durability(Durability::None);
+        db.create_table("t", &[
+            ColumnDef::new("name", Type::Text),
+            ColumnDef::new("v", Type::Integer),
+        ]).await.unwrap();
+        db.create_table("counters", &[
+            ColumnDef::new("key", Type::Text),
+            ColumnDef::new("n", Type::Integer),
+        ]).await.unwrap();
+        db.create_index("counters", "idx_key", "key").await.unwrap();
+        db
+    });
+    Arc::new(db)
+}
+
+fn bench_concurrent_write_tx(tasks: usize, txs_per_task: usize) -> (f64, f64) {
+    let total_txs = tasks * txs_per_task;
+
+    // Scenario A: interactive write-tx (serialize-writers across tx lifetime)
+    let db_a = open_async_db(true);
+    let elapsed_a = {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(tasks.max(2))
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(run_interactive_tx_tasks(db_a, tasks, txs_per_task))
+    };
+    let tx_per_sec_a = total_txs as f64 / elapsed_a.as_secs_f64();
+
+    // Scenario B: non-tx (per-op gate, released between calls)
+    let db_b = open_async_db(false);
+    let elapsed_b = {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(tasks.max(2))
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(run_nontx_tasks(db_b, tasks, txs_per_task))
+    };
+    let tx_per_sec_b = total_txs as f64 / elapsed_b.as_secs_f64();
+
+    (tx_per_sec_a, tx_per_sec_b)
+}
+
+fn bench_write_tx_section() {
+    let txs_per_task = 500;
+
+    println!("\n=== Concurrent Write-Transaction Throughput (serialize-writers) ===");
+    println!("Each 'tx' = begin_interactive → 2 inserts + 1 upsert_increment → commit");
+    println!("Non-tx baseline: same 3 ops as separate AsyncBoogyDb calls (per-op gate)");
+    println!("{txs_per_task} tx/task, Durability::None, ACID mode on\n");
+    println!("{:>8}  {:>18}  {:>16}  {:>10}",
+        "tasks", "interactive (tx/s)", "non-tx (tx/s)", "overhead");
+
+    for tasks in [1, 2, 4, 8] {
+        let (interactive, nontx) = bench_concurrent_write_tx(tasks, txs_per_task);
+        let overhead_pct = (nontx - interactive) / nontx * 100.0;
+        println!("{:>8}  {:>18.0}  {:>16.0}  {:>9.1}%",
+            tasks, interactive, nontx, overhead_pct);
+    }
 }

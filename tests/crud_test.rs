@@ -2474,3 +2474,252 @@ fn test_is_not_null_combined_with_is_null() {
     assert_eq!(result.total, Some(1));
     assert_eq!(result.rows[0].get("a").unwrap(), Value::Text("y".into()));
 }
+
+// ---------------------------------------------------------------------------
+// AcidTransaction::scan_batch — read-your-writes cursor tests
+// ---------------------------------------------------------------------------
+
+/// Insert rows inside a transaction, then scan_batch without committing.
+/// Verifies that the cursor sees uncommitted writes (read-your-writes) and
+/// that pagination via the resume key works correctly.
+#[test]
+fn test_acid_scan_batch_primary_key_reads_overlay() {
+    let (db, _dir) = create_db();
+    db.set_acid(true);
+    db.create_table("t", &[ColumnDef::new("v", Type::Integer)]).unwrap();
+
+    let mut tx = db.begin().unwrap();
+    // Insert 15 rows; none are committed yet.
+    for i in 0..15i64 {
+        tx.insert("t", &[("v", Value::Integer(i))]).unwrap();
+    }
+
+    // Page 1: first 10 rows (ids 1–10).
+    let batch1 = tx.scan_batch(
+        "t",
+        &[],
+        &[],
+        ScanOrder::primary_key(SortDir::Asc),
+        None,
+        10,
+    ).unwrap();
+    assert_eq!(batch1.rows.len(), 10, "page 1 should have 10 rows");
+    assert!(batch1.last_key.is_some(), "should have a resume token for page 2");
+    let vals1: Vec<i64> = batch1.rows.iter()
+        .map(|r: &Row| if let Some(Value::Integer(n)) = r.get("v") { n } else { -999 })
+        .collect();
+    assert_eq!(vals1, (0..10).collect::<Vec<_>>(), "page 1 values must be 0..10 in order");
+
+    // Page 2: rows 11–15.
+    let batch2 = tx.scan_batch(
+        "t",
+        &[],
+        &[],
+        ScanOrder::primary_key(SortDir::Asc),
+        batch1.last_key,
+        10,
+    ).unwrap();
+    assert_eq!(batch2.rows.len(), 5, "page 2 should have the remaining 5 rows");
+    assert!(batch2.last_key.is_none(), "page 2 is the last page — no resume token");
+    let vals2: Vec<i64> = batch2.rows.iter()
+        .map(|r: &Row| if let Some(Value::Integer(n)) = r.get("v") { n } else { -999 })
+        .collect();
+    assert_eq!(vals2, (10..15).collect::<Vec<_>>(), "page 2 values must be 10..15 in order");
+
+    // Verify nothing is visible outside the transaction (still uncommitted).
+    assert_eq!(db.count("t", &[]).unwrap(), 0, "rows must not be visible before commit");
+
+    tx.commit().unwrap();
+    assert_eq!(db.count("t", &[]).unwrap(), 15, "all 15 rows visible after commit");
+}
+
+/// Insert rows inside a transaction and scan in descending order through the overlay.
+#[test]
+fn test_acid_scan_batch_primary_key_desc_overlay() {
+    let (db, _dir) = create_db();
+    db.set_acid(true);
+    db.create_table("t", &[ColumnDef::new("v", Type::Integer)]).unwrap();
+
+    let mut tx = db.begin().unwrap();
+    for i in 0..6i64 {
+        tx.insert("t", &[("v", Value::Integer(i))]).unwrap();
+    }
+
+    // Desc page 1: limit 4 — should get rows with v = 5, 4, 3, 2.
+    let batch = tx.scan_batch(
+        "t",
+        &[],
+        &[],
+        ScanOrder::primary_key(SortDir::Desc),
+        None,
+        4,
+    ).unwrap();
+    assert_eq!(batch.rows.len(), 4);
+    assert!(batch.last_key.is_some());
+    let vals: Vec<i64> = batch.rows.iter()
+        .map(|r: &Row| if let Some(Value::Integer(n)) = r.get("v") { n } else { -999 })
+        .collect();
+    assert_eq!(vals, vec![5, 4, 3, 2]);
+
+    // Desc page 2: should get v = 1, 0.
+    let batch2 = tx.scan_batch(
+        "t",
+        &[],
+        &[],
+        ScanOrder::primary_key(SortDir::Desc),
+        batch.last_key,
+        4,
+    ).unwrap();
+    assert_eq!(batch2.rows.len(), 2);
+    assert!(batch2.last_key.is_none());
+    let vals2: Vec<i64> = batch2.rows.iter()
+        .map(|r: &Row| if let Some(Value::Integer(n)) = r.get("v") { n } else { -999 })
+        .collect();
+    assert_eq!(vals2, vec![1, 0]);
+
+    tx.commit().unwrap();
+}
+
+/// Mix committed rows + uncommitted rows: the tx cursor must see both.
+#[test]
+fn test_acid_scan_batch_sees_both_committed_and_overlay() {
+    let (db, _dir) = create_db();
+    db.set_acid(true);
+    db.create_table("t", &[ColumnDef::new("v", Type::Integer)]).unwrap();
+
+    // Commit 3 rows before the transaction.
+    for i in 0..3i64 {
+        db.insert("t", &[("v", Value::Integer(i))]).unwrap();
+    }
+
+    let mut tx = db.begin().unwrap();
+    // Insert 3 more rows inside the tx (uncommitted).
+    for i in 3..6i64 {
+        tx.insert("t", &[("v", Value::Integer(i))]).unwrap();
+    }
+
+    // The tx cursor must see all 6 rows.
+    let batch = tx.scan_batch(
+        "t",
+        &[],
+        &[],
+        ScanOrder::primary_key(SortDir::Asc),
+        None,
+        20,
+    ).unwrap();
+    assert_eq!(batch.rows.len(), 6, "cursor must see committed + uncommitted rows");
+    assert!(batch.last_key.is_none(), "fewer than limit rows — scan exhausted");
+
+    tx.commit().unwrap();
+    assert_eq!(db.count("t", &[]).unwrap(), 6);
+}
+
+/// scan_batch with a filter through the overlay — only matching rows are returned.
+#[test]
+fn test_acid_scan_batch_with_filter_overlay() {
+    let (db, _dir) = create_db();
+    db.set_acid(true);
+    db.create_table("t", &[ColumnDef::new("v", Type::Integer)]).unwrap();
+
+    let mut tx = db.begin().unwrap();
+    for i in 0..10i64 {
+        tx.insert("t", &[("v", Value::Integer(i))]).unwrap();
+    }
+
+    // Only rows with v >= 7 (uncommitted).
+    let batch = tx.scan_batch(
+        "t",
+        &[Filter::ge("v", 7i64)],
+        &[],
+        ScanOrder::primary_key(SortDir::Asc),
+        None,
+        20,
+    ).unwrap();
+    let vals: Vec<i64> = batch.rows.iter()
+        .map(|r: &Row| if let Some(Value::Integer(n)) = r.get("v") { n } else { -999 })
+        .collect();
+    assert_eq!(vals, vec![7, 8, 9]);
+
+    tx.commit().unwrap();
+}
+
+/// Index-order multi-page scan inside a transaction: no gaps, no duplicates.
+///
+/// This test exercises Bug 1 (index-order resume key was set to the overflow
+/// key, causing the (limit+1)-th row to be silently skipped on the next page)
+/// and Bug 2 (exact-limit page emitted a false resume token yielding an empty
+/// trailing page).
+#[test]
+fn test_acid_scan_batch_index_order_multipage_no_gaps() {
+    let (db, _dir) = create_db();
+    db.set_acid(true);
+    db.create_table("t", &[ColumnDef::new("score", Type::Integer)]).unwrap();
+    db.create_index("t", "idx_score", "score").unwrap();
+
+    let mut tx = db.begin().unwrap();
+    // Insert 7 rows with distinct scores. None are committed yet.
+    // Scores are inserted out of order to make the index ordering meaningful.
+    for score in [30i64, 10, 50, 20, 70, 40, 60] {
+        tx.insert("t", &[("score", Value::Integer(score))]).unwrap();
+    }
+
+    // Page through with limit=3: pages [10,20,30], [40,50,60], [70].
+    // Bug 1 would skip score=40 (the 4th row) because the resume key was set
+    // to the overflow entry rather than the last collected entry.
+    let mut all_scores: Vec<i64> = Vec::new();
+    let mut after: Option<ScanKey> = None;
+    let mut page_count = 0usize;
+
+    loop {
+        let batch = tx.scan_batch(
+            "t",
+            &[],
+            &[],
+            ScanOrder::index("idx_score", SortDir::Asc),
+            after.clone(),
+            3,
+        ).unwrap();
+
+        assert!(!batch.rows.is_empty() || page_count == 0,
+            "unexpected empty page at page {page_count}");
+
+        let page_scores: Vec<i64> = batch.rows.iter()
+            .map(|r| if let Some(Value::Integer(n)) = r.get("score") { n } else { -999 })
+            .collect();
+        all_scores.extend_from_slice(&page_scores);
+
+        page_count += 1;
+        after = batch.last_key;
+        if after.is_none() {
+            break;
+        }
+        assert!(page_count <= 10, "paging loop did not terminate — likely infinite");
+    }
+
+    // All 7 rows must be present, in ascending index (score) order, no gaps,
+    // no duplicates.
+    assert_eq!(
+        all_scores,
+        vec![10, 20, 30, 40, 50, 60, 70],
+        "multi-page index scan had gaps or duplicates: got {all_scores:?}"
+    );
+    assert_eq!(page_count, 3, "expected 3 pages (3+3+1) but got {page_count}");
+
+    // Bug 2: a scan that exhausts at exactly the limit must return last_key=None.
+    // Scan with limit=7 (exact row count) — must be None (no false resume token).
+    let exact_batch = tx.scan_batch(
+        "t",
+        &[],
+        &[],
+        ScanOrder::index("idx_score", SortDir::Asc),
+        None,
+        7,
+    ).unwrap();
+    assert_eq!(exact_batch.rows.len(), 7);
+    assert!(
+        exact_batch.last_key.is_none(),
+        "exact-limit scan (limit==row count) must return last_key=None, got Some"
+    );
+
+    tx.commit().unwrap();
+}

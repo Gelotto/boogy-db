@@ -2915,8 +2915,27 @@ struct MetaDelta {
 // AcidTransaction — true ACID: all-or-nothing commit via inject/drain
 // ---------------------------------------------------------------------------
 
+/// A reference to the database that is either borrowed (the classic
+/// scoped `begin()` transaction) or owned via `Arc` (an interactive
+/// transaction holdable across async boundaries). Derefs to `BoogyDb`
+/// so transaction method bodies are identical for both.
+pub(crate) enum DbRef<'a> {
+    Borrowed(&'a BoogyDb),
+    Owned(std::sync::Arc<BoogyDb>),
+}
+
+impl<'a> std::ops::Deref for DbRef<'a> {
+    type Target = BoogyDb;
+    fn deref(&self) -> &BoogyDb {
+        match self {
+            DbRef::Borrowed(db) => db,
+            DbRef::Owned(db) => db,
+        }
+    }
+}
+
 pub struct AcidTransaction<'a> {
-    db: &'a BoogyDb,
+    db: DbRef<'a>,
     private_dirty: StdHashMap<u32, Box<Page>>,
     new_page_count: u32,
     meta_deltas: StdHashMap<String, MetaDelta>,
@@ -2935,7 +2954,20 @@ pub struct AcidTransaction<'a> {
 impl<'a> AcidTransaction<'a> {
     fn new(db: &'a BoogyDb) -> Self {
         Self {
-            db,
+            db: DbRef::Borrowed(db),
+            private_dirty: StdHashMap::new(),
+            new_page_count: 0,
+            meta_deltas: StdHashMap::new(),
+            unique_seen: StdHashMap::new(),
+            committed: false,
+        }
+    }
+
+    /// Owned variant — holds an `Arc<BoogyDb>`, so the transaction is
+    /// `'static` and can be held across async calls.
+    pub(crate) fn new_owned(db: std::sync::Arc<BoogyDb>) -> AcidTransaction<'static> {
+        AcidTransaction {
+            db: DbRef::Owned(db),
             private_dirty: StdHashMap::new(),
             new_page_count: 0,
             meta_deltas: StdHashMap::new(),
@@ -3613,6 +3645,238 @@ impl<'a> AcidTransaction<'a> {
         Ok(FindResult { rows, total })
     }
 
+    /// Resumable ordered cursor over the transaction overlay (read-your-writes).
+    ///
+    /// Produces the same result shape as [`BoogyDb::scan_batch`] but reads the
+    /// **tx-current roots** (including uncommitted writes staged in the
+    /// `private_dirty` overlay), so a cursor inside a transaction sees rows it
+    /// has inserted or mutated but not yet committed.
+    ///
+    /// Because `BTreeWriter::scan_all_w` (the only overlay-aware scan) does a
+    /// full leaf-chain walk without a seek, the after/limit windowing is applied
+    /// in memory — the same tradeoff `find` makes vs. the committed read path.
+    ///
+    /// `order`:
+    /// - [`ScanOrderKind::PrimaryKey`] — walks by rowid; `after.rowid` is the
+    ///   exclusive resume bound; `after.bytes` is ignored.
+    /// - [`ScanOrderKind::Index`] — walks in encoded-key order for the named
+    ///   index; `after.bytes` is the exclusive resume key (same encoding as
+    ///   [`BoogyDb::scan_batch`] produces).
+    pub fn scan_batch(
+        &mut self,
+        table: &str,
+        filters: &[Filter],
+        or_groups: &[Vec<Filter>],
+        order: ScanOrder,
+        after: Option<ScanKey>,
+        limit: u32,
+    ) -> Result<ScanBatch> {
+        if limit == 0 {
+            return Ok(ScanBatch { rows: Vec::new(), last_key: None });
+        }
+
+        let table_state = self.table_state(table)?;
+        let state = table_state.read().unwrap();
+        BoogyDb::check_table_accessible(&state.meta, table)?;
+
+        let root_page = self.current_root(table, &state.meta);
+        let col_names = state.meta.col_names.clone();
+        let col_name_to_id = state.meta.col_name_to_id.clone();
+
+        match order.kind {
+            ScanOrderKind::PrimaryKey => {
+                let after_rowid = after.as_ref().map(|k| k.rowid);
+                let limit_usize = limit as usize;
+
+                // Read all rows through the overlay (read-your-writes).
+                let all = self.with_guard(|guard| {
+                    let tree = BTreeWriter::new(guard, root_page);
+                    tree.scan_all_w()
+                })?;
+                // scan_all_w yields rows in Asc rowid order (B+ tree leaf walk
+                // is always left-to-right). Apply direction, after-bound, filter,
+                // and limit in memory.
+                use crate::filter::SortDir;
+                let mut results: Vec<(u64, Vec<u8>)> = Vec::new();
+                let mut last_rowid: Option<u64> = None;
+
+                match order.dir {
+                    SortDir::Asc => {
+                        for (id, bytes) in &all {
+                            // Exclusive lower bound.
+                            if let Some(rid) = after_rowid {
+                                if *id <= rid {
+                                    continue;
+                                }
+                            }
+                            if results.len() >= limit_usize {
+                                // Batch full and another candidate exists — only
+                                // emit a resume token when we know more rows remain.
+                                last_rowid = results.last().map(|(rid, _)| *rid);
+                                break;
+                            }
+                            if row_passes(&col_name_to_id, bytes, filters, or_groups) {
+                                results.push((*id, bytes.clone()));
+                            }
+                        }
+                        // If we exited the loop without breaking (scan exhausted),
+                        // last_rowid stays None — no false resume token.
+                    }
+                    SortDir::Desc => {
+                        for (id, bytes) in all.iter().rev() {
+                            // Exclusive upper bound.
+                            if let Some(rid) = after_rowid {
+                                if *id >= rid {
+                                    continue;
+                                }
+                            }
+                            if results.len() >= limit_usize {
+                                last_rowid = results.last().map(|(rid, _)| *rid);
+                                break;
+                            }
+                            if row_passes(&col_name_to_id, bytes, filters, or_groups) {
+                                results.push((*id, bytes.clone()));
+                            }
+                        }
+                        // If we exited the loop without breaking (scan exhausted),
+                        // last_rowid stays None — no false resume token.
+                    }
+                }
+
+                let mut rows = Vec::with_capacity(results.len());
+                for (_, bytes) in &results {
+                    rows.push(Row::from_raw(bytes, col_names.clone())?);
+                }
+                let last_key = last_rowid.map(|rowid| ScanKey { bytes: Vec::new(), rowid });
+                Ok(ScanBatch { rows, last_key })
+            }
+
+            ScanOrderKind::Index(ref idx_name) => {
+                // Look up the index metadata.
+                let idx_meta = state
+                    .meta
+                    .find_index(idx_name)
+                    .ok_or_else(|| {
+                        BoogyError::SchemaMismatch(format!(
+                            "scan_batch: no index named '{idx_name}' on table '{table}'"
+                        ))
+                    })?
+                    .clone();
+
+                // Resolve column ids + types for the index key encoder.
+                let mut col_ids: Vec<u16> = Vec::with_capacity(idx_meta.columns.len());
+                let mut col_types: Vec<crate::value::Type> =
+                    Vec::with_capacity(idx_meta.columns.len());
+                for idx_col in &idx_meta.columns {
+                    match (
+                        state.meta.col_name_to_id.get(idx_col).copied(),
+                        state
+                            .meta
+                            .columns
+                            .iter()
+                            .find(|c| &c.name == idx_col)
+                            .map(|c| c.col_type),
+                    ) {
+                        (Some(cid), Some(ct)) => {
+                            col_ids.push(cid);
+                            col_types.push(ct);
+                        }
+                        _ => {
+                            return Err(BoogyError::SchemaMismatch(format!(
+                                "scan_batch(tx): index '{idx_name}' column '{idx_col}' not found on table '{table}'"
+                            )));
+                        }
+                    }
+                }
+                drop(state);
+
+                // Read all rows through the overlay.
+                let all = self.with_guard(|guard| {
+                    let tree = BTreeWriter::new(guard, root_page);
+                    tree.scan_all_w()
+                })?;
+
+                // For each row: apply predicate, encode the index key.
+                let mut keyed: Vec<(Vec<u8>, Vec<u8>)> = Vec::new(); // (encoded_key, row_bytes)
+                for (_, bytes) in &all {
+                    if !row_passes(&col_name_to_id, &bytes, filters, or_groups) {
+                        continue;
+                    }
+                    let rowid = crate::row::extract_id(bytes)?;
+                    // Encode index key (returns None if any indexed column is Null).
+                    let mut col_vals: Vec<crate::value::Value> =
+                        Vec::with_capacity(col_ids.len());
+                    for cid in &col_ids {
+                        col_vals.push(
+                            crate::row::extract_column(bytes, *cid)?.unwrap_or(Value::Null),
+                        );
+                    }
+                    if let Some(key) =
+                        index::encode_composite_index_key(&col_types, &col_vals, rowid)
+                    {
+                        keyed.push((key, bytes.clone()));
+                    }
+                    // Rows with Null in any index column are skipped (not indexed).
+                }
+
+                // Sort by encoded key (index order — same ordering as the index tree).
+                use crate::filter::SortDir;
+                keyed.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
+
+                let after_bytes: Option<&[u8]> = after.as_ref().map(|k| k.bytes.as_slice());
+                let limit_usize = limit as usize;
+                let mut rows = Vec::new();
+                // last_key tracks the last *collected* key (the limit-th row).
+                // It is set to None when the scan is exhausted (no overflow key
+                // was seen), so the caller receives no false resume token.
+                let mut last_key: Option<ScanKey> = None;
+                let mut has_more = false;
+
+                let iter: Box<dyn Iterator<Item = &(Vec<u8>, Vec<u8>)>> = match order.dir {
+                    SortDir::Asc => Box::new(keyed.iter()),
+                    SortDir::Desc => Box::new(keyed.iter().rev()),
+                };
+
+                for (key, bytes) in iter {
+                    // Exclusive bound.
+                    if let Some(ab) = after_bytes {
+                        match order.dir {
+                            SortDir::Asc => {
+                                if key.as_slice() <= ab {
+                                    continue;
+                                }
+                            }
+                            SortDir::Desc => {
+                                if key.as_slice() >= ab {
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                    if rows.len() < limit_usize {
+                        // Collect this row and record it as the current last key.
+                        rows.push(Row::from_raw(bytes, col_names.clone())?);
+                        last_key = Some(ScanKey {
+                            bytes: key.clone(),
+                            rowid: rowid_from_index_key(key),
+                        });
+                    } else {
+                        // Batch is full and an overflow key exists — more pages remain.
+                        has_more = true;
+                        break;
+                    }
+                }
+
+                // If no overflow key was seen the scan is exhausted: clear the
+                // resume token so the caller gets None and stops paging.
+                if !has_more {
+                    last_key = None;
+                }
+                Ok(ScanBatch { rows, last_key })
+            }
+        }
+    }
+
     /// Count rows matching filters (scans all rows through dirty overlay).
     ///
     /// Back-compatible signature. For OR-of-AND counting use [`count_with`].
@@ -3975,6 +4239,24 @@ impl<'a> Transaction<'a> {
         match self {
             Transaction::Light(t) => t.db.delete_where(table, filters),
             Transaction::Acid(t) => t.delete_where(table, filters),
+        }
+    }
+
+    /// Resumable ordered cursor. For an ACID transaction this reads through
+    /// the tx overlay (read-your-writes). For a light transaction it reads
+    /// committed state (no overlay).
+    pub fn scan_batch(
+        &mut self,
+        table: &str,
+        filters: &[Filter],
+        or_groups: &[Vec<Filter>],
+        order: ScanOrder,
+        after: Option<ScanKey>,
+        limit: u32,
+    ) -> Result<ScanBatch> {
+        match self {
+            Transaction::Light(t) => t.db.scan_batch(table, filters, or_groups, order, after, limit),
+            Transaction::Acid(t) => t.scan_batch(table, filters, or_groups, order, after, limit),
         }
     }
 }
