@@ -3710,7 +3710,8 @@ impl<'a> AcidTransaction<'a> {
                                 }
                             }
                             if results.len() >= limit_usize {
-                                // Batch full and another candidate exists.
+                                // Batch full and another candidate exists — only
+                                // emit a resume token when we know more rows remain.
                                 last_rowid = results.last().map(|(rid, _)| *rid);
                                 break;
                             }
@@ -3718,9 +3719,8 @@ impl<'a> AcidTransaction<'a> {
                                 results.push((*id, bytes.clone()));
                             }
                         }
-                        if last_rowid.is_none() && results.len() >= limit_usize {
-                            last_rowid = results.last().map(|(rid, _)| *rid);
-                        }
+                        // If we exited the loop without breaking (scan exhausted),
+                        // last_rowid stays None — no false resume token.
                     }
                     SortDir::Desc => {
                         for (id, bytes) in all.iter().rev() {
@@ -3738,9 +3738,8 @@ impl<'a> AcidTransaction<'a> {
                                 results.push((*id, bytes.clone()));
                             }
                         }
-                        if last_rowid.is_none() && results.len() >= limit_usize {
-                            last_rowid = results.last().map(|(rid, _)| *rid);
-                        }
+                        // If we exited the loop without breaking (scan exhausted),
+                        // last_rowid stays None — no false resume token.
                     }
                 }
 
@@ -3827,7 +3826,11 @@ impl<'a> AcidTransaction<'a> {
                 let after_bytes: Option<&[u8]> = after.as_ref().map(|k| k.bytes.as_slice());
                 let limit_usize = limit as usize;
                 let mut rows = Vec::new();
+                // last_key tracks the last *collected* key (the limit-th row).
+                // It is set to None when the scan is exhausted (no overflow key
+                // was seen), so the caller receives no false resume token.
                 let mut last_key: Option<ScanKey> = None;
+                let mut has_more = false;
 
                 let iter: Box<dyn Iterator<Item = &(Vec<u8>, Vec<u8>)>> = match order.dir {
                     SortDir::Asc => Box::new(keyed.iter()),
@@ -3850,22 +3853,23 @@ impl<'a> AcidTransaction<'a> {
                             }
                         }
                     }
-                    // Advance the cursor for EVERY key past the bound, even when
-                    // we've already filled the batch — matches non-tx semantics.
-                    last_key = Some(ScanKey {
-                        bytes: key.clone(),
-                        rowid: rowid_from_index_key(key),
-                    });
                     if rows.len() < limit_usize {
+                        // Collect this row and record it as the current last key.
                         rows.push(Row::from_raw(bytes, col_names.clone())?);
+                        last_key = Some(ScanKey {
+                            bytes: key.clone(),
+                            rowid: rowid_from_index_key(key),
+                        });
                     } else {
-                        // Batch full and another key exists ⇒ stop; last_key is set.
+                        // Batch is full and an overflow key exists — more pages remain.
+                        has_more = true;
                         break;
                     }
                 }
 
-                // If fewer than limit rows were emitted, the scan is exhausted.
-                if rows.len() < limit_usize {
+                // If no overflow key was seen the scan is exhausted: clear the
+                // resume token so the caller gets None and stops paging.
+                if !has_more {
                     last_key = None;
                 }
                 Ok(ScanBatch { rows, last_key })

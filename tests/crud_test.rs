@@ -2642,3 +2642,84 @@ fn test_acid_scan_batch_with_filter_overlay() {
 
     tx.commit().unwrap();
 }
+
+/// Index-order multi-page scan inside a transaction: no gaps, no duplicates.
+///
+/// This test exercises Bug 1 (index-order resume key was set to the overflow
+/// key, causing the (limit+1)-th row to be silently skipped on the next page)
+/// and Bug 2 (exact-limit page emitted a false resume token yielding an empty
+/// trailing page).
+#[test]
+fn test_acid_scan_batch_index_order_multipage_no_gaps() {
+    let (db, _dir) = create_db();
+    db.set_acid(true);
+    db.create_table("t", &[ColumnDef::new("score", Type::Integer)]).unwrap();
+    db.create_index("t", "idx_score", "score").unwrap();
+
+    let mut tx = db.begin().unwrap();
+    // Insert 7 rows with distinct scores. None are committed yet.
+    // Scores are inserted out of order to make the index ordering meaningful.
+    for score in [30i64, 10, 50, 20, 70, 40, 60] {
+        tx.insert("t", &[("score", Value::Integer(score))]).unwrap();
+    }
+
+    // Page through with limit=3: pages [10,20,30], [40,50,60], [70].
+    // Bug 1 would skip score=40 (the 4th row) because the resume key was set
+    // to the overflow entry rather than the last collected entry.
+    let mut all_scores: Vec<i64> = Vec::new();
+    let mut after: Option<ScanKey> = None;
+    let mut page_count = 0usize;
+
+    loop {
+        let batch = tx.scan_batch(
+            "t",
+            &[],
+            &[],
+            ScanOrder::index("idx_score", SortDir::Asc),
+            after.clone(),
+            3,
+        ).unwrap();
+
+        assert!(!batch.rows.is_empty() || page_count == 0,
+            "unexpected empty page at page {page_count}");
+
+        let page_scores: Vec<i64> = batch.rows.iter()
+            .map(|r| if let Some(Value::Integer(n)) = r.get("score") { n } else { -999 })
+            .collect();
+        all_scores.extend_from_slice(&page_scores);
+
+        page_count += 1;
+        after = batch.last_key;
+        if after.is_none() {
+            break;
+        }
+        assert!(page_count <= 10, "paging loop did not terminate — likely infinite");
+    }
+
+    // All 7 rows must be present, in ascending index (score) order, no gaps,
+    // no duplicates.
+    assert_eq!(
+        all_scores,
+        vec![10, 20, 30, 40, 50, 60, 70],
+        "multi-page index scan had gaps or duplicates: got {all_scores:?}"
+    );
+    assert_eq!(page_count, 3, "expected 3 pages (3+3+1) but got {page_count}");
+
+    // Bug 2: a scan that exhausts at exactly the limit must return last_key=None.
+    // Scan with limit=7 (exact row count) — must be None (no false resume token).
+    let exact_batch = tx.scan_batch(
+        "t",
+        &[],
+        &[],
+        ScanOrder::index("idx_score", SortDir::Asc),
+        None,
+        7,
+    ).unwrap();
+    assert_eq!(exact_batch.rows.len(), 7);
+    assert!(
+        exact_batch.last_key.is_none(),
+        "exact-limit scan (limit==row count) must return last_key=None, got Some"
+    );
+
+    tx.commit().unwrap();
+}
