@@ -146,6 +146,67 @@ impl<'a> BTreeReader<'a> {
         Ok(results)
     }
 
+    /// Scan rows in key order, applying a predicate, stopping once `stop_after`
+    /// matching rows have been collected.  When `stop_after` is `None` all
+    /// matching rows are returned (equivalent to `scan_all` filtered in-place).
+    ///
+    /// Unlike calling `scan_all()` and then filtering, this method stops reading
+    /// pages as soon as the cap is reached, so it is O(stop_after) I/O rather
+    /// than O(table_size).  Used by the `find` scan-all + row_passes fallback to
+    /// restore O(limit) behaviour when a limit (and optional offset) is given.
+    pub fn scan_all_matching<F>(
+        &self,
+        keep: F,
+        stop_after: Option<usize>,
+    ) -> Result<Vec<(u64, Vec<u8>)>>
+    where
+        F: Fn(&[u8]) -> bool,
+    {
+        let first_leaf = self.find_leftmost_leaf(self.root)?;
+        let max_pages = self.file.page_count();
+        let mut pages_visited = 0u32;
+        let mut results = Vec::new();
+        let mut current = first_leaf;
+        loop {
+            pages_visited += 1;
+            if pages_visited > max_pages {
+                return Err(BoogyError::Corruption(
+                    "leaf chain cycle detected in scan_all_matching".into(),
+                ));
+            }
+            let page = self.file.read_page(current)?;
+            let num_rows = page.num_rows() as usize;
+            for i in 0..num_rows {
+                if let Some(cap) = stop_after {
+                    if results.len() >= cap {
+                        return Ok(results);
+                    }
+                }
+                let (start, end) = row_bounds(&page, i, num_rows);
+                if start < end && end <= PAGE_SIZE {
+                    let data = &page.data[start..end];
+                    let full = reassemble_row_reader(data, self.file)?;
+                    if keep(&full) {
+                        let id = row::extract_id(&full)?;
+                        results.push((id, full));
+                    }
+                }
+            }
+            // Check cap again before loading the next page.
+            if let Some(cap) = stop_after {
+                if results.len() >= cap {
+                    return Ok(results);
+                }
+            }
+            let next = page.next_leaf();
+            if next == 0 {
+                break;
+            }
+            current = next;
+        }
+        Ok(results)
+    }
+
     /// Batch-fetch rows by sorted rowids. Finds the first rowid's leaf via
     /// tree traversal, then walks the leaf chain collecting matches.
     /// Much faster than N individual searches for clustered rowids.
@@ -206,6 +267,14 @@ impl<'a> BTreeReader<'a> {
     /// Scan rows, evaluating a filter on raw page bytes using extract_column.
     /// Only decodes and collects rows that pass the filter.
     /// Returns (matching rows as raw bytes, total matching count).
+    ///
+    /// `absent_default`: when a column is not present in a row's raw bytes AND
+    /// the row has no overflow (i.e. the column was added after the row was
+    /// written via `add_column`), use this value instead of `Null` when
+    /// evaluating the filter. Pass `None` to keep the original behaviour
+    /// (absent = Null). Passing the stored column default here lets
+    /// `scan_filtered` produce correct results for default-at-read columns
+    /// while keeping the fast raw-byte comparison path.
     pub fn scan_filtered(
         &self,
         filter_col_id: u16,
@@ -214,6 +283,7 @@ impl<'a> BTreeReader<'a> {
         limit: Option<u32>,
         offset: Option<u32>,
         stop_after: Option<u64>,
+        absent_default: Option<&crate::value::Value>,
     ) -> Result<(Vec<(u64, Vec<u8>)>, u64)> {
         let first_leaf = self.find_leftmost_leaf(self.root)?;
         let max_pages = self.file.page_count();
@@ -259,17 +329,25 @@ impl<'a> BTreeReader<'a> {
                         // Column might be in the overflow portion — reassemble and retry
                         None
                     } else {
-                        // Column not found, no overflow — treat as Null
-                        Some(crate::filter::eval_filter_op(&crate::value::Value::Null, &filter_op, filter_val))
+                        // Column not found, no overflow — use the stored default when
+                        // available (add_column path), otherwise treat as Null.
+                        let absent_val = absent_default.unwrap_or(&crate::value::Value::Null);
+                        Some(crate::filter::eval_filter_op(absent_val, &filter_op, filter_val))
                     };
 
                     if let Some(m) = inline_match {
                         (m, None)
                     } else {
-                        // Reassemble and evaluate on full row
+                        // Reassemble and evaluate on full row (overflow case).
                         let full = reassemble_row_reader(data, self.file)?;
                         let col_val = row::extract_column(&full, filter_col_id)?;
-                        let actual = col_val.as_ref().unwrap_or(&crate::value::Value::Null);
+                        // For overflow rows, if the column still isn't present after
+                        // reassembly, use absent_default (same semantics as the
+                        // inline no-overflow path above).
+                        let null = crate::value::Value::Null;
+                        let actual = col_val.as_ref()
+                            .or(absent_default)
+                            .unwrap_or(&null);
                         let m = crate::filter::eval_filter_op(actual, &filter_op, filter_val);
                         (m, Some(full))
                     }

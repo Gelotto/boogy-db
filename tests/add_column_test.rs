@@ -354,3 +354,115 @@ fn test_add_column_default_survives_reopen() {
         assert_eq!(r_null.rows.len(), 0, "find(score IS NULL) must not match old row with default after reopen");
     }
 }
+
+// ---------------------------------------------------------------------------
+// Short-circuit correctness: find(limit=k) on a default-column table must
+// return exactly k rows and not drop any valid results when limit < total.
+// ---------------------------------------------------------------------------
+
+/// On a default-carrying-column table with N old rows all matching the default,
+/// find(filter == default, limit = k) must return exactly k rows (short-circuit
+/// stops early without discarding valid rows), and a no-limit find must return all.
+#[test]
+fn test_find_default_column_limit_short_circuit_correctness() {
+    let (db, _dir) = create_db();
+    db.create_table("sc", &[ColumnDef::new("name", Type::Text)]).unwrap();
+
+    // Insert 50 old rows before adding the default column.
+    let n = 50usize;
+    for i in 0..n {
+        db.insert("sc", &[("name", Value::Text(format!("row{i}")))]).unwrap();
+    }
+
+    // Add column with default — all 50 existing rows will use the default.
+    db.add_column("sc", ColumnDef::new("score", Type::Integer).default(Value::Integer(99))).unwrap();
+
+    // Also add one new row with a different value so we can verify the filter excludes it.
+    db.insert("sc", &[("name", Value::Text("new".into())), ("score", Value::Integer(0))]).unwrap();
+
+    let filter_eq = || vec![Filter::eq("score", Value::Integer(99))];
+
+    // No-limit: must return all 50 old rows (the new row has score=0, not 99).
+    let all = db.find("sc", FindOptions {
+        filters: filter_eq(),
+        limit: None,
+        ..Default::default()
+    }).unwrap();
+    assert_eq!(all.rows.len(), n, "no-limit find must return all {n} matching rows");
+
+    // limit = 10 (well below total): must return exactly 10.
+    let k = 10usize;
+    let limited = db.find("sc", FindOptions {
+        filters: filter_eq(),
+        limit: Some(k as u32),
+        ..Default::default()
+    }).unwrap();
+    assert_eq!(limited.rows.len(), k, "find(limit={k}) must return exactly {k} rows");
+    // All returned rows must actually match score == 99.
+    for row in &limited.rows {
+        assert_eq!(row.get("score"), Some(Value::Integer(99)), "every returned row must match score==99");
+    }
+
+    // limit = n (exact total): must return all n.
+    let exact = db.find("sc", FindOptions {
+        filters: filter_eq(),
+        limit: Some(n as u32),
+        ..Default::default()
+    }).unwrap();
+    assert_eq!(exact.rows.len(), n, "find(limit=n) must return all {n} rows");
+
+    // limit > total: must return all matching (no over-truncation or panic).
+    let over = db.find("sc", FindOptions {
+        filters: filter_eq(),
+        limit: Some((n + 100) as u32),
+        ..Default::default()
+    }).unwrap();
+    assert_eq!(over.rows.len(), n, "find(limit > total) must return all {n} matching rows");
+}
+
+/// Offset + limit on a default-column scan: offset skips the first k rows, limit caps the rest.
+#[test]
+fn test_find_default_column_offset_limit_short_circuit_correctness() {
+    let (db, _dir) = create_db();
+    db.create_table("sc2", &[ColumnDef::new("v", Type::Integer)]).unwrap();
+
+    let n = 30usize;
+    for i in 0..n as i64 {
+        db.insert("sc2", &[("v", Value::Integer(i))]).unwrap();
+    }
+
+    // Add a default column — all existing rows match.
+    db.add_column("sc2", ColumnDef::new("tag", Type::Text).default(Value::Text("x".into()))).unwrap();
+
+    let filter_tag = || vec![Filter::eq("tag", Value::Text("x".into()))];
+
+    // offset=5, limit=10 — must return exactly 10 rows.
+    let r = db.find("sc2", FindOptions {
+        filters: filter_tag(),
+        offset: Some(5),
+        limit: Some(10),
+        ..Default::default()
+    }).unwrap();
+    assert_eq!(r.rows.len(), 10, "offset=5 limit=10 must return exactly 10 rows");
+    for row in &r.rows {
+        assert_eq!(row.get("tag"), Some(Value::Text("x".into())), "each row must have the default tag");
+    }
+
+    // offset past the end — must return 0 rows (no panic or wrong count).
+    let r_past = db.find("sc2", FindOptions {
+        filters: filter_tag(),
+        offset: Some((n + 5) as u32),
+        limit: Some(5),
+        ..Default::default()
+    }).unwrap();
+    assert_eq!(r_past.rows.len(), 0, "offset past end must return 0 rows");
+
+    // No sort, no limit, with include_total: must count correctly (no short-circuit).
+    let r_total = db.find("sc2", FindOptions {
+        filters: filter_tag(),
+        include_total: true,
+        ..Default::default()
+    }).unwrap();
+    assert_eq!(r_total.rows.len(), n);
+    assert_eq!(r_total.total, Some(n as u64), "include_total must return full match count");
+}

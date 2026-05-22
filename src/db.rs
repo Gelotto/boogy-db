@@ -1621,19 +1621,45 @@ impl BoogyDb {
                 .unwrap_or(false);
             if let Some(col_id) = state.meta.col_id(&f.column) {
                 if col_has_default {
-                    // Column has a stored default — bypass scan_filtered (which treats
-                    // absent columns as Null) and use row_passes for correct semantics.
+                    // Column has a stored default.  Original scan_filtered treated absent
+                    // columns as Null, which misses old rows that should match the default.
+                    // Fix: pass the stored default to scan_filtered so absent-column rows
+                    // are evaluated against the correct value — keeping the fast raw-byte
+                    // comparison path and its existing limit/offset short-circuit.
                     let reader = BTreeReader::new(&self.file, state.meta.root_page);
-                    let all = reader.scan_all()?;
+                    let stored_default = state.meta.col_defs
+                        .get(col_id as usize)
+                        .and_then(|d| d.default.clone())
+                        .unwrap_or(Value::Null);
+                    // Only apply limit/offset if no sort (sorted results need full collection first)
+                    let (lim, off) = if opts.sort.is_empty() {
+                        (opts.limit, opts.offset)
+                    } else {
+                        (None, None)
+                    };
+                    // Compute stop_after for short-circuit
+                    let stop = if can_short_circuit {
+                        match (opts.offset, opts.limit) {
+                            (_, Some(l)) => {
+                                let off = opts.offset.unwrap_or(0) as u64;
+                                Some(off + l as u64)
+                            }
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    };
+                    let (raw_rows, count) = reader.scan_filtered(col_id, f.op, &f.value, lim, off, stop, Some(&stored_default))?;
                     let col_names = state.meta.col_names.clone();
                     let col_defs = state.meta.col_defs.clone();
-                    let mut matching = Vec::new();
-                    for (_, bytes) in &all {
-                        if row_passes(&state.meta.col_name_to_id, &col_defs, bytes, &opts.filters, &opts.or_groups) {
-                            matching.push(Row::from_raw(bytes, col_names.clone(), col_defs.clone())?);
-                        }
+                    let matching: Vec<Row> = raw_rows.iter()
+                        .map(|(_, bytes)| Row::from_raw(bytes, col_names.clone(), col_defs.clone()).unwrap())
+                        .collect();
+                    let total = if opts.include_total { Some(count) } else { None };
+                    // scan_filtered already handled limit/offset when sort is empty.
+                    if opts.sort.is_empty() {
+                        pagination_applied = true;
                     }
-                    let total = if opts.include_total { Some(matching.len() as u64) } else { None };
                     (matching, total)
                 } else {
                     let reader = BTreeReader::new(&self.file, state.meta.root_page);
@@ -1655,7 +1681,7 @@ impl BoogyDb {
                     } else {
                         None
                     };
-                    let (raw_rows, count) = reader.scan_filtered(col_id, f.op, &f.value, lim, off, stop)?;
+                    let (raw_rows, count) = reader.scan_filtered(col_id, f.op, &f.value, lim, off, stop, None)?;
                     let col_names = state.meta.col_names.clone();
                     let col_defs = state.meta.col_defs.clone();
                     let matching: Vec<Row> = raw_rows.iter()
@@ -1689,15 +1715,27 @@ impl BoogyDb {
         } else {
             // Multi-filter, single-IN filter, or any query with or_groups present:
             // scan all, apply the full predicate (filters AND or-of-groups), lazy Row.
+            // Uses scan_all_matching so the predicate + limit short-circuit is fused into
+            // the page-walk, avoiding loading the entire table when a limit is given.
             let reader = BTreeReader::new(&self.file, state.meta.root_page);
-            let all = reader.scan_all()?;
+            let col_name_to_id = state.meta.col_name_to_id.clone();
             let col_names = state.meta.col_names.clone();
             let col_defs = state.meta.col_defs.clone();
-            let mut matching = Vec::new();
-            for (_, bytes) in &all {
-                if row_passes(&state.meta.col_name_to_id, &col_defs, bytes, &opts.filters, &opts.or_groups) {
-                    matching.push(Row::from_raw(bytes, col_names.clone(), col_defs.clone())?);
-                }
+            let stop_after: Option<usize> = if can_short_circuit {
+                opts.limit.map(|l| opts.offset.unwrap_or(0) as usize + l as usize)
+            } else {
+                None
+            };
+            let filters = opts.filters.clone();
+            let or_groups = opts.or_groups.clone();
+            let col_defs2 = col_defs.clone();
+            let raw_rows = reader.scan_all_matching(
+                move |bytes| row_passes(&col_name_to_id, &col_defs2, bytes, &filters, &or_groups),
+                stop_after,
+            )?;
+            let mut matching = Vec::with_capacity(raw_rows.len());
+            for (_, bytes) in &raw_rows {
+                matching.push(Row::from_raw(bytes, col_names.clone(), col_defs.clone())?);
             }
             let total = if opts.include_total { Some(matching.len() as u64) } else { None };
             (matching, total)
@@ -3988,8 +4026,22 @@ impl<'a> AcidTransaction<'a> {
         // Filter in memory (full predicate: filters AND or-of-groups).
         // This path always scans every row, so there are no index/single-filter
         // fast paths to gate — `row_passes` simply incorporates or_groups.
+        //
+        // Short-circuit: when no sort is requested and we're not computing a total,
+        // stop collecting once we have offset+limit matches.
+        let can_short_circuit = opts.sort.is_empty() && !opts.include_total;
+        let stop_after: Option<usize> = if can_short_circuit {
+            opts.limit.map(|l| opts.offset.unwrap_or(0) as usize + l as usize)
+        } else {
+            None
+        };
         let mut matching = Vec::new();
         for (_, bytes) in &all {
+            if let Some(cap) = stop_after {
+                if matching.len() >= cap {
+                    break;
+                }
+            }
             if row_passes(&col_name_to_id, &col_defs, bytes, &opts.filters, &opts.or_groups) {
                 matching.push(Row::from_raw(bytes, col_names.clone(), col_defs.clone())?);
             }
