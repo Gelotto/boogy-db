@@ -153,13 +153,25 @@ impl Row {
     ///   the column was part of the original schema but simply not set during the
     ///   insert), returns `None` — preserving the historical contract.
     pub fn get(&self, column: &str) -> Option<Value> {
-        let col_id = self.col_names.iter().position(|n| n == column)? as u16;
-        // Skip dropped columns — they are invisible.
-        if let Some(def) = self.col_defs.get(col_id as usize) {
-            if def.dropped {
-                return None;
-            }
-        }
+        // Scan col_names for all positions matching `column`, picking the first
+        // one that is NOT dropped.  This handles the case where a column was
+        // dropped and re-added under the same name: the old slot is marked
+        // dropped and sits at an earlier position, while the new live slot sits
+        // at a later position.
+        let col_id = self
+            .col_names
+            .iter()
+            .enumerate()
+            .find(|(idx, n)| {
+                *n == column
+                    && self
+                        .col_defs
+                        .get(*idx)
+                        .map(|d| !d.dropped)
+                        .unwrap_or(false)
+            })
+            .map(|(idx, _)| idx as u16)?;
+
         let stored = row::extract_column(&self.data, col_id).ok().flatten();
         match stored {
             Some(v) => Some(v),
@@ -2207,6 +2219,59 @@ impl BoogyDb {
         }
 
         // 7. Persist registry atomically (mirrors add_column / create_index).
+        drop(state);
+        let (metas, next_id) = self.snapshot_table_metas();
+        let durability = self.durability();
+        Self::persist_registry(&self.file, &self.wal, &metas, next_id, durability)?;
+
+        Ok(())
+    }
+
+    /// Drop (tombstone) a column from an existing table (metadata-only, no row rewrite).
+    ///
+    /// The column's slot (`col_id`) is kept with `dropped = true` so that later
+    /// columns' `col_id`s are not shifted and existing row data is not corrupted.
+    /// The `col_id` is never reused; subsequent `add_column` calls append a new slot.
+    ///
+    /// Validation:
+    /// - `name` must be a live column (present in `col_name_to_id`).
+    /// - The column must not be referenced by any secondary index.
+    pub fn drop_column(&self, table: &str, name: &str) -> Result<()> {
+        // 1. Read-lock registry, clone Arc.
+        let table_state = {
+            let tables = self.tables.read().unwrap();
+            tables
+                .get(table)
+                .ok_or_else(|| BoogyError::TableNotFound(table.to_string()))?
+                .clone()
+        };
+
+        // 2. Write-lock the specific table.
+        let mut state = table_state.write().unwrap();
+        Self::check_table_accessible(&state.meta, table)?;
+
+        // 3. Reject if the column is not a live column.
+        if !state.meta.col_name_to_id.contains_key(name) {
+            return Err(BoogyError::SchemaMismatch(format!(
+                "column '{}' does not exist on table '{}' (already dropped or unknown)",
+                name, table
+            )));
+        }
+
+        // 4. Reject if any index references this column.
+        for idx in &state.meta.indexes {
+            if idx.columns.iter().any(|c| c == name) {
+                return Err(BoogyError::SchemaMismatch(format!(
+                    "column `{}` is indexed by `{}`; drop the index first",
+                    name, idx.name
+                )));
+            }
+        }
+
+        // 5. Tombstone the column in the table metadata.
+        state.meta.drop_column(name);
+
+        // 6. Persist registry atomically (mirrors add_column / rename_column).
         drop(state);
         let (metas, next_id) = self.snapshot_table_metas();
         let durability = self.durability();

@@ -51,9 +51,13 @@ pub struct TableMeta {
 
 impl TableMeta {
     pub fn new(name: String, table_id: u32, columns: Vec<ColumnDef>, root_page: u32) -> Self {
+        // Only insert LIVE (non-dropped) columns into the name → id map.
+        // Dropped columns keep their slot (positional col_id) but must not
+        // appear in the name map — their name is freed so it can be reused.
         let col_name_to_id: HashMap<String, u16> = columns
             .iter()
             .enumerate()
+            .filter(|(_, c)| !c.dropped)
             .map(|(i, c)| (c.name.clone(), i as u16))
             .collect();
         let col_names = Arc::new(columns.iter().map(|c| c.name.clone()).collect());
@@ -102,6 +106,23 @@ impl TableMeta {
         self.columns.push(col);
         // col_defs is also positional — rebuild from columns to stay in sync.
         self.col_defs = std::sync::Arc::new(self.columns.clone());
+    }
+
+    /// Tombstone a live column: mark it dropped, free its name, keep its slot.
+    ///
+    /// The `col_id` (vec position) is NEVER reused — later `add_column` calls will
+    /// append a new slot.  Readers already skip dropped columns via `col_defs`.
+    /// Returns `false` if `name` isn't a live column (already dropped or unknown).
+    pub fn drop_column(&mut self, name: &str) -> bool {
+        let Some(col_id) = self.col_name_to_id.get(name).copied() else {
+            return false;
+        };
+        self.col_name_to_id.remove(name);
+        self.columns[col_id as usize].dropped = true;
+        // col_names keeps its slot (positional); readers skip dropped cols via col_defs.
+        // col_defs is positional — rebuild from columns to stay in sync.
+        self.col_defs = std::sync::Arc::new(self.columns.clone());
+        true
     }
 
     /// Rename a live column, keeping its col_id (so row data is preserved).
