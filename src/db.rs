@@ -2915,8 +2915,27 @@ struct MetaDelta {
 // AcidTransaction — true ACID: all-or-nothing commit via inject/drain
 // ---------------------------------------------------------------------------
 
+/// A reference to the database that is either borrowed (the classic
+/// scoped `begin()` transaction) or owned via `Arc` (an interactive
+/// transaction holdable across async boundaries). Derefs to `BoogyDb`
+/// so transaction method bodies are identical for both.
+pub(crate) enum DbRef<'a> {
+    Borrowed(&'a BoogyDb),
+    Owned(std::sync::Arc<BoogyDb>),
+}
+
+impl<'a> std::ops::Deref for DbRef<'a> {
+    type Target = BoogyDb;
+    fn deref(&self) -> &BoogyDb {
+        match self {
+            DbRef::Borrowed(db) => db,
+            DbRef::Owned(db) => db,
+        }
+    }
+}
+
 pub struct AcidTransaction<'a> {
-    db: &'a BoogyDb,
+    db: DbRef<'a>,
     private_dirty: StdHashMap<u32, Box<Page>>,
     new_page_count: u32,
     meta_deltas: StdHashMap<String, MetaDelta>,
@@ -2935,7 +2954,20 @@ pub struct AcidTransaction<'a> {
 impl<'a> AcidTransaction<'a> {
     fn new(db: &'a BoogyDb) -> Self {
         Self {
-            db,
+            db: DbRef::Borrowed(db),
+            private_dirty: StdHashMap::new(),
+            new_page_count: 0,
+            meta_deltas: StdHashMap::new(),
+            unique_seen: StdHashMap::new(),
+            committed: false,
+        }
+    }
+
+    /// Owned variant — holds an `Arc<BoogyDb>`, so the transaction is
+    /// `'static` and can be held across async calls.
+    pub(crate) fn new_owned(db: std::sync::Arc<BoogyDb>) -> AcidTransaction<'static> {
+        AcidTransaction {
+            db: DbRef::Owned(db),
             private_dirty: StdHashMap::new(),
             new_page_count: 0,
             meta_deltas: StdHashMap::new(),
