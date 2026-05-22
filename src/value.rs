@@ -82,6 +82,13 @@ pub struct ColumnDef {
     pub col_type: Type,
     pub nullable: bool,
     pub unique: bool,
+    /// Value returned for rows that predate this column (or that omit it
+    /// on insert). `None` => such reads return `Value::Null`.
+    pub default: Option<Value>,
+    /// Tombstone: a dropped column keeps its slot (so later columns'
+    /// `col_id`s don't shift) but is invisible to reads/finds. Its
+    /// `col_id` is never reused.
+    pub dropped: bool,
 }
 
 impl ColumnDef {
@@ -91,6 +98,8 @@ impl ColumnDef {
             col_type,
             nullable: true,
             unique: false,
+            default: None,
+            dropped: false,
         }
     }
 
@@ -102,5 +111,28 @@ impl ColumnDef {
     pub fn unique(mut self) -> Self {
         self.unique = true;
         self
+    }
+
+    pub fn default(mut self, v: Value) -> Self {
+        self.default = Some(v);
+        self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn column_def_default_and_dropped_fields() {
+        // Builder sets default correctly; dropped stays false.
+        let col = ColumnDef::new("x", Type::Integer).default(Value::Integer(5));
+        assert_eq!(col.default, Some(Value::Integer(5)));
+        assert!(!col.dropped);
+
+        // new() alone yields default == None and dropped == false.
+        let col2 = ColumnDef::new("y", Type::Text);
+        assert_eq!(col2.default, None);
+        assert!(!col2.dropped);
     }
 }
