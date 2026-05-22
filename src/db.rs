@@ -233,18 +233,11 @@ pub struct BoogyDb {
 //     [idx_col_len: u16][idx_col_bytes]
 //     [idx_root_page: u32]
 
-/// Legacy (pre-versioning) system page magic.
-/// Old pages have this magic; their layout has NO version byte after the magic —
-/// next_table_id follows immediately.
+/// System page magic. Written by all serialization; corruption if absent.
+/// Layout: magic(4) + next_table_id(4) + num_tables(2) + per-table records.
+/// Per-column records carry: [name_len:u16][name][type_tag:1][nullable:1][unique:1]
+///   [dropped:1][has_default:1][ if has_default: [value_len:u16][encoded Value] ]
 const SYSTEM_PAGE_MAGIC: u32 = 0xB00D_5150;
-
-/// V2 system page magic. Written by all current serialization.
-/// V2 layout: magic(4) + next_table_id(4) + num_tables(2) + per-table records.
-/// Per-column records additionally carry `dropped` (1 byte) + `default` (variable).
-/// Discriminating by magic (rather than a version byte inside the payload) is
-/// robust: the magic sits at a fixed, fully-controlled position and the two
-/// constants are disjoint from any plausible payload byte pattern.
-const SYSTEM_PAGE_MAGIC_V2: u32 = 0xB00D_5151;
 
 fn type_to_tag(t: Type) -> u8 {
     match t {
@@ -291,10 +284,9 @@ fn serialize_system_page(
 
     let mut offset = 16; // after page header
 
-    // System page magic (v2). The deserializer branches on magic value to
-    // distinguish this layout from legacy pages (SYSTEM_PAGE_MAGIC).
+    // System page magic — must match on read or the page is corrupt.
     check_sys_page_bounds(offset, 4)?;
-    data[offset..offset + 4].copy_from_slice(&SYSTEM_PAGE_MAGIC_V2.to_le_bytes());
+    data[offset..offset + 4].copy_from_slice(&SYSTEM_PAGE_MAGIC.to_le_bytes());
     offset += 4;
 
     // next_table_id
@@ -426,22 +418,15 @@ fn deserialize_system_page(
     let data = &page.data;
     let mut offset = 16; // skip page header
 
-    // System page magic — used as a format discriminator.
-    // SYSTEM_PAGE_MAGIC_V2  → current layout: dropped+default per column, no version byte.
-    // SYSTEM_PAGE_MAGIC     → legacy layout:  no dropped/default bytes per column.
-    // Anything else         → corruption error.
+    // System page magic — must equal SYSTEM_PAGE_MAGIC or the page is corrupt.
     let magic = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
-    let is_v2 = match magic {
-        SYSTEM_PAGE_MAGIC_V2 => true,
-        SYSTEM_PAGE_MAGIC => false,
-        _ => {
-            return Err(BoogyError::Corruption(format!(
-                "bad system page magic: {magic:#010x}"
-            )));
-        }
-    };
+    if magic != SYSTEM_PAGE_MAGIC {
+        return Err(BoogyError::Corruption(format!(
+            "bad system page magic: {magic:#010x}"
+        )));
+    }
     offset += 4;
-    // No version byte in either layout — next_table_id follows the magic directly.
+    // next_table_id follows the magic directly.
 
     // next_table_id
     let next_table_id = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
@@ -509,37 +494,31 @@ fn deserialize_system_page(
             let unique = data[offset] != 0;
             offset += 1;
 
-            // v2 fields: dropped flag + optional default value
-            let (dropped, col_default) = if is_v2 {
-                if offset + 1 > SYSTEM_PAGE_PAYLOAD {
-                    return Err(BoogyError::Corruption("system page truncated at column dropped flag".into()));
+            // dropped flag + optional default value
+            if offset + 1 > SYSTEM_PAGE_PAYLOAD {
+                return Err(BoogyError::Corruption("system page truncated at column dropped flag".into()));
+            }
+            let dropped = data[offset] != 0;
+            offset += 1;
+            if offset + 1 > SYSTEM_PAGE_PAYLOAD {
+                return Err(BoogyError::Corruption("system page truncated at column has_default flag".into()));
+            }
+            let has_default = data[offset] != 0;
+            offset += 1;
+            let col_default = if has_default {
+                if offset + 2 > SYSTEM_PAGE_PAYLOAD {
+                    return Err(BoogyError::Corruption("system page truncated at column default length".into()));
                 }
-                let dropped = data[offset] != 0;
-                offset += 1;
-                if offset + 1 > SYSTEM_PAGE_PAYLOAD {
-                    return Err(BoogyError::Corruption("system page truncated at column has_default flag".into()));
+                let vlen = u16::from_le_bytes(data[offset..offset + 2].try_into().unwrap()) as usize;
+                offset += 2;
+                if offset + vlen > SYSTEM_PAGE_PAYLOAD {
+                    return Err(BoogyError::Corruption("system page truncated at column default value".into()));
                 }
-                let has_default = data[offset] != 0;
-                offset += 1;
-                let col_default = if has_default {
-                    if offset + 2 > SYSTEM_PAGE_PAYLOAD {
-                        return Err(BoogyError::Corruption("system page truncated at column default length".into()));
-                    }
-                    let vlen = u16::from_le_bytes(data[offset..offset + 2].try_into().unwrap()) as usize;
-                    offset += 2;
-                    if offset + vlen > SYSTEM_PAGE_PAYLOAD {
-                        return Err(BoogyError::Corruption("system page truncated at column default value".into()));
-                    }
-                    let (v, _) = crate::row::decode_value(&data[offset..offset + vlen])?;
-                    offset += vlen;
-                    Some(v)
-                } else {
-                    None
-                };
-                (dropped, col_default)
+                let (v, _) = crate::row::decode_value(&data[offset..offset + vlen])?;
+                offset += vlen;
+                Some(v)
             } else {
-                // Legacy page: no dropped/default fields written — use safe defaults
-                (false, None)
+                None
             };
 
             let mut col_def = ColumnDef::new(col_name, tag_to_type(type_tag)?);
@@ -5660,13 +5639,10 @@ mod tests {
         }
     }
 
-    /// Back-compat regression: a normal create_table + insert + reopen must still work
-    /// correctly after the versioned format change. This is the legacy guard — all
-    /// existing persistence tests (like test_index_meta_survives_reopen) also serve
-    /// this role since they write then reopen a v2 page and verify data is intact.
-    /// This test makes the intent explicit.
+    /// Round-trip through reopen: create_table + insert + reopen must preserve data.
+    /// Verifies the system-page ser/de path end-to-end on a normal workflow.
     #[test]
-    fn test_sys_page_back_compat_normal_workflow() {
+    fn test_sys_page_normal_workflow_reopen() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("test.boogy");
 
@@ -5699,187 +5675,4 @@ mod tests {
         }
     }
 
-    /// Prove the magic-based discrimination is robust against the old byte-detection bug.
-    ///
-    /// Under the old scheme, data[4] (the low byte of next_table_id) was read as a version
-    /// byte. A legacy db with next_table_id=5 has low byte 0x05 >= 2, so the old code would
-    /// mis-identify it as "v2" and try to read dropped/default bytes out of old column data —
-    /// corrupting the parse of any real (non-empty) legacy database.
-    ///
-    /// The magic-based scheme is immune: SYSTEM_PAGE_MAGIC at offset 0 unambiguously signals
-    /// the legacy layout and next_table_id is read verbatim.
-    #[test]
-    fn test_sys_page_legacy_next_table_id_gte_2() {
-        use crate::page::{Page, PAGE_SYSTEM};
-
-        // Build a legacy system page by hand with next_table_id=5.
-        // Layout (offset 16 = after page header):
-        //   magic(4) [SYSTEM_PAGE_MAGIC] + next_table_id(4, =5) +
-        //   num_tables(2, =1) + table_record
-        // Per-column old format: [name_len][name][type][nullable][unique] — NO dropped/default.
-        let mut data = [0u8; crate::page::PAGE_SIZE];
-        data[0] = PAGE_SYSTEM as u8;
-
-        let mut off = 16usize;
-
-        // Legacy magic (not V2) — this is the key discriminator
-        data[off..off + 4].copy_from_slice(&SYSTEM_PAGE_MAGIC.to_le_bytes());
-        off += 4;
-
-        // next_table_id = 5: low byte = 0x05, which is >= 2.
-        // Under the old byte-detection scheme this byte would be mis-read as "version 5"
-        // and the entire page would be parsed as v2 — producing corrupted results.
-        let ntid: u32 = 5;
-        data[off..off + 4].copy_from_slice(&ntid.to_le_bytes());
-        off += 4;
-
-        // num_tables = 1
-        data[off..off + 2].copy_from_slice(&1u16.to_le_bytes());
-        off += 2;
-
-        // Table record: table_id=2, root_page=3, row_count=10, next_rowid=11
-        data[off..off + 4].copy_from_slice(&2u32.to_le_bytes()); off += 4;
-        data[off..off + 4].copy_from_slice(&3u32.to_le_bytes()); off += 4;
-        data[off..off + 8].copy_from_slice(&10u64.to_le_bytes()); off += 8;
-        data[off..off + 8].copy_from_slice(&11u64.to_le_bytes()); off += 8;
-
-        // table name "users"
-        let tname = b"users";
-        data[off..off + 2].copy_from_slice(&(tname.len() as u16).to_le_bytes()); off += 2;
-        data[off..off + tname.len()].copy_from_slice(tname); off += tname.len();
-
-        // num_cols = 2
-        data[off..off + 2].copy_from_slice(&2u16.to_le_bytes()); off += 2;
-
-        // Column 1: "name", Text, not-null, not-unique — OLD FORMAT (no dropped/default bytes)
-        let cname1 = b"name";
-        data[off..off + 2].copy_from_slice(&(cname1.len() as u16).to_le_bytes()); off += 2;
-        data[off..off + cname1.len()].copy_from_slice(cname1); off += cname1.len();
-        data[off] = 1; off += 1; // type_tag = Text
-        data[off] = 0; off += 1; // nullable = false
-        data[off] = 0; off += 1; // unique = false
-        // (no dropped byte, no default byte — legacy format)
-
-        // Column 2: "age", Integer, nullable, not-unique — OLD FORMAT
-        let cname2 = b"age";
-        data[off..off + 2].copy_from_slice(&(cname2.len() as u16).to_le_bytes()); off += 2;
-        data[off..off + cname2.len()].copy_from_slice(cname2); off += cname2.len();
-        data[off] = 2; off += 1; // type_tag = Integer
-        data[off] = 1; off += 1; // nullable = true
-        data[off] = 0; off += 1; // unique = false
-        // (no dropped byte, no default byte — legacy format)
-
-        // num_indexes = 0
-        data[off..off + 2].copy_from_slice(&0u16.to_le_bytes()); off += 2;
-
-        // encrypted = 0
-        data[off] = 0;
-
-        let page = Page::from_bytes_unchecked(data);
-        let (tables, next_id) = deserialize_system_page(&page).unwrap();
-
-        // next_table_id must come through verbatim — not mis-parsed as a version tag
-        assert_eq!(next_id, 5, "next_table_id=5 must survive legacy-magic parse");
-        assert_eq!(tables.len(), 1);
-        assert_eq!(tables[0].name, "users");
-        assert_eq!(tables[0].table_id, 2);
-        assert_eq!(tables[0].row_count, 10);
-        assert_eq!(tables[0].next_rowid, 11);
-        assert_eq!(tables[0].columns.len(), 2);
-
-        let col0 = &tables[0].columns[0];
-        assert_eq!(col0.name, "name");
-        assert_eq!(col0.col_type, Type::Text);
-        assert!(!col0.nullable);
-        assert!(!col0.dropped, "legacy col must have dropped=false");
-        assert_eq!(col0.default, None, "legacy col must have default=None");
-
-        let col1 = &tables[0].columns[1];
-        assert_eq!(col1.name, "age");
-        assert_eq!(col1.col_type, Type::Integer);
-        assert!(col1.nullable);
-        assert!(!col1.dropped, "legacy col must have dropped=false");
-        assert_eq!(col1.default, None, "legacy col must have default=None");
-    }
-
-    /// Craft a synthetic legacy system page and verify that
-    /// deserialize_system_page handles it correctly: returns dropped=false, default=None.
-    ///
-    /// Complementary to test_sys_page_legacy_next_table_id_gte_2 — uses next_table_id=1
-    /// (the value the old buggy test used) to keep full legacy coverage.
-    #[test]
-    fn test_sys_page_legacy_v1_detection() {
-        use crate::page::{Page, PAGE_SYSTEM};
-
-        // Build a minimal legacy system page by hand.
-        // Layout (starting at offset 16 = after page header):
-        //   magic(4) + next_table_id(4, =1) + num_tables(2, =1) + table_record
-        // Table record: table_id(4) + root_page(4) + row_count(8) + next_rowid(8) +
-        //               name_len(2) + name + num_cols(2) +
-        //               col_name_len(2) + col_name + type_tag(1) + nullable(1) + unique(1) +
-        //               num_indexes(2) + encrypted(1)
-        let mut data = [0u8; crate::page::PAGE_SIZE];
-
-        // Page header (16 bytes): flags at byte 0
-        data[0] = PAGE_SYSTEM as u8;
-
-        let mut off = 16usize;
-
-        // magic
-        let magic = SYSTEM_PAGE_MAGIC.to_le_bytes();
-        data[off..off + 4].copy_from_slice(&magic);
-        off += 4;
-
-        // next_table_id = 1 (legacy: no version byte before this)
-        let ntid: u32 = 1;
-        data[off..off + 4].copy_from_slice(&ntid.to_le_bytes());
-        off += 4;
-
-        // num_tables = 1
-        let nt: u16 = 1;
-        data[off..off + 2].copy_from_slice(&nt.to_le_bytes());
-        off += 2;
-
-        // Table record
-        // table_id=0, root_page=1, row_count=0, next_rowid=1
-        data[off..off + 4].copy_from_slice(&0u32.to_le_bytes()); off += 4; // table_id
-        data[off..off + 4].copy_from_slice(&1u32.to_le_bytes()); off += 4; // root_page
-        data[off..off + 8].copy_from_slice(&0u64.to_le_bytes()); off += 8; // row_count
-        data[off..off + 8].copy_from_slice(&1u64.to_le_bytes()); off += 8; // next_rowid
-
-        // table name "legacy"
-        let tname = b"legacy";
-        data[off..off + 2].copy_from_slice(&(tname.len() as u16).to_le_bytes()); off += 2;
-        data[off..off + tname.len()].copy_from_slice(tname); off += tname.len();
-
-        // num_cols = 1
-        data[off..off + 2].copy_from_slice(&1u16.to_le_bytes()); off += 2;
-
-        // Column: name="x", type=Integer(2), nullable=1, unique=0
-        // No dropped/default bytes — this is the legacy format.
-        let cname = b"x";
-        data[off..off + 2].copy_from_slice(&(cname.len() as u16).to_le_bytes()); off += 2;
-        data[off..off + cname.len()].copy_from_slice(cname); off += cname.len();
-        data[off] = 2; off += 1; // type_tag = Integer
-        data[off] = 1; off += 1; // nullable = true
-        data[off] = 0; off += 1; // unique = false
-
-        // num_indexes = 0
-        data[off..off + 2].copy_from_slice(&0u16.to_le_bytes()); off += 2;
-
-        // encrypted = 0
-        data[off] = 0;
-
-        let page = Page::from_bytes_unchecked(data);
-        let (tables, next_id) = deserialize_system_page(&page).unwrap();
-
-        assert_eq!(next_id, 1);
-        assert_eq!(tables.len(), 1);
-        assert_eq!(tables[0].name, "legacy");
-        assert_eq!(tables[0].columns.len(), 1);
-        assert_eq!(tables[0].columns[0].name, "x");
-        // Legacy page: dropped and default must be safe defaults
-        assert!(!tables[0].columns[0].dropped);
-        assert_eq!(tables[0].columns[0].default, None);
-    }
 }
