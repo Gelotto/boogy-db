@@ -26,9 +26,20 @@ use crate::vector::{VectorCollectionOptions, VectorResult, VectorSearchOptions};
 /// the column to a `Value` and `Filter::matches`. A filter on an unknown column
 /// matches against `Value::Null` (mirroring the historical inline logic).
 ///
+/// When a column is physically absent from the row (e.g. added via `add_column`
+/// after this row was written) AND the column has a stored `default`, the
+/// predicate matches against the default — exactly mirroring `Row::get()`'s
+/// "absent → `default` else Null" logic.  A column absent with no default is
+/// treated as `Null` (current behaviour; `IS NULL` matches).
+///
 /// This is the single home for the per-row predicate that used to be copy-pasted
 /// across the find/count scan branches.
-fn filter_matches_row(col_name_to_id: &HashMap<String, u16>, bytes: &[u8], f: &Filter) -> bool {
+fn filter_matches_row(
+    col_name_to_id: &HashMap<String, u16>,
+    col_defs: &[ColumnDef],
+    bytes: &[u8],
+    f: &Filter,
+) -> bool {
     if let Some(col_id) = col_name_to_id.get(&f.column).copied() {
         if let Ok(Some(raw)) = row::extract_column_raw(bytes, col_id) {
             if let Some(result) = crate::filter::eval_filter_raw_full(raw, f) {
@@ -36,8 +47,18 @@ fn filter_matches_row(col_name_to_id: &HashMap<String, u16>, bytes: &[u8], f: &F
             }
         }
         let col_val = row::extract_column(bytes, col_id).ok().flatten();
-        let actual = col_val.as_ref().unwrap_or(&Value::Null);
-        f.matches(actual)
+        match col_val {
+            Some(ref v) => f.matches(v),
+            None => {
+                // Column absent from this row — apply the stored default (if any),
+                // mirroring Row::get()'s semantics exactly.
+                let default_val = col_defs
+                    .get(col_id as usize)
+                    .and_then(|d| d.default.clone())
+                    .unwrap_or(Value::Null);
+                f.matches(&default_val)
+            }
+        }
     } else {
         f.matches(&Value::Null)
     }
@@ -49,17 +70,21 @@ fn filter_matches_row(col_name_to_id: &HashMap<String, u16>, bytes: &[u8], f: &F
 /// `filters` is the mandatory AND-prefix; `or_groups` adds an OR-of-AND clause
 /// when non-empty. With an empty `or_groups` this is exactly the historical
 /// `filters.iter().all(...)` behavior.
+///
+/// `col_defs` is the positional column-definition slice (from `TableMeta::col_defs`)
+/// used to resolve stored defaults for columns absent from older row bytes.
 fn row_passes(
     col_name_to_id: &HashMap<String, u16>,
+    col_defs: &[ColumnDef],
     bytes: &[u8],
     filters: &[Filter],
     or_groups: &[Vec<Filter>],
 ) -> bool {
-    filters.iter().all(|f| filter_matches_row(col_name_to_id, bytes, f))
+    filters.iter().all(|f| filter_matches_row(col_name_to_id, col_defs, bytes, f))
         && (or_groups.is_empty()
             || or_groups
                 .iter()
-                .any(|g| g.iter().all(|f| filter_matches_row(col_name_to_id, bytes, f))))
+                .any(|g| g.iter().all(|f| filter_matches_row(col_name_to_id, col_defs, bytes, f))))
 }
 
 /// Add a numeric `delta` to a `current` counter value, preserving type:
@@ -102,28 +127,93 @@ pub struct Row {
     pub id: u64,
     data: Vec<u8>,
     col_names: Arc<Vec<String>>,
+    /// Column definitions (parallel to col_names) for default-at-read and
+    /// dropped-column skipping. Shared Arc from the table meta snapshot.
+    col_defs: Arc<Vec<crate::value::ColumnDef>>,
 }
 
 impl Row {
-    fn from_raw(bytes: &[u8], col_names: Arc<Vec<String>>) -> Result<Self> {
+    fn from_raw(
+        bytes: &[u8],
+        col_names: Arc<Vec<String>>,
+        col_defs: Arc<Vec<crate::value::ColumnDef>>,
+    ) -> Result<Self> {
         let id = row::extract_id(bytes)?;
-        Ok(Self { id, data: bytes.to_vec(), col_names })
+        Ok(Self { id, data: bytes.to_vec(), col_names, col_defs })
     }
 
-    /// Get a single column value by name. Decodes only that column.
+    /// Get a single column value by name.
+    ///
+    /// - Returns `None` when the column name is unknown, or when the column is
+    ///   dropped.
+    /// - For columns that are physically absent from the row bytes AND that have
+    ///   a stored `default` (e.g. they were added via `add_column` after this row
+    ///   was written), returns `Some(default)`.
+    /// - For columns that are physically absent AND have no stored default (e.g.
+    ///   the column was part of the original schema but simply not set during the
+    ///   insert), returns `None` — preserving the historical contract.
     pub fn get(&self, column: &str) -> Option<Value> {
-        let col_id = self.col_names.iter().position(|n| n == column)? as u16;
-        row::extract_column(&self.data, col_id).ok().flatten()
+        // Scan col_names for all positions matching `column`, picking the first
+        // one that is NOT dropped.  This handles the case where a column was
+        // dropped and re-added under the same name: the old slot is marked
+        // dropped and sits at an earlier position, while the new live slot sits
+        // at a later position.
+        let col_id = self
+            .col_names
+            .iter()
+            .enumerate()
+            .find(|(idx, n)| {
+                *n == column
+                    && self
+                        .col_defs
+                        .get(*idx)
+                        .map(|d| !d.dropped)
+                        .unwrap_or(false)
+            })
+            .map(|(idx, _)| idx as u16)?;
+
+        let stored = row::extract_column(&self.data, col_id).ok().flatten();
+        match stored {
+            Some(v) => Some(v),
+            None => {
+                // Apply the stored default only when one is explicitly set;
+                // otherwise propagate None (historically: column was omitted).
+                self.col_defs
+                    .get(col_id as usize)
+                    .and_then(|d| d.default.clone())
+                    .map(Some)
+                    .unwrap_or(None)
+            }
+        }
     }
 
-    /// Decode all columns.
+    /// Decode all live (non-dropped) columns.
+    ///
+    /// For columns that are physically absent from the row bytes AND have a
+    /// stored `default`, returns the default value. Columns absent with no stored
+    /// default are omitted (matching `Row::get` semantics).
     pub fn columns(&self) -> Vec<(String, Value)> {
-        match row::decode_row(&self.data) {
-            Ok(decoded) => decoded.columns.into_iter().filter_map(|(col_id, val)| {
-                self.col_names.get(col_id as usize).map(|name| (name.clone(), val))
-            }).collect(),
-            Err(_) => Vec::new(),
+        let mut result = Vec::with_capacity(self.col_names.len());
+        for (idx, def) in self.col_defs.iter().enumerate() {
+            if def.dropped {
+                continue;
+            }
+            let name = match self.col_names.get(idx) {
+                Some(n) => n.clone(),
+                None => continue,
+            };
+            let col_id = idx as u16;
+            let stored = row::extract_column(&self.data, col_id).ok().flatten();
+            let val = match stored {
+                Some(v) => v,
+                None => match def.default.clone() {
+                    Some(d) => d,
+                    None => continue, // absent + no default → omit from result
+                },
+            };
+            result.push((name, val));
         }
+        result
     }
 }
 
@@ -233,6 +323,10 @@ pub struct BoogyDb {
 //     [idx_col_len: u16][idx_col_bytes]
 //     [idx_root_page: u32]
 
+/// System page magic. Written by all serialization; corruption if absent.
+/// Layout: magic(4) + next_table_id(4) + num_tables(2) + per-table records.
+/// Per-column records carry: [name_len:u16][name][type_tag:1][nullable:1][unique:1]
+///   [dropped:1][has_default:1][ if has_default: [value_len:u16][encoded Value] ]
 const SYSTEM_PAGE_MAGIC: u32 = 0xB00D_5150;
 
 fn type_to_tag(t: Type) -> u8 {
@@ -280,7 +374,7 @@ fn serialize_system_page(
 
     let mut offset = 16; // after page header
 
-    // System page magic
+    // System page magic — must match on read or the page is corrupt.
     check_sys_page_bounds(offset, 4)?;
     data[offset..offset + 4].copy_from_slice(&SYSTEM_PAGE_MAGIC.to_le_bytes());
     offset += 4;
@@ -334,6 +428,29 @@ fn serialize_system_page(
             offset += 1;
             data[offset] = if col.unique { 1 } else { 0 };
             offset += 1;
+
+            // v2 fields: dropped flag + optional default value
+            check_sys_page_bounds(offset, 1)?;
+            data[offset] = if col.dropped { 1 } else { 0 };
+            offset += 1;
+            match &col.default {
+                None => {
+                    check_sys_page_bounds(offset, 1)?;
+                    data[offset] = 0; // has_default = false
+                    offset += 1;
+                }
+                Some(v) => {
+                    check_sys_page_bounds(offset, 1)?;
+                    data[offset] = 1; // has_default = true
+                    offset += 1;
+                    let vb = crate::row::encode_value_to_vec(v);
+                    check_sys_page_bounds(offset, 2 + vb.len())?;
+                    data[offset..offset + 2].copy_from_slice(&(vb.len() as u16).to_le_bytes());
+                    offset += 2;
+                    data[offset..offset + vb.len()].copy_from_slice(&vb);
+                    offset += vb.len();
+                }
+            }
         }
 
         // Indexes
@@ -391,7 +508,7 @@ fn deserialize_system_page(
     let data = &page.data;
     let mut offset = 16; // skip page header
 
-    // System page magic
+    // System page magic — must equal SYSTEM_PAGE_MAGIC or the page is corrupt.
     let magic = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
     if magic != SYSTEM_PAGE_MAGIC {
         return Err(BoogyError::Corruption(format!(
@@ -399,6 +516,7 @@ fn deserialize_system_page(
         )));
     }
     offset += 4;
+    // next_table_id follows the magic directly.
 
     // next_table_id
     let next_table_id = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
@@ -466,6 +584,33 @@ fn deserialize_system_page(
             let unique = data[offset] != 0;
             offset += 1;
 
+            // dropped flag + optional default value
+            if offset + 1 > SYSTEM_PAGE_PAYLOAD {
+                return Err(BoogyError::Corruption("system page truncated at column dropped flag".into()));
+            }
+            let dropped = data[offset] != 0;
+            offset += 1;
+            if offset + 1 > SYSTEM_PAGE_PAYLOAD {
+                return Err(BoogyError::Corruption("system page truncated at column has_default flag".into()));
+            }
+            let has_default = data[offset] != 0;
+            offset += 1;
+            let col_default = if has_default {
+                if offset + 2 > SYSTEM_PAGE_PAYLOAD {
+                    return Err(BoogyError::Corruption("system page truncated at column default length".into()));
+                }
+                let vlen = u16::from_le_bytes(data[offset..offset + 2].try_into().unwrap()) as usize;
+                offset += 2;
+                if offset + vlen > SYSTEM_PAGE_PAYLOAD {
+                    return Err(BoogyError::Corruption("system page truncated at column default value".into()));
+                }
+                let (v, _) = crate::row::decode_value(&data[offset..offset + vlen])?;
+                offset += vlen;
+                Some(v)
+            } else {
+                None
+            };
+
             let mut col_def = ColumnDef::new(col_name, tag_to_type(type_tag)?);
             if !nullable {
                 col_def = col_def.not_null();
@@ -473,6 +618,8 @@ fn deserialize_system_page(
             if unique {
                 col_def = col_def.unique();
             }
+            col_def.dropped = dropped;
+            col_def.default = col_default;
             columns.push(col_def);
         }
 
@@ -1181,7 +1328,7 @@ impl BoogyDb {
         // 4. Decode.
         match result {
             Some(bytes) => {
-                Ok(Some(Row::from_raw(&bytes, state.meta.col_names.clone())?))
+                Ok(Some(Row::from_raw(&bytes, state.meta.col_names.clone(), state.meta.col_defs.clone())?))
             }
             None => Ok(None),
         }
@@ -1422,6 +1569,7 @@ impl BoogyDb {
             let has_extra_filters = opts.filters.len() > 1;
 
             let col_names = state.meta.col_names.clone();
+            let col_defs = state.meta.col_defs.clone();
             let mut rows = Vec::with_capacity(raw_rows.len());
             for bytes in &raw_rows {
                 if has_extra_filters {
@@ -1430,12 +1578,12 @@ impl BoogyDb {
                     let passes = opts
                         .filters
                         .iter()
-                        .all(|f| filter_matches_row(&state.meta.col_name_to_id, bytes, f));
+                        .all(|f| filter_matches_row(&state.meta.col_name_to_id, &col_defs, bytes, f));
                     if passes {
-                        rows.push(Row::from_raw(bytes, col_names.clone())?);
+                        rows.push(Row::from_raw(bytes, col_names.clone(), col_defs.clone())?);
                     }
                 } else {
-                    rows.push(Row::from_raw(bytes, col_names.clone())?);
+                    rows.push(Row::from_raw(bytes, col_names.clone(), col_defs.clone())?);
                 }
             }
 
@@ -1461,38 +1609,91 @@ impl BoogyDb {
         {
             // Single filter (non-IN): use scan_filtered (extract_column on raw bytes, no full decode)
             // Gated on empty or_groups: scan_filtered only applies the one filter.
+            //
+            // IMPORTANT: scan_filtered operates on raw bytes and treats absent columns as
+            // Null. If the column has a stored default (added via add_column), absent rows
+            // should match against the default, not Null. In that case we must bypass
+            // scan_filtered and fall through to the row_passes scan-all path below.
             let f = &opts.filters[0];
+            let col_has_default = state.meta.col_id(&f.column)
+                .and_then(|id| state.meta.col_defs.get(id as usize))
+                .map(|d| d.default.is_some())
+                .unwrap_or(false);
             if let Some(col_id) = state.meta.col_id(&f.column) {
-                let reader = BTreeReader::new(&self.file, state.meta.root_page);
-                // Only apply limit/offset if no sort (sorted results need full collection first)
-                let (lim, off) = if opts.sort.is_empty() {
-                    (opts.limit, opts.offset)
-                } else {
-                    (None, None)
-                };
-                // Compute stop_after for short-circuit
-                let stop = if can_short_circuit {
-                    match (opts.offset, opts.limit) {
-                        (_, Some(l)) => {
-                            let off = opts.offset.unwrap_or(0) as u64;
-                            Some(off + l as u64)
+                if col_has_default {
+                    // Column has a stored default.  Original scan_filtered treated absent
+                    // columns as Null, which misses old rows that should match the default.
+                    // Fix: pass the stored default to scan_filtered so absent-column rows
+                    // are evaluated against the correct value — keeping the fast raw-byte
+                    // comparison path and its existing limit/offset short-circuit.
+                    let reader = BTreeReader::new(&self.file, state.meta.root_page);
+                    let stored_default = state.meta.col_defs
+                        .get(col_id as usize)
+                        .and_then(|d| d.default.clone())
+                        .unwrap_or(Value::Null);
+                    // Only apply limit/offset if no sort (sorted results need full collection first)
+                    let (lim, off) = if opts.sort.is_empty() {
+                        (opts.limit, opts.offset)
+                    } else {
+                        (None, None)
+                    };
+                    // Compute stop_after for short-circuit
+                    let stop = if can_short_circuit {
+                        match (opts.offset, opts.limit) {
+                            (_, Some(l)) => {
+                                let off = opts.offset.unwrap_or(0) as u64;
+                                Some(off + l as u64)
+                            }
+                            _ => None,
                         }
-                        _ => None,
+                    } else {
+                        None
+                    };
+                    let (raw_rows, count) = reader.scan_filtered(col_id, f.op, &f.value, lim, off, stop, Some(&stored_default))?;
+                    let col_names = state.meta.col_names.clone();
+                    let col_defs = state.meta.col_defs.clone();
+                    let matching: Vec<Row> = raw_rows.iter()
+                        .map(|(_, bytes)| Row::from_raw(bytes, col_names.clone(), col_defs.clone()).unwrap())
+                        .collect();
+                    let total = if opts.include_total { Some(count) } else { None };
+                    // scan_filtered already handled limit/offset when sort is empty.
+                    if opts.sort.is_empty() {
+                        pagination_applied = true;
                     }
+                    (matching, total)
                 } else {
-                    None
-                };
-                let (raw_rows, count) = reader.scan_filtered(col_id, f.op, &f.value, lim, off, stop)?;
-                let col_names = state.meta.col_names.clone();
-                let matching: Vec<Row> = raw_rows.iter()
-                    .map(|(_, bytes)| Row::from_raw(bytes, col_names.clone()).unwrap())
-                    .collect();
-                let total = if opts.include_total { Some(count) } else { None };
-                // scan_filtered already handled limit/offset when sort is empty.
-                if opts.sort.is_empty() {
-                    pagination_applied = true;
+                    let reader = BTreeReader::new(&self.file, state.meta.root_page);
+                    // Only apply limit/offset if no sort (sorted results need full collection first)
+                    let (lim, off) = if opts.sort.is_empty() {
+                        (opts.limit, opts.offset)
+                    } else {
+                        (None, None)
+                    };
+                    // Compute stop_after for short-circuit
+                    let stop = if can_short_circuit {
+                        match (opts.offset, opts.limit) {
+                            (_, Some(l)) => {
+                                let off = opts.offset.unwrap_or(0) as u64;
+                                Some(off + l as u64)
+                            }
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    };
+                    let (raw_rows, count) = reader.scan_filtered(col_id, f.op, &f.value, lim, off, stop, None)?;
+                    let col_names = state.meta.col_names.clone();
+                    let col_defs = state.meta.col_defs.clone();
+                    let matching: Vec<Row> = raw_rows.iter()
+                        .map(|(_, bytes)| Row::from_raw(bytes, col_names.clone(), col_defs.clone()).unwrap())
+                        .collect();
+                    let total = if opts.include_total { Some(count) } else { None };
+                    // scan_filtered already handled limit/offset when sort is empty.
+                    if opts.sort.is_empty() {
+                        pagination_applied = true;
+                    }
+                    (matching, total)
                 }
-                (matching, total)
             } else {
                 // Column not found -- no matches
                 let total = if opts.include_total { Some(0) } else { None };
@@ -1506,21 +1707,35 @@ impl BoogyDb {
             let all = reader.scan_all()?;
             let total = if opts.include_total { Some(all.len() as u64) } else { None };
             let col_names = state.meta.col_names.clone();
+            let col_defs = state.meta.col_defs.clone();
             let matching: Vec<Row> = all.iter()
-                .map(|(_, bytes)| Row::from_raw(bytes, col_names.clone()).unwrap())
+                .map(|(_, bytes)| Row::from_raw(bytes, col_names.clone(), col_defs.clone()).unwrap())
                 .collect();
             (matching, total)
         } else {
             // Multi-filter, single-IN filter, or any query with or_groups present:
             // scan all, apply the full predicate (filters AND or-of-groups), lazy Row.
+            // Uses scan_all_matching so the predicate + limit short-circuit is fused into
+            // the page-walk, avoiding loading the entire table when a limit is given.
             let reader = BTreeReader::new(&self.file, state.meta.root_page);
-            let all = reader.scan_all()?;
+            let col_name_to_id = state.meta.col_name_to_id.clone();
             let col_names = state.meta.col_names.clone();
-            let mut matching = Vec::new();
-            for (_, bytes) in &all {
-                if row_passes(&state.meta.col_name_to_id, bytes, &opts.filters, &opts.or_groups) {
-                    matching.push(Row::from_raw(bytes, col_names.clone())?);
-                }
+            let col_defs = state.meta.col_defs.clone();
+            let stop_after: Option<usize> = if can_short_circuit {
+                opts.limit.map(|l| opts.offset.unwrap_or(0) as usize + l as usize)
+            } else {
+                None
+            };
+            let filters = opts.filters.clone();
+            let or_groups = opts.or_groups.clone();
+            let col_defs2 = col_defs.clone();
+            let raw_rows = reader.scan_all_matching(
+                move |bytes| row_passes(&col_name_to_id, &col_defs2, bytes, &filters, &or_groups),
+                stop_after,
+            )?;
+            let mut matching = Vec::with_capacity(raw_rows.len());
+            for (_, bytes) in &raw_rows {
+                matching.push(Row::from_raw(bytes, col_names.clone(), col_defs.clone())?);
             }
             let total = if opts.include_total { Some(matching.len() as u64) } else { None };
             (matching, total)
@@ -1608,6 +1823,7 @@ impl BoogyDb {
         Self::check_table_accessible(&state.meta, table)?;
 
         let col_names = state.meta.col_names.clone();
+        let col_defs = state.meta.col_defs.clone();
         let col_name_to_id = &state.meta.col_name_to_id;
 
         match order.kind {
@@ -1615,11 +1831,11 @@ impl BoogyDb {
                 let after_rowid = after.as_ref().map(|k| k.rowid);
                 let reader = BTreeReader::new(&self.file, state.meta.root_page);
                 let (raw, last_rowid) = reader.scan_from(after_rowid, order.dir, limit, |bytes| {
-                    row_passes(col_name_to_id, bytes, filters, or_groups)
+                    row_passes(col_name_to_id, &col_defs, bytes, filters, or_groups)
                 })?;
                 let mut rows = Vec::with_capacity(raw.len());
                 for (_, bytes) in &raw {
-                    rows.push(Row::from_raw(bytes, col_names.clone())?);
+                    rows.push(Row::from_raw(bytes, col_names.clone(), col_defs.clone())?);
                 }
                 let last_key = last_rowid.map(|rowid| ScanKey { bytes: Vec::new(), rowid });
                 Ok(ScanBatch { rows, last_key })
@@ -1650,8 +1866,8 @@ impl BoogyDb {
                     // exclusive regardless of filter outcome.
                     last_key = Some(ScanKey { bytes: key.clone(), rowid });
                     if let Some(bytes) = btree_reader.search(rowid)? {
-                        if row_passes(col_name_to_id, &bytes, filters, or_groups) {
-                            rows.push(Row::from_raw(&bytes, col_names.clone())?);
+                        if row_passes(col_name_to_id, &col_defs, &bytes, filters, or_groups) {
+                            rows.push(Row::from_raw(&bytes, col_names.clone(), col_defs.clone())?);
                         }
                     }
                 }
@@ -1720,13 +1936,22 @@ impl BoogyDb {
             }
 
             // Single filter (non-IN): use count_filtered (extract_column on raw bytes)
+            // IMPORTANT: count_filtered treats absent columns as Null; bypass it when
+            // the column has a stored default so absent rows are matched correctly.
             if filters.len() == 1 && filters[0].op != FilterOp::In {
                 let f = &filters[0];
-                if let Some(col_id) = state.meta.col_id(&f.column) {
-                    let reader = BTreeReader::new(&self.file, state.meta.root_page);
-                    return reader.count_filtered(col_id, f.op, &f.value);
+                let col_has_default = state.meta.col_id(&f.column)
+                    .and_then(|id| state.meta.col_defs.get(id as usize))
+                    .map(|d| d.default.is_some())
+                    .unwrap_or(false);
+                if !col_has_default {
+                    if let Some(col_id) = state.meta.col_id(&f.column) {
+                        let reader = BTreeReader::new(&self.file, state.meta.root_page);
+                        return reader.count_filtered(col_id, f.op, &f.value);
+                    }
+                    return Ok(0);
                 }
-                return Ok(0);
+                // col_has_default: fall through to row_passes scan-all below.
             }
         }
 
@@ -1734,10 +1959,11 @@ impl BoogyDb {
         // scan all and apply the full predicate.
         let reader = BTreeReader::new(&self.file, state.meta.root_page);
         let all = reader.scan_all()?;
+        let col_defs = state.meta.col_defs.clone();
 
         let mut count = 0u64;
         for (_, bytes) in &all {
-            if row_passes(&state.meta.col_name_to_id, bytes, filters, or_groups) {
+            if row_passes(&state.meta.col_name_to_id, &col_defs, bytes, filters, or_groups) {
                 count += 1;
             }
         }
@@ -1902,6 +2128,221 @@ impl BoogyDb {
         Self::persist_registry(&self.file, &self.wal, &metas, next_id, durability)?;
 
         Ok(())
+    }
+
+    /// Add a new column to an existing table (metadata-only, no row rewrite).
+    ///
+    /// The column is appended with the next available `col_id`. Rows that predate
+    /// the column (or new inserts that omit it) will read the column's stored
+    /// `default` (or `Null` if none was given) via the default-at-read path.
+    ///
+    /// Validation:
+    /// - The column name must not collide with any live column.
+    /// - A NOT-NULL column without a default cannot be added to a non-empty table
+    ///   (there is no way to backfill existing rows).
+    pub fn add_column(&self, table: &str, column: ColumnDef) -> Result<()> {
+        // Validate the column name as an identifier (no NUL bytes, non-empty).
+        if column.name.is_empty() {
+            return Err(BoogyError::SchemaMismatch(
+                "column name must not be empty".to_string(),
+            ));
+        }
+        if column.name.contains('\0') {
+            return Err(BoogyError::SchemaMismatch(
+                "column name must not contain null bytes".to_string(),
+            ));
+        }
+
+        // 1. Read-lock registry, clone Arc.
+        let table_state = {
+            let tables = self.tables.read().unwrap();
+            tables
+                .get(table)
+                .ok_or_else(|| BoogyError::TableNotFound(table.to_string()))?
+                .clone()
+        };
+
+        // 2. Write-lock the specific table.
+        let mut state = table_state.write().unwrap();
+        Self::check_table_accessible(&state.meta, table)?;
+
+        // 3. Reject if a LIVE column already has this name.
+        if state.meta.col_name_to_id.contains_key(&column.name) {
+            return Err(BoogyError::SchemaMismatch(format!(
+                "column '{}' already exists on table '{}'",
+                column.name, table
+            )));
+        }
+
+        // 4. Reject NOT-NULL column without a default on a non-empty table.
+        if !column.nullable && column.default.is_none() && state.meta.row_count > 0 {
+            return Err(BoogyError::SchemaMismatch(format!(
+                "cannot add NOT-NULL column '{}' without a default to non-empty table '{}' ({} rows)",
+                column.name, table, state.meta.row_count
+            )));
+        }
+
+        // 5. Append the column to the table metadata.
+        state.meta.add_column(column);
+
+        // 6. Persist registry atomically (mirrors create_index / drop_index).
+        drop(state);
+        let (metas, next_id) = self.snapshot_table_metas();
+        let durability = self.durability();
+        Self::persist_registry(&self.file, &self.wal, &metas, next_id, durability)?;
+
+        Ok(())
+    }
+
+    /// Rename a column in `table` from `old` to `new`, keeping the column's
+    /// `col_id` intact so all existing row data is preserved under the new name.
+    ///
+    /// Any secondary indexes that recorded `old` as a column name are updated
+    /// in-place to record `new` instead (index keys are stored by `col_id` so
+    /// the B+-tree data is unaffected — only the metadata name needs fixing).
+    pub fn rename_column(&self, table: &str, old: &str, new: &str) -> Result<()> {
+        // Validate the new name as an identifier (non-empty, no NUL bytes).
+        if new.is_empty() {
+            return Err(BoogyError::SchemaMismatch(
+                "column name must not be empty".to_string(),
+            ));
+        }
+        if new.contains('\0') {
+            return Err(BoogyError::SchemaMismatch(
+                "column name must not contain null bytes".to_string(),
+            ));
+        }
+
+        // 1. Read-lock registry, clone Arc.
+        let table_state = {
+            let tables = self.tables.read().unwrap();
+            tables
+                .get(table)
+                .ok_or_else(|| BoogyError::TableNotFound(table.to_string()))?
+                .clone()
+        };
+
+        // 2. Write-lock the specific table.
+        let mut state = table_state.write().unwrap();
+        Self::check_table_accessible(&state.meta, table)?;
+
+        // 3. Reject if the old column doesn't exist as a live column.
+        if !state.meta.col_name_to_id.contains_key(old) {
+            return Err(BoogyError::SchemaMismatch(format!(
+                "column '{}' does not exist on table '{}'",
+                old, table
+            )));
+        }
+
+        // 4. Reject if the new name already belongs to a live column.
+        if state.meta.col_name_to_id.contains_key(new) {
+            return Err(BoogyError::SchemaMismatch(format!(
+                "column '{}' already exists on table '{}'",
+                new, table
+            )));
+        }
+
+        // 5. Rename the column in the table metadata (col_id preserved).
+        state.meta.rename_column(old, new);
+
+        // 6. Fix up any index that records `old` as a column name.
+        //    Index keys are keyed by col_id in the B+-tree, so the tree data is
+        //    unaffected — only the recorded column name in IndexMeta needs updating.
+        for idx in state.meta.indexes.iter_mut() {
+            for col_name in idx.columns.iter_mut() {
+                if col_name == old {
+                    *col_name = new.to_string();
+                }
+            }
+        }
+
+        // 7. Persist registry atomically (mirrors add_column / create_index).
+        drop(state);
+        let (metas, next_id) = self.snapshot_table_metas();
+        let durability = self.durability();
+        Self::persist_registry(&self.file, &self.wal, &metas, next_id, durability)?;
+
+        Ok(())
+    }
+
+    /// Drop (tombstone) a column from an existing table (metadata-only, no row rewrite).
+    ///
+    /// The column's slot (`col_id`) is kept with `dropped = true` so that later
+    /// columns' `col_id`s are not shifted and existing row data is not corrupted.
+    /// The `col_id` is never reused; subsequent `add_column` calls append a new slot.
+    ///
+    /// Validation:
+    /// - `name` must be a live column (present in `col_name_to_id`).
+    /// - The column must not be referenced by any secondary index.
+    pub fn drop_column(&self, table: &str, name: &str) -> Result<()> {
+        // 1. Read-lock registry, clone Arc.
+        let table_state = {
+            let tables = self.tables.read().unwrap();
+            tables
+                .get(table)
+                .ok_or_else(|| BoogyError::TableNotFound(table.to_string()))?
+                .clone()
+        };
+
+        // 2. Write-lock the specific table.
+        let mut state = table_state.write().unwrap();
+        Self::check_table_accessible(&state.meta, table)?;
+
+        // 3. Reject if the column is not a live column.
+        if !state.meta.col_name_to_id.contains_key(name) {
+            return Err(BoogyError::SchemaMismatch(format!(
+                "column '{}' does not exist on table '{}' (already dropped or unknown)",
+                name, table
+            )));
+        }
+
+        // 4. Reject if any index references this column.
+        for idx in &state.meta.indexes {
+            if idx.columns.iter().any(|c| c == name) {
+                return Err(BoogyError::SchemaMismatch(format!(
+                    "column `{}` is indexed by `{}`; drop the index first",
+                    name, idx.name
+                )));
+            }
+        }
+
+        // 5. Tombstone the column in the table metadata.
+        state.meta.drop_column(name);
+
+        // 6. Persist registry atomically (mirrors add_column / rename_column).
+        drop(state);
+        let (metas, next_id) = self.snapshot_table_metas();
+        let durability = self.durability();
+        Self::persist_registry(&self.file, &self.wal, &metas, next_id, durability)?;
+
+        Ok(())
+    }
+
+    /// Return the live (non-dropped) columns for `table`, in schema order.
+    ///
+    /// This is a read — it takes no write-gate and only holds a shared lock on
+    /// the per-table `RwLock` for the duration of the clone.  Returns
+    /// `TableNotFound` when the table does not exist.
+    pub fn list_columns(&self, table: &str) -> Result<Vec<ColumnDef>> {
+        // 1. Read-lock the registry, clone the Arc (same pattern as `get`).
+        let table_state = {
+            let tables = self.tables.read().unwrap();
+            tables
+                .get(table)
+                .ok_or_else(|| BoogyError::TableNotFound(table.to_string()))?
+                .clone()
+        };
+
+        // 2. Read-lock the specific table and filter to non-dropped columns.
+        let state = table_state.read().unwrap();
+        let cols = state
+            .meta
+            .columns
+            .iter()
+            .filter(|c| !c.dropped)
+            .cloned()
+            .collect();
+        Ok(cols)
     }
 
     /// Update all rows matching filters. Returns number of rows updated.
@@ -3403,6 +3844,7 @@ impl<'a> AcidTransaction<'a> {
 
         let root_page = self.current_root(table, &state.meta);
         let col_names = state.meta.col_names.clone();
+        let col_defs = state.meta.col_defs.clone();
         drop(state);
 
         let result = self.with_guard(|guard| {
@@ -3411,7 +3853,7 @@ impl<'a> AcidTransaction<'a> {
         })?;
 
         match result {
-            Some(bytes) => Ok(Some(Row::from_raw(&bytes, col_names)?)),
+            Some(bytes) => Ok(Some(Row::from_raw(&bytes, col_names, col_defs)?)),
             None => Ok(None),
         }
     }
@@ -3599,6 +4041,7 @@ impl<'a> AcidTransaction<'a> {
 
         let root_page = self.current_root(table, &state.meta);
         let col_names = state.meta.col_names.clone();
+        let col_defs = state.meta.col_defs.clone();
         let col_name_to_id = state.meta.col_name_to_id.clone();
         drop(state);
 
@@ -3610,10 +4053,24 @@ impl<'a> AcidTransaction<'a> {
         // Filter in memory (full predicate: filters AND or-of-groups).
         // This path always scans every row, so there are no index/single-filter
         // fast paths to gate — `row_passes` simply incorporates or_groups.
+        //
+        // Short-circuit: when no sort is requested and we're not computing a total,
+        // stop collecting once we have offset+limit matches.
+        let can_short_circuit = opts.sort.is_empty() && !opts.include_total;
+        let stop_after: Option<usize> = if can_short_circuit {
+            opts.limit.map(|l| opts.offset.unwrap_or(0) as usize + l as usize)
+        } else {
+            None
+        };
         let mut matching = Vec::new();
         for (_, bytes) in &all {
-            if row_passes(&col_name_to_id, bytes, &opts.filters, &opts.or_groups) {
-                matching.push(Row::from_raw(bytes, col_names.clone())?);
+            if let Some(cap) = stop_after {
+                if matching.len() >= cap {
+                    break;
+                }
+            }
+            if row_passes(&col_name_to_id, &col_defs, bytes, &opts.filters, &opts.or_groups) {
+                matching.push(Row::from_raw(bytes, col_names.clone(), col_defs.clone())?);
             }
         }
 
@@ -3681,6 +4138,7 @@ impl<'a> AcidTransaction<'a> {
 
         let root_page = self.current_root(table, &state.meta);
         let col_names = state.meta.col_names.clone();
+        let col_defs = state.meta.col_defs.clone();
         let col_name_to_id = state.meta.col_name_to_id.clone();
 
         match order.kind {
@@ -3715,7 +4173,7 @@ impl<'a> AcidTransaction<'a> {
                                 last_rowid = results.last().map(|(rid, _)| *rid);
                                 break;
                             }
-                            if row_passes(&col_name_to_id, bytes, filters, or_groups) {
+                            if row_passes(&col_name_to_id, &col_defs, bytes, filters, or_groups) {
                                 results.push((*id, bytes.clone()));
                             }
                         }
@@ -3734,7 +4192,7 @@ impl<'a> AcidTransaction<'a> {
                                 last_rowid = results.last().map(|(rid, _)| *rid);
                                 break;
                             }
-                            if row_passes(&col_name_to_id, bytes, filters, or_groups) {
+                            if row_passes(&col_name_to_id, &col_defs, bytes, filters, or_groups) {
                                 results.push((*id, bytes.clone()));
                             }
                         }
@@ -3745,7 +4203,7 @@ impl<'a> AcidTransaction<'a> {
 
                 let mut rows = Vec::with_capacity(results.len());
                 for (_, bytes) in &results {
-                    rows.push(Row::from_raw(bytes, col_names.clone())?);
+                    rows.push(Row::from_raw(bytes, col_names.clone(), col_defs.clone())?);
                 }
                 let last_key = last_rowid.map(|rowid| ScanKey { bytes: Vec::new(), rowid });
                 Ok(ScanBatch { rows, last_key })
@@ -3799,7 +4257,7 @@ impl<'a> AcidTransaction<'a> {
                 // For each row: apply predicate, encode the index key.
                 let mut keyed: Vec<(Vec<u8>, Vec<u8>)> = Vec::new(); // (encoded_key, row_bytes)
                 for (_, bytes) in &all {
-                    if !row_passes(&col_name_to_id, &bytes, filters, or_groups) {
+                    if !row_passes(&col_name_to_id, &col_defs, &bytes, filters, or_groups) {
                         continue;
                     }
                     let rowid = crate::row::extract_id(bytes)?;
@@ -3855,7 +4313,7 @@ impl<'a> AcidTransaction<'a> {
                     }
                     if rows.len() < limit_usize {
                         // Collect this row and record it as the current last key.
-                        rows.push(Row::from_raw(bytes, col_names.clone())?);
+                        rows.push(Row::from_raw(bytes, col_names.clone(), col_defs.clone())?);
                         last_key = Some(ScanKey {
                             bytes: key.clone(),
                             rowid: rowid_from_index_key(key),
@@ -3911,6 +4369,7 @@ impl<'a> AcidTransaction<'a> {
         }
 
         let col_name_to_id = state.meta.col_name_to_id.clone();
+        let col_defs = state.meta.col_defs.clone();
         drop(state);
 
         let all = self.with_guard(|guard| {
@@ -3920,7 +4379,7 @@ impl<'a> AcidTransaction<'a> {
 
         let mut count = 0u64;
         for (_, bytes) in &all {
-            if row_passes(&col_name_to_id, bytes, filters, or_groups) {
+            if row_passes(&col_name_to_id, &col_defs, bytes, filters, or_groups) {
                 count += 1;
             }
         }
@@ -3953,6 +4412,7 @@ impl<'a> AcidTransaction<'a> {
 
         let root_page = self.current_root(table, &state.meta);
         let col_name_to_id = state.meta.col_name_to_id.clone();
+        let col_defs = state.meta.col_defs.clone();
         drop(state);
 
         let all = self.with_guard(|guard| {
@@ -3963,20 +4423,7 @@ impl<'a> AcidTransaction<'a> {
         let matching_ids: Vec<u64> = all
             .iter()
             .filter(|(_, bytes)| {
-                filters.iter().all(|f| {
-                    if let Some(col_id) = col_name_to_id.get(&f.column).copied() {
-                        if let Ok(Some(raw)) = row::extract_column_raw(bytes, col_id) {
-                            if let Some(result) = crate::filter::eval_filter_raw_full(raw, f) {
-                                return result;
-                            }
-                        }
-                        let col_val = row::extract_column(bytes, col_id).ok().flatten();
-                        let actual = col_val.as_ref().unwrap_or(&Value::Null);
-                        f.matches(actual)
-                    } else {
-                        f.matches(&Value::Null)
-                    }
-                })
+                filters.iter().all(|f| filter_matches_row(&col_name_to_id, &col_defs, bytes, f))
             })
             .map(|(id, _)| *id)
             .collect();
@@ -3998,6 +4445,7 @@ impl<'a> AcidTransaction<'a> {
 
         let root_page = self.current_root(table, &state.meta);
         let col_name_to_id = state.meta.col_name_to_id.clone();
+        let col_defs = state.meta.col_defs.clone();
         drop(state);
 
         let all = self.with_guard(|guard| {
@@ -4008,20 +4456,7 @@ impl<'a> AcidTransaction<'a> {
         let matching_ids: Vec<u64> = all
             .iter()
             .filter(|(_, bytes)| {
-                filters.iter().all(|f| {
-                    if let Some(col_id) = col_name_to_id.get(&f.column).copied() {
-                        if let Ok(Some(raw)) = row::extract_column_raw(bytes, col_id) {
-                            if let Some(result) = crate::filter::eval_filter_raw_full(raw, f) {
-                                return result;
-                            }
-                        }
-                        let col_val = row::extract_column(bytes, col_id).ok().flatten();
-                        let actual = col_val.as_ref().unwrap_or(&Value::Null);
-                        f.matches(actual)
-                    } else {
-                        f.matches(&Value::Null)
-                    }
-                })
+                filters.iter().all(|f| filter_matches_row(&col_name_to_id, &col_defs, bytes, f))
             })
             .map(|(id, _)| *id)
             .collect();
@@ -5481,4 +5916,141 @@ mod tests {
         let r = db.upsert_increment("t", &[("k", "x".into())], "n", Value::Text("nope".into()), &[]);
         assert!(matches!(r, Err(BoogyError::SchemaMismatch(_))));
     }
+
+    // --- Task 2: versioned system-page column format tests ---
+
+    /// Round-trip: columns with `dropped=true` and `default=Some(...)` survive
+    /// serialize → write → reopen → deserialize without loss.
+    #[test]
+    fn test_sys_page_column_default_and_dropped_round_trip() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.boogy");
+
+        // Create table with one "normal" column, one with a default, one marked dropped.
+        // We set dropped manually on the ColumnDef (Task 3+ ops will set it via API;
+        // here we exercise the ser/de path directly).
+        {
+            let db = BoogyDb::open(&path).unwrap();
+            let cols = vec![
+                ColumnDef::new("id", Type::Integer),
+                ColumnDef::new("note", Type::Text).default(Value::Text("hello".into())),
+                {
+                    let mut c = ColumnDef::new("gone", Type::Boolean);
+                    c.dropped = true;
+                    c
+                },
+                ColumnDef::new("score", Type::Real).default(Value::Real(3.14)),
+            ];
+            db.create_table("t", &cols).unwrap();
+            // Verify the schema was stored in memory correctly before reopen.
+            let tables = db.tables.read().unwrap();
+            let state = tables.get("t").unwrap().read().unwrap();
+            assert_eq!(state.meta.columns.len(), 4);
+            assert_eq!(state.meta.columns[1].default, Some(Value::Text("hello".into())));
+            assert!(!state.meta.columns[1].dropped);
+            assert!(state.meta.columns[2].dropped);
+            assert_eq!(state.meta.columns[3].default, Some(Value::Real(3.14)));
+        }
+
+        // Reopen and verify the fields survived the system-page round-trip.
+        {
+            let db = BoogyDb::open(&path).unwrap();
+            let tables = db.tables.read().unwrap();
+            let state = tables.get("t").unwrap().read().unwrap();
+            let cols = &state.meta.columns;
+
+            assert_eq!(cols.len(), 4);
+
+            // col 0: plain integer, no default, not dropped
+            assert_eq!(cols[0].name, "id");
+            assert_eq!(cols[0].default, None);
+            assert!(!cols[0].dropped);
+
+            // col 1: text with default "hello"
+            assert_eq!(cols[1].name, "note");
+            assert_eq!(cols[1].default, Some(Value::Text("hello".into())));
+            assert!(!cols[1].dropped);
+
+            // col 2: dropped
+            assert_eq!(cols[2].name, "gone");
+            assert!(cols[2].dropped);
+            assert_eq!(cols[2].default, None);
+
+            // col 3: real with default 3.14
+            assert_eq!(cols[3].name, "score");
+            assert_eq!(cols[3].default, Some(Value::Real(3.14)));
+            assert!(!cols[3].dropped);
+        }
+    }
+
+    /// All Value variants can round-trip as column defaults through the system page.
+    #[test]
+    fn test_sys_page_column_default_all_value_types() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.boogy");
+
+        {
+            let db = BoogyDb::open(&path).unwrap();
+            let cols = vec![
+                ColumnDef::new("a", Type::Integer).default(Value::Integer(-42)),
+                ColumnDef::new("b", Type::Text).default(Value::Text("world".into())),
+                ColumnDef::new("c", Type::Real).default(Value::Real(-1.5)),
+                ColumnDef::new("d", Type::Boolean).default(Value::Boolean(true)),
+                ColumnDef::new("e", Type::Blob).default(Value::Blob(vec![0xDE, 0xAD, 0xBE, 0xEF])),
+                ColumnDef::new("f", Type::Integer).default(Value::Null),
+            ];
+            db.create_table("all_defaults", &cols).unwrap();
+        }
+
+        {
+            let db = BoogyDb::open(&path).unwrap();
+            let tables = db.tables.read().unwrap();
+            let state = tables.get("all_defaults").unwrap().read().unwrap();
+            let cols = &state.meta.columns;
+
+            assert_eq!(cols[0].default, Some(Value::Integer(-42)));
+            assert_eq!(cols[1].default, Some(Value::Text("world".into())));
+            assert_eq!(cols[2].default, Some(Value::Real(-1.5)));
+            assert_eq!(cols[3].default, Some(Value::Boolean(true)));
+            assert_eq!(cols[4].default, Some(Value::Blob(vec![0xDE, 0xAD, 0xBE, 0xEF])));
+            assert_eq!(cols[5].default, Some(Value::Null));
+        }
+    }
+
+    /// Round-trip through reopen: create_table + insert + reopen must preserve data.
+    /// Verifies the system-page ser/de path end-to-end on a normal workflow.
+    #[test]
+    fn test_sys_page_normal_workflow_reopen() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.boogy");
+
+        {
+            let db = BoogyDb::open(&path).unwrap();
+            db.create_table("users", &[
+                ColumnDef::new("name", Type::Text),
+                ColumnDef::new("age", Type::Integer),
+            ]).unwrap();
+            db.insert("users", &[
+                ("name", Value::Text("alice".into())),
+                ("age", Value::Integer(30)),
+            ]).unwrap();
+        }
+
+        {
+            let db = BoogyDb::open(&path).unwrap();
+            let row = db.find("users", crate::filter::FindOptions::default()).unwrap();
+            assert_eq!(row.rows.len(), 1);
+            assert_eq!(row.rows[0].get("name"), Some(Value::Text("alice".into())));
+            assert_eq!(row.rows[0].get("age"), Some(Value::Integer(30)));
+
+            // Verify that the re-opened columns have no stale dropped/default
+            let tables = db.tables.read().unwrap();
+            let state = tables.get("users").unwrap().read().unwrap();
+            assert!(!state.meta.columns[0].dropped);
+            assert_eq!(state.meta.columns[0].default, None);
+            assert!(!state.meta.columns[1].dropped);
+            assert_eq!(state.meta.columns[1].default, None);
+        }
+    }
+
 }

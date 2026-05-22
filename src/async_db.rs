@@ -159,6 +159,27 @@ impl AsyncBoogyDb {
         self.inner.upsert_increment(table, key, counter, delta, set)
     }
 
+    pub async fn add_column(&self, table: &str, column: ColumnDef) -> Result<()> {
+        let _w = self.write_gate.lock().await;
+        self.inner.add_column(table, column)
+    }
+
+    pub async fn rename_column(&self, table: &str, old: &str, new: &str) -> Result<()> {
+        let _w = self.write_gate.lock().await;
+        self.inner.rename_column(table, old, new)
+    }
+
+    pub async fn drop_column(&self, table: &str, name: &str) -> Result<()> {
+        let _w = self.write_gate.lock().await;
+        self.inner.drop_column(table, name)
+    }
+
+    /// Return the live (non-dropped) columns for `table`, in schema order.
+    /// This is a read — no write-gate acquired.
+    pub async fn list_columns(&self, table: &str) -> Result<Vec<ColumnDef>> {
+        self.inner.list_columns(table)
+    }
+
     pub async fn create_index(
         &self,
         table: &str,

@@ -25,8 +25,16 @@ pub struct TableMeta {
     pub columns: Vec<ColumnDef>,
     /// Column name -> column ID mapping.
     pub col_name_to_id: HashMap<String, u16>,
-    /// Shared column names for lazy Row decoding.
+    /// Shared column names for lazy Row decoding (positional, indexed by col_id).
     pub col_names: Arc<Vec<String>>,
+    /// Shared column definitions for default-at-read (positional, indexed by col_id,
+    /// in lockstep with `col_names`).
+    ///
+    /// INVARIANT: this slice is positional — `col_defs[col_id]` must be the definition
+    /// for the column whose ID is `col_id`.  Any operation that mutates `columns`
+    /// (e.g. `add_column`, and future `rename_column`/`drop_column`) MUST rebuild
+    /// this field immediately via `Arc::new(self.columns.clone())` to keep them in sync.
+    pub col_defs: Arc<Vec<ColumnDef>>,
     /// B+ tree root page number.
     pub root_page: u32,
     /// Number of rows (maintained by insert/delete).
@@ -43,18 +51,24 @@ pub struct TableMeta {
 
 impl TableMeta {
     pub fn new(name: String, table_id: u32, columns: Vec<ColumnDef>, root_page: u32) -> Self {
+        // Only insert LIVE (non-dropped) columns into the name → id map.
+        // Dropped columns keep their slot (positional col_id) but must not
+        // appear in the name map — their name is freed so it can be reused.
         let col_name_to_id: HashMap<String, u16> = columns
             .iter()
             .enumerate()
+            .filter(|(_, c)| !c.dropped)
             .map(|(i, c)| (c.name.clone(), i as u16))
             .collect();
         let col_names = Arc::new(columns.iter().map(|c| c.name.clone()).collect());
+        let col_defs = Arc::new(columns.clone());
         Self {
             name,
             table_id,
             columns,
             col_name_to_id,
             col_names,
+            col_defs,
             root_page,
             row_count: 0,
             next_rowid: 1,
@@ -78,6 +92,54 @@ impl TableMeta {
         self.indexes
             .iter()
             .find(|idx| idx.columns.first().map(|c| c == column).unwrap_or(false))
+    }
+
+    /// Append a new column. Its col_id is the new last index (vec position).
+    /// Caller has already validated name-uniqueness and NOT-NULL-needs-default.
+    pub fn add_column(&mut self, col: ColumnDef) {
+        let col_id = self.columns.len() as u16;
+        self.col_name_to_id.insert(col.name.clone(), col_id);
+        // col_names is positional (indexed by col_id) — push in lockstep.
+        let mut names = (*self.col_names).clone();
+        names.push(col.name.clone());
+        self.col_names = std::sync::Arc::new(names);
+        self.columns.push(col);
+        // col_defs is also positional — rebuild from columns to stay in sync.
+        self.col_defs = std::sync::Arc::new(self.columns.clone());
+    }
+
+    /// Tombstone a live column: mark it dropped, free its name, keep its slot.
+    ///
+    /// The `col_id` (vec position) is NEVER reused — later `add_column` calls will
+    /// append a new slot.  Readers already skip dropped columns via `col_defs`.
+    /// Returns `false` if `name` isn't a live column (already dropped or unknown).
+    pub fn drop_column(&mut self, name: &str) -> bool {
+        let Some(col_id) = self.col_name_to_id.get(name).copied() else {
+            return false;
+        };
+        self.col_name_to_id.remove(name);
+        self.columns[col_id as usize].dropped = true;
+        // col_names keeps its slot (positional); readers skip dropped cols via col_defs.
+        // col_defs is positional — rebuild from columns to stay in sync.
+        self.col_defs = std::sync::Arc::new(self.columns.clone());
+        true
+    }
+
+    /// Rename a live column, keeping its col_id (so row data is preserved).
+    /// Returns the col_id, or None if `old` isn't a live column (not in
+    /// col_name_to_id — either missing or already dropped).
+    pub fn rename_column(&mut self, old: &str, new: &str) -> Option<u16> {
+        let col_id = *self.col_name_to_id.get(old)?;
+        self.col_name_to_id.remove(old);
+        self.col_name_to_id.insert(new.to_string(), col_id);
+        self.columns[col_id as usize].name = new.to_string();
+        // col_names is positional — update in place (same slot, new string).
+        let mut names = (*self.col_names).clone();
+        names[col_id as usize] = new.to_string();
+        self.col_names = std::sync::Arc::new(names);
+        // col_defs is positional — rebuild from columns to stay in sync.
+        self.col_defs = std::sync::Arc::new(self.columns.clone());
+        Some(col_id)
     }
 }
 
