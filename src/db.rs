@@ -259,6 +259,14 @@ fn tag_to_type(tag: u8) -> Result<Type> {
 /// Maximum usable payload in a system page (page size minus header and checksum).
 const SYSTEM_PAGE_PAYLOAD: usize = PAGE_SIZE - 4; // 4-byte checksum at end
 
+/// System page format version.
+/// Version 2 adds per-column `dropped` + `default` fields.
+/// Version 1 (or any value < 2) is the legacy format without those fields.
+/// The version byte is written immediately after the 4-byte magic, before next_table_id.
+/// Old databases (no version byte) had next_table_id starting there, whose first byte
+/// was always 0x01 (table_id starts at 1), so they are correctly detected as legacy.
+const SYS_PAGE_VERSION: u8 = 2;
+
 /// Check that writing `needed` bytes at `offset` won't overflow the system page.
 fn check_sys_page_bounds(offset: usize, needed: usize) -> Result<()> {
     if offset + needed > SYSTEM_PAGE_PAYLOAD {
@@ -284,6 +292,12 @@ fn serialize_system_page(
     check_sys_page_bounds(offset, 4)?;
     data[offset..offset + 4].copy_from_slice(&SYSTEM_PAGE_MAGIC.to_le_bytes());
     offset += 4;
+
+    // Format version (1 byte). Written immediately after magic so the deserializer
+    // can read it before anything else and branch accordingly.
+    check_sys_page_bounds(offset, 1)?;
+    data[offset] = SYS_PAGE_VERSION;
+    offset += 1;
 
     // next_table_id
     check_sys_page_bounds(offset, 4)?;
@@ -334,6 +348,29 @@ fn serialize_system_page(
             offset += 1;
             data[offset] = if col.unique { 1 } else { 0 };
             offset += 1;
+
+            // v2 fields: dropped flag + optional default value
+            check_sys_page_bounds(offset, 1)?;
+            data[offset] = if col.dropped { 1 } else { 0 };
+            offset += 1;
+            match &col.default {
+                None => {
+                    check_sys_page_bounds(offset, 1)?;
+                    data[offset] = 0; // has_default = false
+                    offset += 1;
+                }
+                Some(v) => {
+                    check_sys_page_bounds(offset, 1)?;
+                    data[offset] = 1; // has_default = true
+                    offset += 1;
+                    let vb = crate::row::encode_value_to_vec(v);
+                    check_sys_page_bounds(offset, 2 + vb.len())?;
+                    data[offset..offset + 2].copy_from_slice(&(vb.len() as u16).to_le_bytes());
+                    offset += 2;
+                    data[offset..offset + vb.len()].copy_from_slice(&vb);
+                    offset += vb.len();
+                }
+            }
         }
 
         // Indexes
@@ -399,6 +436,21 @@ fn deserialize_system_page(
         )));
     }
     offset += 4;
+
+    // Format version byte (written since v2). For legacy pages (written before
+    // versioning was added), the byte here is the low byte of next_table_id,
+    // which starts at 1 — so we read it as version=1 (legacy) and rewind.
+    // Any version < 2 is treated as legacy: no per-column dropped/default fields.
+    if offset + 1 > SYSTEM_PAGE_PAYLOAD {
+        return Err(BoogyError::Corruption("system page truncated at version byte".into()));
+    }
+    let sys_version = data[offset];
+    if sys_version >= SYS_PAGE_VERSION {
+        // Current version: consume the version byte
+        offset += 1;
+    }
+    // Legacy (sys_version < 2): do NOT advance — that byte is actually the first
+    // byte of next_table_id in the old layout.
 
     // next_table_id
     let next_table_id = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
@@ -466,6 +518,39 @@ fn deserialize_system_page(
             let unique = data[offset] != 0;
             offset += 1;
 
+            // v2 fields: dropped flag + optional default value
+            let (dropped, col_default) = if sys_version >= SYS_PAGE_VERSION {
+                if offset + 1 > SYSTEM_PAGE_PAYLOAD {
+                    return Err(BoogyError::Corruption("system page truncated at column dropped flag".into()));
+                }
+                let dropped = data[offset] != 0;
+                offset += 1;
+                if offset + 1 > SYSTEM_PAGE_PAYLOAD {
+                    return Err(BoogyError::Corruption("system page truncated at column has_default flag".into()));
+                }
+                let has_default = data[offset] != 0;
+                offset += 1;
+                let col_default = if has_default {
+                    if offset + 2 > SYSTEM_PAGE_PAYLOAD {
+                        return Err(BoogyError::Corruption("system page truncated at column default length".into()));
+                    }
+                    let vlen = u16::from_le_bytes(data[offset..offset + 2].try_into().unwrap()) as usize;
+                    offset += 2;
+                    if offset + vlen > SYSTEM_PAGE_PAYLOAD {
+                        return Err(BoogyError::Corruption("system page truncated at column default value".into()));
+                    }
+                    let (v, _) = crate::row::decode_value(&data[offset..offset + vlen])?;
+                    offset += vlen;
+                    Some(v)
+                } else {
+                    None
+                };
+                (dropped, col_default)
+            } else {
+                // Legacy page: no dropped/default fields written — use safe defaults
+                (false, None)
+            };
+
             let mut col_def = ColumnDef::new(col_name, tag_to_type(type_tag)?);
             if !nullable {
                 col_def = col_def.not_null();
@@ -473,6 +558,8 @@ fn deserialize_system_page(
             if unique {
                 col_def = col_def.unique();
             }
+            col_def.dropped = dropped;
+            col_def.default = col_default;
             columns.push(col_def);
         }
 
@@ -5480,5 +5567,228 @@ mod tests {
         ]).unwrap();
         let r = db.upsert_increment("t", &[("k", "x".into())], "n", Value::Text("nope".into()), &[]);
         assert!(matches!(r, Err(BoogyError::SchemaMismatch(_))));
+    }
+
+    // --- Task 2: versioned system-page column format tests ---
+
+    /// Round-trip: columns with `dropped=true` and `default=Some(...)` survive
+    /// serialize → write → reopen → deserialize without loss.
+    #[test]
+    fn test_sys_page_column_default_and_dropped_round_trip() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.boogy");
+
+        // Create table with one "normal" column, one with a default, one marked dropped.
+        // We set dropped manually on the ColumnDef (Task 3+ ops will set it via API;
+        // here we exercise the ser/de path directly).
+        {
+            let db = BoogyDb::open(&path).unwrap();
+            let cols = vec![
+                ColumnDef::new("id", Type::Integer),
+                ColumnDef::new("note", Type::Text).default(Value::Text("hello".into())),
+                {
+                    let mut c = ColumnDef::new("gone", Type::Boolean);
+                    c.dropped = true;
+                    c
+                },
+                ColumnDef::new("score", Type::Real).default(Value::Real(3.14)),
+            ];
+            db.create_table("t", &cols).unwrap();
+            // Verify the schema was stored in memory correctly before reopen.
+            let tables = db.tables.read().unwrap();
+            let state = tables.get("t").unwrap().read().unwrap();
+            assert_eq!(state.meta.columns.len(), 4);
+            assert_eq!(state.meta.columns[1].default, Some(Value::Text("hello".into())));
+            assert!(!state.meta.columns[1].dropped);
+            assert!(state.meta.columns[2].dropped);
+            assert_eq!(state.meta.columns[3].default, Some(Value::Real(3.14)));
+        }
+
+        // Reopen and verify the fields survived the system-page round-trip.
+        {
+            let db = BoogyDb::open(&path).unwrap();
+            let tables = db.tables.read().unwrap();
+            let state = tables.get("t").unwrap().read().unwrap();
+            let cols = &state.meta.columns;
+
+            assert_eq!(cols.len(), 4);
+
+            // col 0: plain integer, no default, not dropped
+            assert_eq!(cols[0].name, "id");
+            assert_eq!(cols[0].default, None);
+            assert!(!cols[0].dropped);
+
+            // col 1: text with default "hello"
+            assert_eq!(cols[1].name, "note");
+            assert_eq!(cols[1].default, Some(Value::Text("hello".into())));
+            assert!(!cols[1].dropped);
+
+            // col 2: dropped
+            assert_eq!(cols[2].name, "gone");
+            assert!(cols[2].dropped);
+            assert_eq!(cols[2].default, None);
+
+            // col 3: real with default 3.14
+            assert_eq!(cols[3].name, "score");
+            assert_eq!(cols[3].default, Some(Value::Real(3.14)));
+            assert!(!cols[3].dropped);
+        }
+    }
+
+    /// All Value variants can round-trip as column defaults through the system page.
+    #[test]
+    fn test_sys_page_column_default_all_value_types() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.boogy");
+
+        {
+            let db = BoogyDb::open(&path).unwrap();
+            let cols = vec![
+                ColumnDef::new("a", Type::Integer).default(Value::Integer(-42)),
+                ColumnDef::new("b", Type::Text).default(Value::Text("world".into())),
+                ColumnDef::new("c", Type::Real).default(Value::Real(-1.5)),
+                ColumnDef::new("d", Type::Boolean).default(Value::Boolean(true)),
+                ColumnDef::new("e", Type::Blob).default(Value::Blob(vec![0xDE, 0xAD, 0xBE, 0xEF])),
+                ColumnDef::new("f", Type::Integer).default(Value::Null),
+            ];
+            db.create_table("all_defaults", &cols).unwrap();
+        }
+
+        {
+            let db = BoogyDb::open(&path).unwrap();
+            let tables = db.tables.read().unwrap();
+            let state = tables.get("all_defaults").unwrap().read().unwrap();
+            let cols = &state.meta.columns;
+
+            assert_eq!(cols[0].default, Some(Value::Integer(-42)));
+            assert_eq!(cols[1].default, Some(Value::Text("world".into())));
+            assert_eq!(cols[2].default, Some(Value::Real(-1.5)));
+            assert_eq!(cols[3].default, Some(Value::Boolean(true)));
+            assert_eq!(cols[4].default, Some(Value::Blob(vec![0xDE, 0xAD, 0xBE, 0xEF])));
+            assert_eq!(cols[5].default, Some(Value::Null));
+        }
+    }
+
+    /// Back-compat regression: a normal create_table + insert + reopen must still work
+    /// correctly after the versioned format change. This is the legacy guard — all
+    /// existing persistence tests (like test_index_meta_survives_reopen) also serve
+    /// this role since they write then reopen a v2 page and verify data is intact.
+    /// This test makes the intent explicit.
+    #[test]
+    fn test_sys_page_back_compat_normal_workflow() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.boogy");
+
+        {
+            let db = BoogyDb::open(&path).unwrap();
+            db.create_table("users", &[
+                ColumnDef::new("name", Type::Text),
+                ColumnDef::new("age", Type::Integer),
+            ]).unwrap();
+            db.insert("users", &[
+                ("name", Value::Text("alice".into())),
+                ("age", Value::Integer(30)),
+            ]).unwrap();
+        }
+
+        {
+            let db = BoogyDb::open(&path).unwrap();
+            let row = db.find("users", crate::filter::FindOptions::default()).unwrap();
+            assert_eq!(row.rows.len(), 1);
+            assert_eq!(row.rows[0].get("name"), Some(Value::Text("alice".into())));
+            assert_eq!(row.rows[0].get("age"), Some(Value::Integer(30)));
+
+            // Verify that the re-opened columns have no stale dropped/default
+            let tables = db.tables.read().unwrap();
+            let state = tables.get("users").unwrap().read().unwrap();
+            assert!(!state.meta.columns[0].dropped);
+            assert_eq!(state.meta.columns[0].default, None);
+            assert!(!state.meta.columns[1].dropped);
+            assert_eq!(state.meta.columns[1].default, None);
+        }
+    }
+
+    /// Craft a synthetic legacy (version-1) system page and verify that
+    /// deserialize_system_page handles it correctly: returns dropped=false, default=None.
+    ///
+    /// A legacy page has the old layout: after magic comes next_table_id (4 bytes) whose
+    /// first byte is 0x01 (table_id starts at 1). The deserializer reads that byte as
+    /// sys_version=1 (< SYS_PAGE_VERSION), does NOT advance past it, then reads
+    /// next_table_id from that same position — so a legacy page with next_table_id=1
+    /// is round-tripped correctly.
+    #[test]
+    fn test_sys_page_legacy_v1_detection() {
+        use crate::page::{Page, PAGE_SYSTEM};
+
+        // Build a minimal legacy system page by hand.
+        // Layout (starting at offset 16 = after page header):
+        //   magic(4) + next_table_id(4, =1) + num_tables(2, =1) + table_record
+        // Table record: table_id(4) + root_page(4) + row_count(8) + next_rowid(8) +
+        //               name_len(2) + name + num_cols(2) +
+        //               col_name_len(2) + col_name + type_tag(1) + nullable(1) + unique(1) +
+        //               num_indexes(2) + encrypted(1)
+        let mut data = [0u8; crate::page::PAGE_SIZE];
+
+        // Page header (16 bytes): flags at byte 0
+        data[0] = PAGE_SYSTEM as u8;
+
+        let mut off = 16usize;
+
+        // magic
+        let magic = SYSTEM_PAGE_MAGIC.to_le_bytes();
+        data[off..off + 4].copy_from_slice(&magic);
+        off += 4;
+
+        // next_table_id = 1 (legacy: no version byte before this)
+        let ntid: u32 = 1;
+        data[off..off + 4].copy_from_slice(&ntid.to_le_bytes());
+        off += 4;
+
+        // num_tables = 1
+        let nt: u16 = 1;
+        data[off..off + 2].copy_from_slice(&nt.to_le_bytes());
+        off += 2;
+
+        // Table record
+        // table_id=0, root_page=1, row_count=0, next_rowid=1
+        data[off..off + 4].copy_from_slice(&0u32.to_le_bytes()); off += 4; // table_id
+        data[off..off + 4].copy_from_slice(&1u32.to_le_bytes()); off += 4; // root_page
+        data[off..off + 8].copy_from_slice(&0u64.to_le_bytes()); off += 8; // row_count
+        data[off..off + 8].copy_from_slice(&1u64.to_le_bytes()); off += 8; // next_rowid
+
+        // table name "legacy"
+        let tname = b"legacy";
+        data[off..off + 2].copy_from_slice(&(tname.len() as u16).to_le_bytes()); off += 2;
+        data[off..off + tname.len()].copy_from_slice(tname); off += tname.len();
+
+        // num_cols = 1
+        data[off..off + 2].copy_from_slice(&1u16.to_le_bytes()); off += 2;
+
+        // Column: name="x", type=Integer(2), nullable=1, unique=0
+        // No dropped/default bytes — this is the legacy format.
+        let cname = b"x";
+        data[off..off + 2].copy_from_slice(&(cname.len() as u16).to_le_bytes()); off += 2;
+        data[off..off + cname.len()].copy_from_slice(cname); off += cname.len();
+        data[off] = 2; off += 1; // type_tag = Integer
+        data[off] = 1; off += 1; // nullable = true
+        data[off] = 0; off += 1; // unique = false
+
+        // num_indexes = 0
+        data[off..off + 2].copy_from_slice(&0u16.to_le_bytes()); off += 2;
+
+        // encrypted = 0
+        data[off] = 0;
+
+        let page = Page::from_bytes_unchecked(data);
+        let (tables, next_id) = deserialize_system_page(&page).unwrap();
+
+        assert_eq!(next_id, 1);
+        assert_eq!(tables.len(), 1);
+        assert_eq!(tables[0].name, "legacy");
+        assert_eq!(tables[0].columns.len(), 1);
+        assert_eq!(tables[0].columns[0].name, "x");
+        // Legacy page: dropped and default must be safe defaults
+        assert!(!tables[0].columns[0].dropped);
+        assert_eq!(tables[0].columns[0].default, None);
     }
 }

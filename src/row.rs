@@ -311,7 +311,7 @@ pub fn extract_column(data: &[u8], target_col_id: u16) -> Result<Option<Value>> 
     Ok(None)
 }
 
-fn decode_value(data: &[u8]) -> Result<(Value, usize)> {
+pub(crate) fn decode_value(data: &[u8]) -> Result<(Value, usize)> {
     ensure_bytes(data, 0, 1)?;
     match data[0] {
         TAG_NULL => Ok((Value::Null, 1)),
