@@ -3645,6 +3645,234 @@ impl<'a> AcidTransaction<'a> {
         Ok(FindResult { rows, total })
     }
 
+    /// Resumable ordered cursor over the transaction overlay (read-your-writes).
+    ///
+    /// Produces the same result shape as [`BoogyDb::scan_batch`] but reads the
+    /// **tx-current roots** (including uncommitted writes staged in the
+    /// `private_dirty` overlay), so a cursor inside a transaction sees rows it
+    /// has inserted or mutated but not yet committed.
+    ///
+    /// Because `BTreeWriter::scan_all_w` (the only overlay-aware scan) does a
+    /// full leaf-chain walk without a seek, the after/limit windowing is applied
+    /// in memory — the same tradeoff `find` makes vs. the committed read path.
+    ///
+    /// `order`:
+    /// - [`ScanOrderKind::PrimaryKey`] — walks by rowid; `after.rowid` is the
+    ///   exclusive resume bound; `after.bytes` is ignored.
+    /// - [`ScanOrderKind::Index`] — walks in encoded-key order for the named
+    ///   index; `after.bytes` is the exclusive resume key (same encoding as
+    ///   [`BoogyDb::scan_batch`] produces).
+    pub fn scan_batch(
+        &mut self,
+        table: &str,
+        filters: &[Filter],
+        or_groups: &[Vec<Filter>],
+        order: ScanOrder,
+        after: Option<ScanKey>,
+        limit: u32,
+    ) -> Result<ScanBatch> {
+        if limit == 0 {
+            return Ok(ScanBatch { rows: Vec::new(), last_key: None });
+        }
+
+        let table_state = self.table_state(table)?;
+        let state = table_state.read().unwrap();
+        BoogyDb::check_table_accessible(&state.meta, table)?;
+
+        let root_page = self.current_root(table, &state.meta);
+        let col_names = state.meta.col_names.clone();
+        let col_name_to_id = state.meta.col_name_to_id.clone();
+
+        match order.kind {
+            ScanOrderKind::PrimaryKey => {
+                let after_rowid = after.as_ref().map(|k| k.rowid);
+                let limit_usize = limit as usize;
+
+                // Read all rows through the overlay (read-your-writes).
+                let all = self.with_guard(|guard| {
+                    let tree = BTreeWriter::new(guard, root_page);
+                    tree.scan_all_w()
+                })?;
+                // scan_all_w yields rows in Asc rowid order (B+ tree leaf walk
+                // is always left-to-right). Apply direction, after-bound, filter,
+                // and limit in memory.
+                use crate::filter::SortDir;
+                let mut results: Vec<(u64, Vec<u8>)> = Vec::new();
+                let mut last_rowid: Option<u64> = None;
+
+                match order.dir {
+                    SortDir::Asc => {
+                        for (id, bytes) in &all {
+                            // Exclusive lower bound.
+                            if let Some(rid) = after_rowid {
+                                if *id <= rid {
+                                    continue;
+                                }
+                            }
+                            if results.len() >= limit_usize {
+                                // Batch full and another candidate exists.
+                                last_rowid = results.last().map(|(rid, _)| *rid);
+                                break;
+                            }
+                            if row_passes(&col_name_to_id, bytes, filters, or_groups) {
+                                results.push((*id, bytes.clone()));
+                            }
+                        }
+                        if last_rowid.is_none() && results.len() >= limit_usize {
+                            last_rowid = results.last().map(|(rid, _)| *rid);
+                        }
+                    }
+                    SortDir::Desc => {
+                        for (id, bytes) in all.iter().rev() {
+                            // Exclusive upper bound.
+                            if let Some(rid) = after_rowid {
+                                if *id >= rid {
+                                    continue;
+                                }
+                            }
+                            if results.len() >= limit_usize {
+                                last_rowid = results.last().map(|(rid, _)| *rid);
+                                break;
+                            }
+                            if row_passes(&col_name_to_id, bytes, filters, or_groups) {
+                                results.push((*id, bytes.clone()));
+                            }
+                        }
+                        if last_rowid.is_none() && results.len() >= limit_usize {
+                            last_rowid = results.last().map(|(rid, _)| *rid);
+                        }
+                    }
+                }
+
+                let mut rows = Vec::with_capacity(results.len());
+                for (_, bytes) in &results {
+                    rows.push(Row::from_raw(bytes, col_names.clone())?);
+                }
+                let last_key = last_rowid.map(|rowid| ScanKey { bytes: Vec::new(), rowid });
+                Ok(ScanBatch { rows, last_key })
+            }
+
+            ScanOrderKind::Index(ref idx_name) => {
+                // Look up the index metadata.
+                let idx_meta = state
+                    .meta
+                    .find_index(idx_name)
+                    .ok_or_else(|| {
+                        BoogyError::SchemaMismatch(format!(
+                            "scan_batch: no index named '{idx_name}' on table '{table}'"
+                        ))
+                    })?
+                    .clone();
+
+                // Resolve column ids + types for the index key encoder.
+                let mut col_ids: Vec<u16> = Vec::with_capacity(idx_meta.columns.len());
+                let mut col_types: Vec<crate::value::Type> =
+                    Vec::with_capacity(idx_meta.columns.len());
+                for idx_col in &idx_meta.columns {
+                    match (
+                        state.meta.col_name_to_id.get(idx_col).copied(),
+                        state
+                            .meta
+                            .columns
+                            .iter()
+                            .find(|c| &c.name == idx_col)
+                            .map(|c| c.col_type),
+                    ) {
+                        (Some(cid), Some(ct)) => {
+                            col_ids.push(cid);
+                            col_types.push(ct);
+                        }
+                        _ => {
+                            return Err(BoogyError::SchemaMismatch(format!(
+                                "scan_batch(tx): index '{idx_name}' column '{idx_col}' not found on table '{table}'"
+                            )));
+                        }
+                    }
+                }
+                drop(state);
+
+                // Read all rows through the overlay.
+                let all = self.with_guard(|guard| {
+                    let tree = BTreeWriter::new(guard, root_page);
+                    tree.scan_all_w()
+                })?;
+
+                // For each row: apply predicate, encode the index key.
+                let mut keyed: Vec<(Vec<u8>, Vec<u8>)> = Vec::new(); // (encoded_key, row_bytes)
+                for (_, bytes) in &all {
+                    if !row_passes(&col_name_to_id, &bytes, filters, or_groups) {
+                        continue;
+                    }
+                    let rowid = crate::row::extract_id(bytes)?;
+                    // Encode index key (returns None if any indexed column is Null).
+                    let mut col_vals: Vec<crate::value::Value> =
+                        Vec::with_capacity(col_ids.len());
+                    for cid in &col_ids {
+                        col_vals.push(
+                            crate::row::extract_column(bytes, *cid)?.unwrap_or(Value::Null),
+                        );
+                    }
+                    if let Some(key) =
+                        index::encode_composite_index_key(&col_types, &col_vals, rowid)
+                    {
+                        keyed.push((key, bytes.clone()));
+                    }
+                    // Rows with Null in any index column are skipped (not indexed).
+                }
+
+                // Sort by encoded key (index order — same ordering as the index tree).
+                use crate::filter::SortDir;
+                keyed.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
+
+                let after_bytes: Option<&[u8]> = after.as_ref().map(|k| k.bytes.as_slice());
+                let limit_usize = limit as usize;
+                let mut rows = Vec::new();
+                let mut last_key: Option<ScanKey> = None;
+
+                let iter: Box<dyn Iterator<Item = &(Vec<u8>, Vec<u8>)>> = match order.dir {
+                    SortDir::Asc => Box::new(keyed.iter()),
+                    SortDir::Desc => Box::new(keyed.iter().rev()),
+                };
+
+                for (key, bytes) in iter {
+                    // Exclusive bound.
+                    if let Some(ab) = after_bytes {
+                        match order.dir {
+                            SortDir::Asc => {
+                                if key.as_slice() <= ab {
+                                    continue;
+                                }
+                            }
+                            SortDir::Desc => {
+                                if key.as_slice() >= ab {
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                    // Advance the cursor for EVERY key past the bound, even when
+                    // we've already filled the batch — matches non-tx semantics.
+                    last_key = Some(ScanKey {
+                        bytes: key.clone(),
+                        rowid: rowid_from_index_key(key),
+                    });
+                    if rows.len() < limit_usize {
+                        rows.push(Row::from_raw(bytes, col_names.clone())?);
+                    } else {
+                        // Batch full and another key exists ⇒ stop; last_key is set.
+                        break;
+                    }
+                }
+
+                // If fewer than limit rows were emitted, the scan is exhausted.
+                if rows.len() < limit_usize {
+                    last_key = None;
+                }
+                Ok(ScanBatch { rows, last_key })
+            }
+        }
+    }
+
     /// Count rows matching filters (scans all rows through dirty overlay).
     ///
     /// Back-compatible signature. For OR-of-AND counting use [`count_with`].
@@ -4007,6 +4235,24 @@ impl<'a> Transaction<'a> {
         match self {
             Transaction::Light(t) => t.db.delete_where(table, filters),
             Transaction::Acid(t) => t.delete_where(table, filters),
+        }
+    }
+
+    /// Resumable ordered cursor. For an ACID transaction this reads through
+    /// the tx overlay (read-your-writes). For a light transaction it reads
+    /// committed state (no overlay).
+    pub fn scan_batch(
+        &mut self,
+        table: &str,
+        filters: &[Filter],
+        or_groups: &[Vec<Filter>],
+        order: ScanOrder,
+        after: Option<ScanKey>,
+        limit: u32,
+    ) -> Result<ScanBatch> {
+        match self {
+            Transaction::Light(t) => t.db.scan_batch(table, filters, or_groups, order, after, limit),
+            Transaction::Acid(t) => t.scan_batch(table, filters, or_groups, order, after, limit),
         }
     }
 }
