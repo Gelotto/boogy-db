@@ -27,7 +27,13 @@ pub struct TableMeta {
     pub col_name_to_id: HashMap<String, u16>,
     /// Shared column names for lazy Row decoding (positional, indexed by col_id).
     pub col_names: Arc<Vec<String>>,
-    /// Shared column definitions for default-at-read (positional, in lockstep with col_names).
+    /// Shared column definitions for default-at-read (positional, indexed by col_id,
+    /// in lockstep with `col_names`).
+    ///
+    /// INVARIANT: this slice is positional — `col_defs[col_id]` must be the definition
+    /// for the column whose ID is `col_id`.  Any operation that mutates `columns`
+    /// (e.g. `add_column`, and future `rename_column`/`drop_column`) MUST rebuild
+    /// this field immediately via `Arc::new(self.columns.clone())` to keep them in sync.
     pub col_defs: Arc<Vec<ColumnDef>>,
     /// B+ tree root page number.
     pub root_page: u32,

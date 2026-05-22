@@ -26,9 +26,20 @@ use crate::vector::{VectorCollectionOptions, VectorResult, VectorSearchOptions};
 /// the column to a `Value` and `Filter::matches`. A filter on an unknown column
 /// matches against `Value::Null` (mirroring the historical inline logic).
 ///
+/// When a column is physically absent from the row (e.g. added via `add_column`
+/// after this row was written) AND the column has a stored `default`, the
+/// predicate matches against the default — exactly mirroring `Row::get()`'s
+/// "absent → `default` else Null" logic.  A column absent with no default is
+/// treated as `Null` (current behaviour; `IS NULL` matches).
+///
 /// This is the single home for the per-row predicate that used to be copy-pasted
 /// across the find/count scan branches.
-fn filter_matches_row(col_name_to_id: &HashMap<String, u16>, bytes: &[u8], f: &Filter) -> bool {
+fn filter_matches_row(
+    col_name_to_id: &HashMap<String, u16>,
+    col_defs: &[ColumnDef],
+    bytes: &[u8],
+    f: &Filter,
+) -> bool {
     if let Some(col_id) = col_name_to_id.get(&f.column).copied() {
         if let Ok(Some(raw)) = row::extract_column_raw(bytes, col_id) {
             if let Some(result) = crate::filter::eval_filter_raw_full(raw, f) {
@@ -36,8 +47,18 @@ fn filter_matches_row(col_name_to_id: &HashMap<String, u16>, bytes: &[u8], f: &F
             }
         }
         let col_val = row::extract_column(bytes, col_id).ok().flatten();
-        let actual = col_val.as_ref().unwrap_or(&Value::Null);
-        f.matches(actual)
+        match col_val {
+            Some(ref v) => f.matches(v),
+            None => {
+                // Column absent from this row — apply the stored default (if any),
+                // mirroring Row::get()'s semantics exactly.
+                let default_val = col_defs
+                    .get(col_id as usize)
+                    .and_then(|d| d.default.clone())
+                    .unwrap_or(Value::Null);
+                f.matches(&default_val)
+            }
+        }
     } else {
         f.matches(&Value::Null)
     }
@@ -49,17 +70,21 @@ fn filter_matches_row(col_name_to_id: &HashMap<String, u16>, bytes: &[u8], f: &F
 /// `filters` is the mandatory AND-prefix; `or_groups` adds an OR-of-AND clause
 /// when non-empty. With an empty `or_groups` this is exactly the historical
 /// `filters.iter().all(...)` behavior.
+///
+/// `col_defs` is the positional column-definition slice (from `TableMeta::col_defs`)
+/// used to resolve stored defaults for columns absent from older row bytes.
 fn row_passes(
     col_name_to_id: &HashMap<String, u16>,
+    col_defs: &[ColumnDef],
     bytes: &[u8],
     filters: &[Filter],
     or_groups: &[Vec<Filter>],
 ) -> bool {
-    filters.iter().all(|f| filter_matches_row(col_name_to_id, bytes, f))
+    filters.iter().all(|f| filter_matches_row(col_name_to_id, col_defs, bytes, f))
         && (or_groups.is_empty()
             || or_groups
                 .iter()
-                .any(|g| g.iter().all(|f| filter_matches_row(col_name_to_id, bytes, f))))
+                .any(|g| g.iter().all(|f| filter_matches_row(col_name_to_id, col_defs, bytes, f))))
 }
 
 /// Add a numeric `delta` to a `current` counter value, preserving type:
@@ -1541,7 +1566,7 @@ impl BoogyDb {
                     let passes = opts
                         .filters
                         .iter()
-                        .all(|f| filter_matches_row(&state.meta.col_name_to_id, bytes, f));
+                        .all(|f| filter_matches_row(&state.meta.col_name_to_id, &col_defs, bytes, f));
                     if passes {
                         rows.push(Row::from_raw(bytes, col_names.clone(), col_defs.clone())?);
                     }
@@ -1572,39 +1597,65 @@ impl BoogyDb {
         {
             // Single filter (non-IN): use scan_filtered (extract_column on raw bytes, no full decode)
             // Gated on empty or_groups: scan_filtered only applies the one filter.
+            //
+            // IMPORTANT: scan_filtered operates on raw bytes and treats absent columns as
+            // Null. If the column has a stored default (added via add_column), absent rows
+            // should match against the default, not Null. In that case we must bypass
+            // scan_filtered and fall through to the row_passes scan-all path below.
             let f = &opts.filters[0];
+            let col_has_default = state.meta.col_id(&f.column)
+                .and_then(|id| state.meta.col_defs.get(id as usize))
+                .map(|d| d.default.is_some())
+                .unwrap_or(false);
             if let Some(col_id) = state.meta.col_id(&f.column) {
-                let reader = BTreeReader::new(&self.file, state.meta.root_page);
-                // Only apply limit/offset if no sort (sorted results need full collection first)
-                let (lim, off) = if opts.sort.is_empty() {
-                    (opts.limit, opts.offset)
-                } else {
-                    (None, None)
-                };
-                // Compute stop_after for short-circuit
-                let stop = if can_short_circuit {
-                    match (opts.offset, opts.limit) {
-                        (_, Some(l)) => {
-                            let off = opts.offset.unwrap_or(0) as u64;
-                            Some(off + l as u64)
+                if col_has_default {
+                    // Column has a stored default — bypass scan_filtered (which treats
+                    // absent columns as Null) and use row_passes for correct semantics.
+                    let reader = BTreeReader::new(&self.file, state.meta.root_page);
+                    let all = reader.scan_all()?;
+                    let col_names = state.meta.col_names.clone();
+                    let col_defs = state.meta.col_defs.clone();
+                    let mut matching = Vec::new();
+                    for (_, bytes) in &all {
+                        if row_passes(&state.meta.col_name_to_id, &col_defs, bytes, &opts.filters, &opts.or_groups) {
+                            matching.push(Row::from_raw(bytes, col_names.clone(), col_defs.clone())?);
                         }
-                        _ => None,
                     }
+                    let total = if opts.include_total { Some(matching.len() as u64) } else { None };
+                    (matching, total)
                 } else {
-                    None
-                };
-                let (raw_rows, count) = reader.scan_filtered(col_id, f.op, &f.value, lim, off, stop)?;
-                let col_names = state.meta.col_names.clone();
-                let col_defs = state.meta.col_defs.clone();
-                let matching: Vec<Row> = raw_rows.iter()
-                    .map(|(_, bytes)| Row::from_raw(bytes, col_names.clone(), col_defs.clone()).unwrap())
-                    .collect();
-                let total = if opts.include_total { Some(count) } else { None };
-                // scan_filtered already handled limit/offset when sort is empty.
-                if opts.sort.is_empty() {
-                    pagination_applied = true;
+                    let reader = BTreeReader::new(&self.file, state.meta.root_page);
+                    // Only apply limit/offset if no sort (sorted results need full collection first)
+                    let (lim, off) = if opts.sort.is_empty() {
+                        (opts.limit, opts.offset)
+                    } else {
+                        (None, None)
+                    };
+                    // Compute stop_after for short-circuit
+                    let stop = if can_short_circuit {
+                        match (opts.offset, opts.limit) {
+                            (_, Some(l)) => {
+                                let off = opts.offset.unwrap_or(0) as u64;
+                                Some(off + l as u64)
+                            }
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    };
+                    let (raw_rows, count) = reader.scan_filtered(col_id, f.op, &f.value, lim, off, stop)?;
+                    let col_names = state.meta.col_names.clone();
+                    let col_defs = state.meta.col_defs.clone();
+                    let matching: Vec<Row> = raw_rows.iter()
+                        .map(|(_, bytes)| Row::from_raw(bytes, col_names.clone(), col_defs.clone()).unwrap())
+                        .collect();
+                    let total = if opts.include_total { Some(count) } else { None };
+                    // scan_filtered already handled limit/offset when sort is empty.
+                    if opts.sort.is_empty() {
+                        pagination_applied = true;
+                    }
+                    (matching, total)
                 }
-                (matching, total)
             } else {
                 // Column not found -- no matches
                 let total = if opts.include_total { Some(0) } else { None };
@@ -1632,7 +1683,7 @@ impl BoogyDb {
             let col_defs = state.meta.col_defs.clone();
             let mut matching = Vec::new();
             for (_, bytes) in &all {
-                if row_passes(&state.meta.col_name_to_id, bytes, &opts.filters, &opts.or_groups) {
+                if row_passes(&state.meta.col_name_to_id, &col_defs, bytes, &opts.filters, &opts.or_groups) {
                     matching.push(Row::from_raw(bytes, col_names.clone(), col_defs.clone())?);
                 }
             }
@@ -1730,7 +1781,7 @@ impl BoogyDb {
                 let after_rowid = after.as_ref().map(|k| k.rowid);
                 let reader = BTreeReader::new(&self.file, state.meta.root_page);
                 let (raw, last_rowid) = reader.scan_from(after_rowid, order.dir, limit, |bytes| {
-                    row_passes(col_name_to_id, bytes, filters, or_groups)
+                    row_passes(col_name_to_id, &col_defs, bytes, filters, or_groups)
                 })?;
                 let mut rows = Vec::with_capacity(raw.len());
                 for (_, bytes) in &raw {
@@ -1765,7 +1816,7 @@ impl BoogyDb {
                     // exclusive regardless of filter outcome.
                     last_key = Some(ScanKey { bytes: key.clone(), rowid });
                     if let Some(bytes) = btree_reader.search(rowid)? {
-                        if row_passes(col_name_to_id, &bytes, filters, or_groups) {
+                        if row_passes(col_name_to_id, &col_defs, &bytes, filters, or_groups) {
                             rows.push(Row::from_raw(&bytes, col_names.clone(), col_defs.clone())?);
                         }
                     }
@@ -1835,13 +1886,22 @@ impl BoogyDb {
             }
 
             // Single filter (non-IN): use count_filtered (extract_column on raw bytes)
+            // IMPORTANT: count_filtered treats absent columns as Null; bypass it when
+            // the column has a stored default so absent rows are matched correctly.
             if filters.len() == 1 && filters[0].op != FilterOp::In {
                 let f = &filters[0];
-                if let Some(col_id) = state.meta.col_id(&f.column) {
-                    let reader = BTreeReader::new(&self.file, state.meta.root_page);
-                    return reader.count_filtered(col_id, f.op, &f.value);
+                let col_has_default = state.meta.col_id(&f.column)
+                    .and_then(|id| state.meta.col_defs.get(id as usize))
+                    .map(|d| d.default.is_some())
+                    .unwrap_or(false);
+                if !col_has_default {
+                    if let Some(col_id) = state.meta.col_id(&f.column) {
+                        let reader = BTreeReader::new(&self.file, state.meta.root_page);
+                        return reader.count_filtered(col_id, f.op, &f.value);
+                    }
+                    return Ok(0);
                 }
-                return Ok(0);
+                // col_has_default: fall through to row_passes scan-all below.
             }
         }
 
@@ -1849,10 +1909,11 @@ impl BoogyDb {
         // scan all and apply the full predicate.
         let reader = BTreeReader::new(&self.file, state.meta.root_page);
         let all = reader.scan_all()?;
+        let col_defs = state.meta.col_defs.clone();
 
         let mut count = 0u64;
         for (_, bytes) in &all {
-            if row_passes(&state.meta.col_name_to_id, bytes, filters, or_groups) {
+            if row_passes(&state.meta.col_name_to_id, &col_defs, bytes, filters, or_groups) {
                 count += 1;
             }
         }
@@ -3793,7 +3854,7 @@ impl<'a> AcidTransaction<'a> {
         // fast paths to gate — `row_passes` simply incorporates or_groups.
         let mut matching = Vec::new();
         for (_, bytes) in &all {
-            if row_passes(&col_name_to_id, bytes, &opts.filters, &opts.or_groups) {
+            if row_passes(&col_name_to_id, &col_defs, bytes, &opts.filters, &opts.or_groups) {
                 matching.push(Row::from_raw(bytes, col_names.clone(), col_defs.clone())?);
             }
         }
@@ -3897,7 +3958,7 @@ impl<'a> AcidTransaction<'a> {
                                 last_rowid = results.last().map(|(rid, _)| *rid);
                                 break;
                             }
-                            if row_passes(&col_name_to_id, bytes, filters, or_groups) {
+                            if row_passes(&col_name_to_id, &col_defs, bytes, filters, or_groups) {
                                 results.push((*id, bytes.clone()));
                             }
                         }
@@ -3916,7 +3977,7 @@ impl<'a> AcidTransaction<'a> {
                                 last_rowid = results.last().map(|(rid, _)| *rid);
                                 break;
                             }
-                            if row_passes(&col_name_to_id, bytes, filters, or_groups) {
+                            if row_passes(&col_name_to_id, &col_defs, bytes, filters, or_groups) {
                                 results.push((*id, bytes.clone()));
                             }
                         }
@@ -3981,7 +4042,7 @@ impl<'a> AcidTransaction<'a> {
                 // For each row: apply predicate, encode the index key.
                 let mut keyed: Vec<(Vec<u8>, Vec<u8>)> = Vec::new(); // (encoded_key, row_bytes)
                 for (_, bytes) in &all {
-                    if !row_passes(&col_name_to_id, &bytes, filters, or_groups) {
+                    if !row_passes(&col_name_to_id, &col_defs, &bytes, filters, or_groups) {
                         continue;
                     }
                     let rowid = crate::row::extract_id(bytes)?;
@@ -4093,6 +4154,7 @@ impl<'a> AcidTransaction<'a> {
         }
 
         let col_name_to_id = state.meta.col_name_to_id.clone();
+        let col_defs = state.meta.col_defs.clone();
         drop(state);
 
         let all = self.with_guard(|guard| {
@@ -4102,7 +4164,7 @@ impl<'a> AcidTransaction<'a> {
 
         let mut count = 0u64;
         for (_, bytes) in &all {
-            if row_passes(&col_name_to_id, bytes, filters, or_groups) {
+            if row_passes(&col_name_to_id, &col_defs, bytes, filters, or_groups) {
                 count += 1;
             }
         }
@@ -4135,6 +4197,7 @@ impl<'a> AcidTransaction<'a> {
 
         let root_page = self.current_root(table, &state.meta);
         let col_name_to_id = state.meta.col_name_to_id.clone();
+        let col_defs = state.meta.col_defs.clone();
         drop(state);
 
         let all = self.with_guard(|guard| {
@@ -4145,20 +4208,7 @@ impl<'a> AcidTransaction<'a> {
         let matching_ids: Vec<u64> = all
             .iter()
             .filter(|(_, bytes)| {
-                filters.iter().all(|f| {
-                    if let Some(col_id) = col_name_to_id.get(&f.column).copied() {
-                        if let Ok(Some(raw)) = row::extract_column_raw(bytes, col_id) {
-                            if let Some(result) = crate::filter::eval_filter_raw_full(raw, f) {
-                                return result;
-                            }
-                        }
-                        let col_val = row::extract_column(bytes, col_id).ok().flatten();
-                        let actual = col_val.as_ref().unwrap_or(&Value::Null);
-                        f.matches(actual)
-                    } else {
-                        f.matches(&Value::Null)
-                    }
-                })
+                filters.iter().all(|f| filter_matches_row(&col_name_to_id, &col_defs, bytes, f))
             })
             .map(|(id, _)| *id)
             .collect();
@@ -4180,6 +4230,7 @@ impl<'a> AcidTransaction<'a> {
 
         let root_page = self.current_root(table, &state.meta);
         let col_name_to_id = state.meta.col_name_to_id.clone();
+        let col_defs = state.meta.col_defs.clone();
         drop(state);
 
         let all = self.with_guard(|guard| {
@@ -4190,20 +4241,7 @@ impl<'a> AcidTransaction<'a> {
         let matching_ids: Vec<u64> = all
             .iter()
             .filter(|(_, bytes)| {
-                filters.iter().all(|f| {
-                    if let Some(col_id) = col_name_to_id.get(&f.column).copied() {
-                        if let Ok(Some(raw)) = row::extract_column_raw(bytes, col_id) {
-                            if let Some(result) = crate::filter::eval_filter_raw_full(raw, f) {
-                                return result;
-                            }
-                        }
-                        let col_val = row::extract_column(bytes, col_id).ok().flatten();
-                        let actual = col_val.as_ref().unwrap_or(&Value::Null);
-                        f.matches(actual)
-                    } else {
-                        f.matches(&Value::Null)
-                    }
-                })
+                filters.iter().all(|f| filter_matches_row(&col_name_to_id, &col_defs, bytes, f))
             })
             .map(|(id, _)| *id)
             .collect();
