@@ -12,6 +12,8 @@ use crate::error::Result;
 use crate::filter::{Filter, FindOptions, FindResult};
 use crate::value::{ColumnDef, Value};
 
+use tokio::sync::Mutex as AsyncMutex;
+
 /// Async wrapper around [`BoogyDb`]. All methods delegate directly
 /// to the synchronous implementation with zero overhead.
 ///
@@ -22,12 +24,19 @@ use crate::value::{ColumnDef, Value};
 #[derive(Clone)]
 pub struct AsyncBoogyDb {
     inner: Arc<BoogyDb>,
+    /// Serializes all async write operations. A held interactive write-tx
+    /// acquires this for its entire lifetime; non-tx writes hold it only
+    /// for the duration of the call. Reads are never gated.
+    write_gate: Arc<AsyncMutex<()>>,
 }
 
 impl AsyncBoogyDb {
     pub async fn open(path: impl AsRef<Path>) -> Result<Self> {
         let db = BoogyDb::open(path)?;
-        Ok(Self { inner: Arc::new(db) })
+        Ok(Self {
+            inner: Arc::new(db),
+            write_gate: Arc::new(AsyncMutex::new(())),
+        })
     }
 
     pub fn set_durability(&self, d: Durability) {
@@ -39,6 +48,7 @@ impl AsyncBoogyDb {
     }
 
     pub async fn create_table(&self, name: &str, columns: &[ColumnDef]) -> Result<()> {
+        let _w = self.write_gate.lock().await;
         self.inner.create_table(name, columns)
     }
 
@@ -48,18 +58,22 @@ impl AsyncBoogyDb {
         columns: &[ColumnDef],
         key: &[u8; 32],
     ) -> Result<()> {
+        let _w = self.write_gate.lock().await;
         self.inner.create_table_encrypted(name, columns, key)
     }
 
     pub async fn unlock_table(&self, name: &str, key: &[u8; 32]) -> Result<()> {
+        let _w = self.write_gate.lock().await;
         self.inner.unlock_table(name, key)
     }
 
     pub async fn drop_table(&self, name: &str) -> Result<()> {
+        let _w = self.write_gate.lock().await;
         self.inner.drop_table(name)
     }
 
     pub async fn insert(&self, table: &str, data: &[(&str, Value)]) -> Result<u64> {
+        let _w = self.write_gate.lock().await;
         self.inner.insert(table, data)
     }
 
@@ -69,6 +83,7 @@ impl AsyncBoogyDb {
         rowid: u64,
         data: &[(&str, Value)],
     ) -> Result<()> {
+        let _w = self.write_gate.lock().await;
         self.inner.insert_with_id(table, rowid, data)
     }
 
@@ -82,10 +97,12 @@ impl AsyncBoogyDb {
         id: u64,
         fields: &[(&str, Value)],
     ) -> Result<bool> {
+        let _w = self.write_gate.lock().await;
         self.inner.update(table, id, fields)
     }
 
     pub async fn delete(&self, table: &str, id: u64) -> Result<bool> {
+        let _w = self.write_gate.lock().await;
         self.inner.delete(table, id)
     }
 
@@ -111,6 +128,7 @@ impl AsyncBoogyDb {
         table: &str,
         rows: &[Vec<(&str, Value)>],
     ) -> Result<Vec<u64>> {
+        let _w = self.write_gate.lock().await;
         self.inner.insert_many(table, rows)
     }
 
@@ -120,11 +138,25 @@ impl AsyncBoogyDb {
         filters: &[Filter],
         fields: &[(&str, Value)],
     ) -> Result<u64> {
+        let _w = self.write_gate.lock().await;
         self.inner.update_where(table, filters, fields)
     }
 
     pub async fn delete_where(&self, table: &str, filters: &[Filter]) -> Result<u64> {
+        let _w = self.write_gate.lock().await;
         self.inner.delete_where(table, filters)
+    }
+
+    pub async fn upsert_increment(
+        &self,
+        table: &str,
+        key: &[(&str, Value)],
+        counter: &str,
+        delta: Value,
+        set: &[(&str, Value)],
+    ) -> Result<u64> {
+        let _w = self.write_gate.lock().await;
+        self.inner.upsert_increment(table, key, counter, delta, set)
     }
 
     pub async fn create_index(
@@ -133,10 +165,12 @@ impl AsyncBoogyDb {
         index_name: &str,
         column: &str,
     ) -> Result<()> {
+        let _w = self.write_gate.lock().await;
         self.inner.create_index(table, index_name, column)
     }
 
     pub async fn drop_index(&self, table: &str, index_name: &str) -> Result<()> {
+        let _w = self.write_gate.lock().await;
         self.inner.drop_index(table, index_name)
     }
 
@@ -242,34 +276,40 @@ impl AsyncBoogyDb {
         name: &str,
         options: &crate::vector::VectorCollectionOptions,
     ) -> Result<()> {
+        let _w = self.write_gate.lock().await;
         self.inner.create_vector_collection(table, name, options)
     }
 
     pub async fn drop_vector_collection(&self, table: &str, name: &str) -> Result<()> {
+        let _w = self.write_gate.lock().await;
         self.inner.drop_vector_collection(table, name)
     }
 
     pub async fn vector_insert(
         &self, table: &str, collection: &str, rowid: u64, vector: &[f32],
     ) -> Result<()> {
+        let _w = self.write_gate.lock().await;
         self.inner.vector_insert(table, collection, rowid, vector)
     }
 
     pub async fn vector_insert_batch(
         &self, table: &str, collection: &str, entries: &[(u64, Vec<f32>)],
     ) -> Result<()> {
+        let _w = self.write_gate.lock().await;
         self.inner.vector_insert_batch(table, collection, entries)
     }
 
     pub async fn vector_update(
         &self, table: &str, collection: &str, rowid: u64, vector: &[f32],
     ) -> Result<()> {
+        let _w = self.write_gate.lock().await;
         self.inner.vector_update(table, collection, rowid, vector)
     }
 
     pub async fn vector_delete(
         &self, table: &str, collection: &str, rowid: u64,
     ) -> Result<()> {
+        let _w = self.write_gate.lock().await;
         self.inner.vector_delete(table, collection, rowid)
     }
 
@@ -282,6 +322,7 @@ impl AsyncBoogyDb {
     pub async fn unlock_vector_collection(
         &self, table: &str, name: &str, key: &[u8; 32],
     ) -> Result<()> {
+        let _w = self.write_gate.lock().await;
         self.inner.unlock_vector_collection(table, name, key)
     }
 }

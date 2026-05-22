@@ -13,7 +13,7 @@ vector = ["dep:memmap2"]
 crc32fast = "1"
 aes-gcm = "0.10"
 rand = "0.9"
-tokio = { version = "1", features = ["rt"], optional = true }
+tokio = { version = "1", features = ["rt", "sync"], optional = true }
 memmap2 = { version = "0.9", optional = true }
 
 [dev-dependencies]
