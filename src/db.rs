@@ -2144,6 +2144,77 @@ impl BoogyDb {
         Ok(())
     }
 
+    /// Rename a column in `table` from `old` to `new`, keeping the column's
+    /// `col_id` intact so all existing row data is preserved under the new name.
+    ///
+    /// Any secondary indexes that recorded `old` as a column name are updated
+    /// in-place to record `new` instead (index keys are stored by `col_id` so
+    /// the B+-tree data is unaffected — only the metadata name needs fixing).
+    pub fn rename_column(&self, table: &str, old: &str, new: &str) -> Result<()> {
+        // Validate the new name as an identifier (non-empty, no NUL bytes).
+        if new.is_empty() {
+            return Err(BoogyError::SchemaMismatch(
+                "column name must not be empty".to_string(),
+            ));
+        }
+        if new.contains('\0') {
+            return Err(BoogyError::SchemaMismatch(
+                "column name must not contain null bytes".to_string(),
+            ));
+        }
+
+        // 1. Read-lock registry, clone Arc.
+        let table_state = {
+            let tables = self.tables.read().unwrap();
+            tables
+                .get(table)
+                .ok_or_else(|| BoogyError::TableNotFound(table.to_string()))?
+                .clone()
+        };
+
+        // 2. Write-lock the specific table.
+        let mut state = table_state.write().unwrap();
+        Self::check_table_accessible(&state.meta, table)?;
+
+        // 3. Reject if the old column doesn't exist as a live column.
+        if !state.meta.col_name_to_id.contains_key(old) {
+            return Err(BoogyError::SchemaMismatch(format!(
+                "column '{}' does not exist on table '{}'",
+                old, table
+            )));
+        }
+
+        // 4. Reject if the new name already belongs to a live column.
+        if state.meta.col_name_to_id.contains_key(new) {
+            return Err(BoogyError::SchemaMismatch(format!(
+                "column '{}' already exists on table '{}'",
+                new, table
+            )));
+        }
+
+        // 5. Rename the column in the table metadata (col_id preserved).
+        state.meta.rename_column(old, new);
+
+        // 6. Fix up any index that records `old` as a column name.
+        //    Index keys are keyed by col_id in the B+-tree, so the tree data is
+        //    unaffected — only the recorded column name in IndexMeta needs updating.
+        for idx in state.meta.indexes.iter_mut() {
+            for col_name in idx.columns.iter_mut() {
+                if col_name == old {
+                    *col_name = new.to_string();
+                }
+            }
+        }
+
+        // 7. Persist registry atomically (mirrors add_column / create_index).
+        drop(state);
+        let (metas, next_id) = self.snapshot_table_metas();
+        let durability = self.durability();
+        Self::persist_registry(&self.file, &self.wal, &metas, next_id, durability)?;
+
+        Ok(())
+    }
+
     /// Update all rows matching filters. Returns number of rows updated.
     pub fn update_where(
         &self,

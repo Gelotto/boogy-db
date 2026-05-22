@@ -103,6 +103,23 @@ impl TableMeta {
         // col_defs is also positional — rebuild from columns to stay in sync.
         self.col_defs = std::sync::Arc::new(self.columns.clone());
     }
+
+    /// Rename a live column, keeping its col_id (so row data is preserved).
+    /// Returns the col_id, or None if `old` isn't a live column (not in
+    /// col_name_to_id — either missing or already dropped).
+    pub fn rename_column(&mut self, old: &str, new: &str) -> Option<u16> {
+        let col_id = *self.col_name_to_id.get(old)?;
+        self.col_name_to_id.remove(old);
+        self.col_name_to_id.insert(new.to_string(), col_id);
+        self.columns[col_id as usize].name = new.to_string();
+        // col_names is positional — update in place (same slot, new string).
+        let mut names = (*self.col_names).clone();
+        names[col_id as usize] = new.to_string();
+        self.col_names = std::sync::Arc::new(names);
+        // col_defs is positional — rebuild from columns to stay in sync.
+        self.col_defs = std::sync::Arc::new(self.columns.clone());
+        Some(col_id)
+    }
 }
 
 /// Registry of all tables in a database.
