@@ -174,6 +174,12 @@ impl AsyncBoogyDb {
         self.inner.drop_column(table, name)
     }
 
+    /// Return the live (non-dropped) columns for `table`, in schema order.
+    /// This is a read — no write-gate acquired.
+    pub async fn list_columns(&self, table: &str) -> Result<Vec<ColumnDef>> {
+        self.inner.list_columns(table)
+    }
+
     pub async fn create_index(
         &self,
         table: &str,

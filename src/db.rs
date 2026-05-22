@@ -2318,6 +2318,33 @@ impl BoogyDb {
         Ok(())
     }
 
+    /// Return the live (non-dropped) columns for `table`, in schema order.
+    ///
+    /// This is a read — it takes no write-gate and only holds a shared lock on
+    /// the per-table `RwLock` for the duration of the clone.  Returns
+    /// `TableNotFound` when the table does not exist.
+    pub fn list_columns(&self, table: &str) -> Result<Vec<ColumnDef>> {
+        // 1. Read-lock the registry, clone the Arc (same pattern as `get`).
+        let table_state = {
+            let tables = self.tables.read().unwrap();
+            tables
+                .get(table)
+                .ok_or_else(|| BoogyError::TableNotFound(table.to_string()))?
+                .clone()
+        };
+
+        // 2. Read-lock the specific table and filter to non-dropped columns.
+        let state = table_state.read().unwrap();
+        let cols = state
+            .meta
+            .columns
+            .iter()
+            .filter(|c| !c.dropped)
+            .cloned()
+            .collect();
+        Ok(cols)
+    }
+
     /// Update all rows matching filters. Returns number of rows updated.
     pub fn update_where(
         &self,
