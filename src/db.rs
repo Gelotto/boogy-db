@@ -2346,7 +2346,9 @@ impl BoogyDb {
     }
 
     /// List the indexes on `table`. Reads from the live `TableMeta.indexes`
-    /// snapshot via the same read-lock pattern as `list_columns`. Returns
+    /// snapshot via the same read-lock pattern as `list_columns`: takes no
+    /// write-gate and only holds a shared lock on the per-table `RwLock`
+    /// for the duration of the `IndexInfo`-Vec clone. Returns
     /// `TableNotFound` when the table does not exist.
     pub fn list_indexes(&self, table: &str) -> Result<Vec<IndexInfo>> {
         let table_state = {
@@ -6123,6 +6125,19 @@ mod tests {
         assert_eq!(db.list_indexes("posts").unwrap().len(), 1);
         db.drop_index("posts", "idx_author").unwrap();
         assert!(db.list_indexes("posts").unwrap().is_empty(), "after drop, list_indexes must be empty");
+    }
+
+    #[test]
+    fn test_list_indexes_table_not_found() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.boogy");
+        let db = BoogyDb::open(&path).unwrap();
+        let err = db.list_indexes("no_such_table").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("no_such_table"),
+            "error must name the missing table; got: {msg}",
+        );
     }
 
 }

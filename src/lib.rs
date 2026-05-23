@@ -22,7 +22,7 @@ pub use error::{BoogyError, Result};
 pub use value::{ColumnDef, Type, Value};
 pub use filter::{Filter, FilterOp, FindOptions, FindResult, Sort, SortDir};
 pub use db::{BoogyDb, Durability, Row, Transaction, AcidTransaction, ScanOrder, ScanOrderKind, ScanKey, ScanBatch};
-pub use table::{IndexInfo, IndexMeta, TableMeta};
+pub use table::IndexInfo;
 
 #[cfg(feature = "tokio")]
 pub use async_db::{AsyncBoogyDb, AsyncTransaction, OwnedAsyncTransaction};
