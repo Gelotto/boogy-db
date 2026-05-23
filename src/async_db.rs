@@ -180,6 +180,11 @@ impl AsyncBoogyDb {
         self.inner.list_columns(table)
     }
 
+    /// This is a read — no write-gate acquired.
+    pub async fn list_indexes(&self, table: &str) -> Result<Vec<crate::IndexInfo>> {
+        self.inner.list_indexes(table)
+    }
+
     pub async fn create_index(
         &self,
         table: &str,
