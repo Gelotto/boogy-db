@@ -17,6 +17,15 @@ pub struct IndexMeta {
     pub root_page: u32,
 }
 
+/// Public, read-only view of an index — what `list_indexes` returns.
+/// Like `IndexMeta` but without the internal `root_page` field.
+#[derive(Debug, Clone)]
+pub struct IndexInfo {
+    pub name: String,
+    pub columns: Vec<String>,
+    pub unique: bool,
+}
+
 /// Metadata for a registered table.
 #[derive(Debug, Clone)]
 pub struct TableMeta {

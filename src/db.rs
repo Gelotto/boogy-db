@@ -10,7 +10,7 @@ use crate::filter::{Filter, FilterOp, FindOptions, FindResult, SortDir};
 use crate::index::{self, IndexTreeReader, IndexTreeWriter};
 use crate::page::{Page, PAGE_SIZE, PAGE_SYSTEM};
 use crate::row;
-use crate::table::{IndexMeta, TableMeta};
+use crate::table::{IndexInfo, IndexMeta, TableMeta};
 use crate::value::{ColumnDef, Type, Value};
 use crate::wal::Wal;
 
@@ -2343,6 +2343,32 @@ impl BoogyDb {
             .cloned()
             .collect();
         Ok(cols)
+    }
+
+    /// List the indexes on `table`. Reads from the live `TableMeta.indexes`
+    /// snapshot via the same read-lock pattern as `list_columns`: takes no
+    /// write-gate and only holds a shared lock on the per-table `RwLock`
+    /// for the duration of the `IndexInfo`-Vec clone. Returns
+    /// `TableNotFound` when the table does not exist.
+    pub fn list_indexes(&self, table: &str) -> Result<Vec<IndexInfo>> {
+        let table_state = {
+            let tables = self.tables.read().unwrap();
+            tables
+                .get(table)
+                .ok_or_else(|| BoogyError::TableNotFound(table.to_string()))?
+                .clone()
+        };
+        let state = table_state.read().unwrap();
+        Ok(state
+            .meta
+            .indexes
+            .iter()
+            .map(|m| IndexInfo {
+                name: m.name.clone(),
+                columns: m.columns.clone(),
+                unique: m.unique,
+            })
+            .collect())
     }
 
     /// Update all rows matching filters. Returns number of rows updated.
@@ -6051,6 +6077,67 @@ mod tests {
             assert!(!state.meta.columns[1].dropped);
             assert_eq!(state.meta.columns[1].default, None);
         }
+    }
+
+    #[test]
+    fn test_list_indexes_returns_all_created() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.boogy");
+        let db = BoogyDb::open(&path).unwrap();
+        db.create_table("posts", &[
+            ColumnDef::new("title",      Type::Text),
+            ColumnDef::new("author",     Type::Text),
+            ColumnDef::new("created_at", Type::Integer),
+        ]).unwrap();
+        db.create_index("posts", "idx_author", "author").unwrap();
+        db.create_index_ex("posts", "idx_composite", &["author", "created_at"], false).unwrap();
+        db.create_index_ex("posts", "idx_uniq_title", &["title"], true).unwrap();
+
+        let indexes = db.list_indexes("posts").unwrap();
+        assert_eq!(indexes.len(), 3, "expected 3 indexes, got: {:?}", indexes.iter().map(|i| &i.name).collect::<Vec<_>>());
+
+        let composite = indexes.iter().find(|i| i.name == "idx_composite").expect("idx_composite missing");
+        assert_eq!(composite.columns, vec!["author".to_string(), "created_at".to_string()]);
+        assert!(!composite.unique);
+
+        let uniq = indexes.iter().find(|i| i.name == "idx_uniq_title").expect("idx_uniq_title missing");
+        assert_eq!(uniq.columns, vec!["title".to_string()]);
+        assert!(uniq.unique);
+    }
+
+    #[test]
+    fn test_list_indexes_empty_for_table_with_no_indexes() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.boogy");
+        let db = BoogyDb::open(&path).unwrap();
+        db.create_table("items", &[ColumnDef::new("name", Type::Text)]).unwrap();
+        let indexes = db.list_indexes("items").unwrap();
+        assert!(indexes.is_empty(), "fresh table must have zero indexes");
+    }
+
+    #[test]
+    fn test_list_indexes_after_drop() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.boogy");
+        let db = BoogyDb::open(&path).unwrap();
+        db.create_table("posts", &[ColumnDef::new("author", Type::Text)]).unwrap();
+        db.create_index("posts", "idx_author", "author").unwrap();
+        assert_eq!(db.list_indexes("posts").unwrap().len(), 1);
+        db.drop_index("posts", "idx_author").unwrap();
+        assert!(db.list_indexes("posts").unwrap().is_empty(), "after drop, list_indexes must be empty");
+    }
+
+    #[test]
+    fn test_list_indexes_table_not_found() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.boogy");
+        let db = BoogyDb::open(&path).unwrap();
+        let err = db.list_indexes("no_such_table").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("no_such_table"),
+            "error must name the missing table; got: {msg}",
+        );
     }
 
 }
