@@ -40,6 +40,16 @@ fn filter_matches_row(
     bytes: &[u8],
     f: &Filter,
 ) -> bool {
+    // The synthetic auto-PK `_id` is not a user-declared column; it lives
+    // only as the row's id in the page bytes. Compare against it directly
+    // so engine semantics match LibSQL (where `_id` is a real PRIMARY KEY
+    // column and `WHERE _id = ?` is a normal column predicate).
+    if f.column == "_id" {
+        return match row::extract_id(bytes) {
+            Ok(row_id) => f.matches(&Value::Integer(row_id as i64)),
+            Err(_) => false, // malformed row bytes — defensive
+        };
+    }
     if let Some(col_id) = col_name_to_id.get(&f.column).copied() {
         if let Ok(Some(raw)) = row::extract_column_raw(bytes, col_id) {
             if let Some(result) = crate::filter::eval_filter_raw_full(raw, f) {
@@ -1702,9 +1712,15 @@ impl BoogyDb {
         } else if opts.or_groups.is_empty()
             && opts.filters.len() == 1
             && opts.filters[0].op != FilterOp::In
+            && opts.filters[0].column != "_id"
         {
-            // Single filter (non-IN): use scan_filtered (extract_column on raw bytes, no full decode)
+            // Single filter (non-IN, non-_id): use scan_filtered (extract_column on raw bytes, no full decode)
             // Gated on empty or_groups: scan_filtered only applies the one filter.
+            // `_id` is excluded here because it is a synthetic auto-PK not stored as a
+            // user column; scan_filtered cannot locate it by col_id and would return 0
+            // results. Queries filtering on `_id` fall through to the row_passes scan
+            // path below, which calls filter_matches_row where the `_id` special-case is
+            // handled by extracting the row id directly from the page bytes.
             //
             // IMPORTANT: scan_filtered operates on raw bytes and treats absent columns as
             // Null. If the column has a stored default (added via add_column), absent rows
@@ -6952,6 +6968,164 @@ mod tests {
             msg.contains("non-overflow") || msg.contains("corruption"),
             "expected a corruption error, got: {err:?}",
         );
+    }
+
+    // ---- _id filter equivalence (engine fix for LibSQL parity) ----------
+
+    #[test]
+    fn test_filter_id_eq_match() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.boogy");
+        let db = BoogyDb::open(&path).unwrap();
+        db.create_table("t", &[ColumnDef::new("v", Type::Integer)]).unwrap();
+        let id1 = db.insert("t", &[("v", Value::Integer(10))]).unwrap();
+        let id2 = db.insert("t", &[("v", Value::Integer(20))]).unwrap();
+        let _id3 = db.insert("t", &[("v", Value::Integer(30))]).unwrap();
+
+        let opts = FindOptions {
+            filters: vec![crate::filter::Filter::eq("_id", Value::Integer(id2 as i64))],
+            include_total: true,
+            ..Default::default()
+        };
+        let result = db.find("t", opts).unwrap();
+        assert_eq!(result.total, Some(1), "exactly one row should match _id == id2");
+        assert_eq!(result.rows.len(), 1);
+        let row = &result.rows[0];
+        assert_eq!(row.get("v").unwrap(), Value::Integer(20));
+        // sanity: the matched row is the one we asked for
+        let _ = id1;
+    }
+
+    #[test]
+    fn test_filter_id_eq_nomatch() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.boogy");
+        let db = BoogyDb::open(&path).unwrap();
+        db.create_table("t", &[ColumnDef::new("v", Type::Integer)]).unwrap();
+        db.insert("t", &[("v", Value::Integer(1))]).unwrap();
+        db.insert("t", &[("v", Value::Integer(2))]).unwrap();
+
+        let opts = FindOptions {
+            filters: vec![crate::filter::Filter::eq("_id", Value::Integer(9999))],
+            include_total: true,
+            ..Default::default()
+        };
+        let result = db.find("t", opts).unwrap();
+        assert_eq!(result.total, Some(0), "no row should match _id == 9999");
+        assert!(result.rows.is_empty());
+    }
+
+    #[test]
+    fn test_filter_id_neq() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.boogy");
+        let db = BoogyDb::open(&path).unwrap();
+        db.create_table("t", &[ColumnDef::new("v", Type::Integer)]).unwrap();
+        let _ = db.insert("t", &[("v", Value::Integer(10))]).unwrap();
+        let id2 = db.insert("t", &[("v", Value::Integer(20))]).unwrap();
+        let _ = db.insert("t", &[("v", Value::Integer(30))]).unwrap();
+
+        let opts = FindOptions {
+            filters: vec![crate::filter::Filter::ne("_id", Value::Integer(id2 as i64))],
+            include_total: true,
+            ..Default::default()
+        };
+        let result = db.find("t", opts).unwrap();
+        assert_eq!(result.total, Some(2), "two rows should match _id != id2");
+        assert_eq!(result.rows.len(), 2);
+    }
+
+    #[test]
+    fn test_filter_id_lt_range() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.boogy");
+        let db = BoogyDb::open(&path).unwrap();
+        db.create_table("t", &[ColumnDef::new("v", Type::Integer)]).unwrap();
+        for i in 1..=5 {
+            db.insert("t", &[("v", Value::Integer(i))]).unwrap();
+        }
+        // ids should be 1..=5 (auto-increment from 1 by convention)
+        let opts = FindOptions {
+            filters: vec![crate::filter::Filter::lt("_id", Value::Integer(4))],
+            include_total: true,
+            ..Default::default()
+        };
+        let result = db.find("t", opts).unwrap();
+        assert_eq!(result.total, Some(3), "three rows should match _id < 4 (ids 1, 2, 3)");
+        assert_eq!(result.rows.len(), 3);
+    }
+
+    #[test]
+    fn test_filter_id_in_list() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.boogy");
+        let db = BoogyDb::open(&path).unwrap();
+        db.create_table("t", &[ColumnDef::new("v", Type::Integer)]).unwrap();
+        let id1 = db.insert("t", &[("v", Value::Integer(1))]).unwrap();
+        let _id2 = db.insert("t", &[("v", Value::Integer(2))]).unwrap();
+        let id3 = db.insert("t", &[("v", Value::Integer(3))]).unwrap();
+        let _id4 = db.insert("t", &[("v", Value::Integer(4))]).unwrap();
+        let id5 = db.insert("t", &[("v", Value::Integer(5))]).unwrap();
+
+        let opts = FindOptions {
+            filters: vec![crate::filter::Filter::in_list(
+                "_id",
+                vec![
+                    Value::Integer(id1 as i64),
+                    Value::Integer(id3 as i64),
+                    Value::Integer(id5 as i64),
+                ],
+            )],
+            include_total: true,
+            ..Default::default()
+        };
+        let result = db.find("t", opts).unwrap();
+        assert_eq!(result.total, Some(3), "three rows should match _id IN [id1, id3, id5]");
+        assert_eq!(result.rows.len(), 3);
+    }
+
+    #[test]
+    fn test_filter_id_is_not_null() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.boogy");
+        let db = BoogyDb::open(&path).unwrap();
+        db.create_table("t", &[ColumnDef::new("v", Type::Integer)]).unwrap();
+        db.insert("t", &[("v", Value::Integer(1))]).unwrap();
+        db.insert("t", &[("v", Value::Integer(2))]).unwrap();
+        db.insert("t", &[("v", Value::Integer(3))]).unwrap();
+
+        let opts = FindOptions {
+            filters: vec![crate::filter::Filter::is_not_null("_id")],
+            include_total: true,
+            ..Default::default()
+        };
+        let result = db.find("t", opts).unwrap();
+        assert_eq!(result.total, Some(3), "_id IS NOT NULL must match every row (PK always present)");
+        assert_eq!(result.rows.len(), 3);
+    }
+
+    #[test]
+    fn test_or_group_with_id_filter() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.boogy");
+        let db = BoogyDb::open(&path).unwrap();
+        db.create_table("t", &[ColumnDef::new("name", Type::Text)]).unwrap();
+        let _id1 = db.insert("t", &[("name", Value::Text("alice".into()))]).unwrap();
+        let id2 = db.insert("t", &[("name", Value::Text("bob".into()))]).unwrap();
+        let _id3 = db.insert("t", &[("name", Value::Text("carol".into()))]).unwrap();
+
+        // (name = "alice") OR (_id = id2)  →  matches row #1 (alice) and row #2 (id2)
+        let opts = FindOptions {
+            or_groups: vec![
+                vec![crate::filter::Filter::eq("name", Value::Text("alice".into()))],
+                vec![crate::filter::Filter::eq("_id", Value::Integer(id2 as i64))],
+            ],
+            include_total: true,
+            ..Default::default()
+        };
+        let result = db.find("t", opts).unwrap();
+        assert_eq!(result.total, Some(2), "OR group must include both alice and id2");
+        assert_eq!(result.rows.len(), 2);
     }
 
 }
