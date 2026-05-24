@@ -408,6 +408,16 @@ impl OwnedAsyncTransaction {
         self.tx.as_mut().unwrap().upsert_increment(table, key, counter, delta, set)
     }
 
+    pub async fn upsert(
+        &mut self,
+        table: &str,
+        key: &[(&str, Value)],
+        set: &[(&str, Value)],
+    ) -> Result<u64> {
+        self.ensure_write_gate().await;
+        self.tx.as_mut().unwrap().upsert(table, key, set)
+    }
+
     // READ ops: no gate; they read the overlay (read-your-writes).
 
     pub async fn get(&mut self, table: &str, id: u64) -> Result<Option<Row>> {
