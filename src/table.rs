@@ -26,6 +26,22 @@ pub struct IndexInfo {
     pub unique: bool,
 }
 
+/// Public, read-only view of a table — what `list_tables` returns.
+/// Lightweight metadata snapshot (counts only, no schema detail);
+/// callers who want the full schema use `list_columns(name)` /
+/// `list_indexes(name)`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TableInfo {
+    pub name: String,
+    /// Live (non-dropped) **user-declared** columns. Matches
+    /// `list_columns(name).len()` exactly.
+    pub column_count: u32,
+    /// Live (non-dropped) **user-defined** indexes (excludes any
+    /// implicit auto-index, e.g. the `_id` PRIMARY KEY autoindex on
+    /// the LibSQL engine). Matches `list_indexes(name).len()` exactly.
+    pub index_count: u32,
+}
+
 /// Metadata for a registered table.
 #[derive(Debug, Clone)]
 pub struct TableMeta {
