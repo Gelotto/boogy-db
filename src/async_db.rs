@@ -159,6 +159,21 @@ impl AsyncBoogyDb {
         self.inner.upsert_increment(table, key, counter, delta, set)
     }
 
+    /// Async wrapper over [`BoogyDb::upsert`]. The engine method
+    /// commits its own transaction (one-shot semantics), so this is
+    /// a thin synchronous-inside-async forwarder — same shape as the
+    /// existing `upsert_increment` / `list_tables` / `list_columns`
+    /// wrappers.
+    pub async fn upsert(
+        &self,
+        table: &str,
+        key: &[(&str, Value)],
+        set: &[(&str, Value)],
+    ) -> Result<u64> {
+        let _w = self.write_gate.lock().await;
+        self.inner.upsert(table, key, set)
+    }
+
     pub async fn add_column(&self, table: &str, column: ColumnDef) -> Result<()> {
         let _w = self.write_gate.lock().await;
         self.inner.add_column(table, column)
