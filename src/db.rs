@@ -10,7 +10,7 @@ use crate::filter::{Filter, FilterOp, FindOptions, FindResult, SortDir};
 use crate::index::{self, IndexTreeReader, IndexTreeWriter};
 use crate::page::{Page, PAGE_HEADER_SIZE, PAGE_SIZE, PAGE_SYSTEM};
 use crate::row;
-use crate::table::{IndexInfo, IndexMeta, TableMeta};
+use crate::table::{IndexInfo, IndexMeta, TableInfo, TableMeta};
 use crate::value::{ColumnDef, Type, Value};
 use crate::wal::Wal;
 
@@ -2465,6 +2465,43 @@ impl BoogyDb {
                 unique: m.unique,
             })
             .collect())
+    }
+
+    /// Lightweight per-table introspection — names + live-column +
+    /// index counts. Reads `self.tables` under a shared read-lock
+    /// (no write-gate), then takes a per-table shared lock just long
+    /// enough to count live columns + indexes from each `TableMeta`.
+    ///
+    /// Returned order is sorted ascending by name — the underlying
+    /// HashMap iteration is non-deterministic, and a stable order
+    /// makes the contract easy to test against.
+    pub fn list_tables(&self) -> Result<Vec<TableInfo>> {
+        // 1. Read-lock the registry; clone the Arc list so we drop
+        //    the registry lock before taking any per-table locks.
+        let table_states: Vec<(String, Arc<RwLock<TableState>>)> = {
+            let tables = self.tables.read().unwrap();
+            tables.iter().map(|(n, ts)| (n.clone(), ts.clone())).collect()
+        };
+
+        // 2. Per-table: shared lock + count + drop.
+        let mut out: Vec<TableInfo> = table_states
+            .into_iter()
+            .map(|(name, ts)| {
+                let state = ts.read().unwrap();
+                let column_count = state
+                    .meta
+                    .columns
+                    .iter()
+                    .filter(|c| !c.dropped)
+                    .count() as u32;
+                let index_count = state.meta.indexes.len() as u32;
+                TableInfo { name, column_count, index_count }
+            })
+            .collect();
+
+        // 3. Deterministic order for the contract.
+        out.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(out)
     }
 
     /// Update all rows matching filters. Returns number of rows updated.
@@ -6239,6 +6276,86 @@ mod tests {
             msg.contains("no_such_table"),
             "error must name the missing table; got: {msg}",
         );
+    }
+
+    #[test]
+    fn test_list_tables_returns_all_table_names_sorted() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.boogy");
+        let db = BoogyDb::open(&path).unwrap();
+        // Create in non-alphabetical order to prove sort:
+        db.create_table("z_orders",   &[ColumnDef::new("amount", Type::Integer)]).unwrap();
+        db.create_table("a_users",    &[
+            ColumnDef::new("name",  Type::Text),
+            ColumnDef::new("email", Type::Text),
+        ]).unwrap();
+        db.create_table("m_products", &[ColumnDef::new("sku", Type::Text)]).unwrap();
+        db.create_index("a_users", "idx_email", "email").unwrap();
+
+        let tables = db.list_tables().unwrap();
+        assert_eq!(tables.len(), 3, "expected 3 tables, got: {:?}", tables);
+
+        // Sorted ascending by name.
+        assert_eq!(tables[0].name, "a_users");
+        assert_eq!(tables[1].name, "m_products");
+        assert_eq!(tables[2].name, "z_orders");
+
+        // Column counts match each create_table's columns vec length.
+        assert_eq!(tables[0].column_count, 2, "a_users has 2 cols");
+        assert_eq!(tables[1].column_count, 1, "m_products has 1 col");
+        assert_eq!(tables[2].column_count, 1, "z_orders has 1 col");
+
+        // Index counts: only a_users has a user index.
+        assert_eq!(tables[0].index_count, 1, "a_users has 1 index");
+        assert_eq!(tables[1].index_count, 0, "m_products has 0 indexes");
+        assert_eq!(tables[2].index_count, 0, "z_orders has 0 indexes");
+    }
+
+    #[test]
+    fn test_list_tables_returns_empty_when_no_tables() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.boogy");
+        let db = BoogyDb::open(&path).unwrap();
+        let tables = db.list_tables().unwrap();
+        assert!(tables.is_empty(), "fresh DB must return empty Vec, got: {:?}", tables);
+    }
+
+    #[test]
+    fn test_list_tables_counts_exclude_dropped_columns() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.boogy");
+        let db = BoogyDb::open(&path).unwrap();
+        db.create_table("items", &[
+            ColumnDef::new("a", Type::Text),
+            ColumnDef::new("b", Type::Text),
+            ColumnDef::new("c", Type::Text),
+            ColumnDef::new("d", Type::Text),
+            ColumnDef::new("e", Type::Text),
+        ]).unwrap();
+        db.drop_column("items", "b").unwrap();
+        db.drop_column("items", "d").unwrap();
+
+        let tables = db.list_tables().unwrap();
+        assert_eq!(tables.len(), 1);
+        assert_eq!(tables[0].name, "items");
+        assert_eq!(tables[0].column_count, 3,
+            "expected 3 live cols after dropping b and d, got {}", tables[0].column_count);
+    }
+
+    #[test]
+    fn test_list_tables_after_drop_table() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.boogy");
+        let db = BoogyDb::open(&path).unwrap();
+        db.create_table("alpha", &[ColumnDef::new("name", Type::Text)]).unwrap();
+        db.create_table("bravo", &[ColumnDef::new("name", Type::Text)]).unwrap();
+        assert_eq!(db.list_tables().unwrap().len(), 2);
+
+        db.drop_table("alpha").unwrap();
+
+        let tables = db.list_tables().unwrap();
+        assert_eq!(tables.len(), 1, "after drop, only one table remains");
+        assert_eq!(tables[0].name, "bravo", "alpha must be gone, bravo must remain");
     }
 
     // ─── System-page overflow chain tests ────────────────────────────────────

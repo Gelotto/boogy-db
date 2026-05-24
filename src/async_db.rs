@@ -185,6 +185,14 @@ impl AsyncBoogyDb {
         self.inner.list_indexes(table)
     }
 
+    /// Async wrapper over [`BoogyDb::list_tables`]. The underlying
+    /// engine method is a pure read (no I/O) so this forwarder
+    /// returns synchronously inside an async fn — identical to
+    /// `list_columns` / `list_indexes`.
+    pub async fn list_tables(&self) -> Result<Vec<crate::TableInfo>> {
+        self.inner.list_tables()
+    }
+
     pub async fn create_index(
         &self,
         table: &str,
