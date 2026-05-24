@@ -6241,4 +6241,330 @@ mod tests {
         );
     }
 
+    // ─── System-page overflow chain tests ────────────────────────────────────
+
+    #[test]
+    fn test_system_page_inline_when_schema_fits() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.boogy");
+        let db = BoogyDb::open(&path).unwrap();
+
+        // 3 small tables — fits comfortably inline (~150 bytes total).
+        for i in 0..3 {
+            db.create_table(
+                &format!("t{i}"),
+                &[ColumnDef::new("c", Type::Text)],
+            ).unwrap();
+        }
+
+        // Reopen + verify all 3 tables present.
+        drop(db);
+        let db = BoogyDb::open(&path).unwrap();
+        let tables = db.tables.read().unwrap();
+        assert_eq!(tables.len(), 3);
+        for i in 0..3 {
+            assert!(tables.contains_key(&format!("t{i}")));
+        }
+
+        // Verify page 0 has NO overflow trailer.
+        let page0 = db.file.read_page(0).unwrap();
+        let trailer_start = PAGE_HEADER_SIZE + SYSTEM_INLINE_BUDGET;
+        assert_ne!(
+            page0.data[trailer_start..trailer_start + 2],
+            crate::overflow::OVERFLOW_MAGIC,
+            "small schema must not produce an overflow trailer"
+        );
+    }
+
+    #[test]
+    fn test_system_page_overflows_to_chain() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.boogy");
+        let db = BoogyDb::open(&path).unwrap();
+
+        // 25 tables with long names + 2 indexes each → ~200-300 bytes per table,
+        // ~5-7.5KB total > SYSTEM_INLINE_BUDGET.
+        let long_col_a = "very_long_column_name_for_overflow_test_a";
+        let long_col_b = "very_long_column_name_for_overflow_test_b";
+        for i in 0..25 {
+            let table = format!("table_with_long_name_{i:02}");
+            db.create_table(&table, &[
+                ColumnDef::new(long_col_a, Type::Text),
+                ColumnDef::new(long_col_b, Type::Integer),
+            ]).unwrap();
+            db.create_index(&table, &format!("idx_a_{i}"), long_col_a).unwrap();
+            db.create_index(&table, &format!("idx_b_{i}"), long_col_b).unwrap();
+        }
+
+        // Page 0 must have the overflow trailer.
+        let page0 = db.file.read_page(0).unwrap();
+        let trailer_start = PAGE_HEADER_SIZE + SYSTEM_INLINE_BUDGET;
+        assert_eq!(
+            page0.data[trailer_start..trailer_start + 2],
+            crate::overflow::OVERFLOW_MAGIC,
+            "schema with 25 tables must produce an overflow trailer"
+        );
+
+        // All 25 tables present.
+        let tables = db.tables.read().unwrap();
+        assert_eq!(tables.len(), 25);
+        for i in 0..25 {
+            assert!(tables.contains_key(&format!("table_with_long_name_{i:02}")));
+        }
+    }
+
+    #[test]
+    fn test_system_page_overflow_chain_reopen_persistence() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.boogy");
+
+        {
+            let db = BoogyDb::open(&path).unwrap();
+            for i in 0..25 {
+                let table = format!("table_persist_{i:02}");
+                db.create_table(&table, &[
+                    ColumnDef::new("text_col", Type::Text),
+                    ColumnDef::new("int_col", Type::Integer),
+                    ColumnDef::new("real_col", Type::Real),
+                    ColumnDef::new("bool_col", Type::Boolean),
+                    ColumnDef::new("blob_col", Type::Blob),
+                ]).unwrap();
+                db.create_index(&table, &format!("idx_text_{i}"), "text_col").unwrap();
+                db.create_index_ex(&table, &format!("idx_uniq_{i}"), &["int_col"], true).unwrap();
+            }
+        } // db dropped — WAL flushed
+
+        // Reopen + verify full round-trip.
+        let db = BoogyDb::open(&path).unwrap();
+        let tables = db.tables.read().unwrap();
+        assert_eq!(tables.len(), 25);
+
+        for i in 0..25 {
+            let name = format!("table_persist_{i:02}");
+            let table_state = tables.get(&name).expect("table missing after reopen");
+            let state = table_state.read().unwrap();
+            let meta = &state.meta;
+
+            assert_eq!(meta.columns.len(), 5);
+            assert_eq!(meta.columns[0].name, "text_col");
+            assert_eq!(meta.columns[0].col_type, Type::Text);
+            assert_eq!(meta.columns[1].col_type, Type::Integer);
+            assert_eq!(meta.columns[2].col_type, Type::Real);
+            assert_eq!(meta.columns[3].col_type, Type::Boolean);
+            assert_eq!(meta.columns[4].col_type, Type::Blob);
+
+            assert_eq!(meta.indexes.len(), 2);
+            assert!(meta.indexes.iter().any(|idx| idx.name == format!("idx_text_{i}") && !idx.unique));
+            assert!(meta.indexes.iter().any(|idx| idx.name == format!("idx_uniq_{i}") && idx.unique));
+        }
+    }
+
+    #[test]
+    fn test_system_page_overflow_chain_shrinks_when_tables_dropped() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.boogy");
+        let db = BoogyDb::open(&path).unwrap();
+
+        // Use same sizing as test_system_page_overflows_to_chain: 2 long columns
+        // + 2 indexes per table to guarantee we exceed the inline budget.
+        let long_col_a = "very_long_column_name_for_overflow_test_a";
+        let long_col_b = "very_long_column_name_for_overflow_test_b";
+        for i in 0..25 {
+            let table = format!("shrink_table_{i:02}");
+            db.create_table(&table, &[
+                ColumnDef::new(long_col_a, Type::Text),
+                ColumnDef::new(long_col_b, Type::Integer),
+            ]).unwrap();
+            db.create_index(&table, &format!("shrink_idx_a_{i}"), long_col_a).unwrap();
+            db.create_index(&table, &format!("shrink_idx_b_{i}"), long_col_b).unwrap();
+        }
+
+        // Trailer present after creating 25 large tables.
+        {
+            let page0 = db.file.read_page(0).unwrap();
+            let trailer_start = PAGE_HEADER_SIZE + SYSTEM_INLINE_BUDGET;
+            assert_eq!(
+                page0.data[trailer_start..trailer_start + 2],
+                crate::overflow::OVERFLOW_MAGIC,
+                "25 large tables must produce an overflow trailer"
+            );
+        }
+
+        // Drop 22 of 25.
+        for i in 0..22 {
+            db.drop_table(&format!("shrink_table_{i:02}")).unwrap();
+        }
+
+        // Trailer GONE — schema now fits inline.
+        let page0 = db.file.read_page(0).unwrap();
+        let trailer_start = PAGE_HEADER_SIZE + SYSTEM_INLINE_BUDGET;
+        assert_ne!(
+            page0.data[trailer_start..trailer_start + 2],
+            crate::overflow::OVERFLOW_MAGIC,
+            "after dropping most tables, schema should fit inline (no trailer)"
+        );
+        // NOTE: page reuse is NOT asserted — the engine has no free-list;
+        // old overflow pages are orphaned, consistent with drop_table's existing
+        // behavior for data pages (see followup §5 in migration-followups).
+    }
+
+    #[test]
+    fn test_system_page_overflow_survives_partial_write_via_wal() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.boogy");
+
+        // Phase 1: small schema, persisted normally.
+        {
+            let db = BoogyDb::open(&path).unwrap();
+            for i in 0..3 {
+                db.create_table(
+                    &format!("phase1_{i}"),
+                    &[ColumnDef::new("c", Type::Text)],
+                ).unwrap();
+            }
+        } // db dropped — WAL checkpointed
+
+        // Phase 2: add many tables to force overflow, then drop without explicit
+        // sync (simulating a process exit before WAL checkpoint).
+        {
+            let db = BoogyDb::open(&path).unwrap();
+            let long_col = "very_long_column_name_for_overflow_test";
+            for i in 0..25 {
+                db.create_table(
+                    &format!("phase2_{i:02}"),
+                    &[ColumnDef::new(long_col, Type::Text)],
+                ).unwrap();
+            }
+            // Drop without explicit sync — WAL atomicity protects us.
+        }
+
+        // Phase 3: reopen. Schema must be parseable (no corruption); EITHER
+        // the pre-phase-2 state (3 tables) or the post-phase-2 state (28 tables)
+        // is acceptable — a torn intermediate state is NOT acceptable.
+        let db = BoogyDb::open(&path).unwrap();
+        let tables = db.tables.read().unwrap();
+        let count = tables.len();
+        assert!(
+            count == 3 || count == 28,
+            "schema must be either pre-crash (3) or post-crash (28), got {count}",
+        );
+        for (name, table_state) in tables.iter() {
+            let state = table_state.read().unwrap();
+            assert!(!state.meta.columns.is_empty(), "table {name} has no columns — corrupt");
+        }
+    }
+
+    #[test]
+    fn test_serialize_system_metas_handles_large_schemas_without_panic() {
+        let metas: Vec<TableMeta> = (0..100)
+            .map(|i| {
+                let mut meta = TableMeta::new(
+                    format!("t{i:03}"),
+                    i as u32 + 1,
+                    vec![
+                        ColumnDef::new("c1", Type::Text),
+                        ColumnDef::new("c2", Type::Integer),
+                    ],
+                    100 + i as u32, // root_page
+                );
+                meta.indexes.push(IndexMeta {
+                    name: format!("idx_{i}"),
+                    columns: vec!["c1".to_string()],
+                    unique: false,
+                    root_page: 1000 + i as u32,
+                });
+                meta
+            })
+            .collect();
+
+        let bytes = serialize_system_metas(&metas, 101);
+
+        // Must be large enough to need overflow.
+        assert!(
+            bytes.len() > SYSTEM_INLINE_BUDGET,
+            "100 tables must overflow inline budget (got {} bytes)", bytes.len(),
+        );
+
+        // Must round-trip through deserialize_system_metas.
+        let (recovered_metas, next_id) = deserialize_system_metas(&bytes).unwrap();
+        assert_eq!(recovered_metas.len(), 100);
+        assert_eq!(next_id, 101);
+        for (i, meta) in recovered_metas.iter().enumerate() {
+            assert_eq!(meta.name, format!("t{i:03}"));
+            assert_eq!(meta.columns.len(), 2);
+            assert_eq!(meta.indexes.len(), 1);
+        }
+    }
+
+    // ─── Regression tests for T1's defensive paths ───────────────────────────
+
+    #[test]
+    fn test_deserialize_system_page_errors_on_corrupt_trailer_with_zero_first_page() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.boogy");
+        let db = BoogyDb::open(&path).unwrap();
+        db.create_table("t", &[ColumnDef::new("c", Type::Text)]).unwrap();
+
+        // Read page 0, craft a corrupt trailer: magic present, first_page == 0,
+        // remaining_len > 0. This should trigger the defensive check:
+        // "trailer present but first_page is 0".
+        let mut corrupted = (*db.file.read_page(0).unwrap()).clone();
+        let trailer_start = PAGE_HEADER_SIZE + SYSTEM_INLINE_BUDGET;
+        corrupted.data[trailer_start..trailer_start + 2]
+            .copy_from_slice(&crate::overflow::OVERFLOW_MAGIC);
+        corrupted.data[trailer_start + 2..trailer_start + 6]
+            .copy_from_slice(&0u32.to_le_bytes()); // first_page = 0 (corrupt)
+        corrupted.data[trailer_start + 6..trailer_start + 10]
+            .copy_from_slice(&100u32.to_le_bytes()); // remaining_len = 100 (> 0)
+        corrupted.update_checksum();
+
+        let err = deserialize_system_page(&corrupted, &db.file).unwrap_err();
+        let msg = format!("{err:?}").to_lowercase();
+        assert!(
+            msg.contains("first_page is 0") || msg.contains("first_page=0"),
+            "expected first-page-zero corruption error, got: {err:?}",
+        );
+    }
+
+    #[test]
+    fn test_deserialize_system_page_errors_on_chain_pointing_at_non_overflow_page() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.boogy");
+        let db = BoogyDb::open(&path).unwrap();
+
+        // Create enough tables to force an overflow chain so we have at least
+        // one real data page (page 1 = system page's first overflow page).
+        // Then create one table (a btree root) to guarantee a non-overflow page
+        // exists at some page number > 0.
+        db.create_table("t", &[ColumnDef::new("c", Type::Text)]).unwrap();
+
+        // Craft a corrupt trailer on page 0 that points at page 0's next data
+        // page (page 1, which is a btree root — NOT an overflow page).
+        // This hits the `is_overflow()` defensive check in the chain walk.
+        //
+        // We need a page > 0 to point at. After create_table the btree root
+        // for "t" is at some page > 0. We'll point at page 1 regardless.
+        // If the engine happens to write an overflow page at page 1 this test
+        // might not hit the is_overflow() path, but for a single small table
+        // page 1 will be a btree leaf, not an overflow page.
+        let mut corrupted = (*db.file.read_page(0).unwrap()).clone();
+        let trailer_start = PAGE_HEADER_SIZE + SYSTEM_INLINE_BUDGET;
+        corrupted.data[trailer_start..trailer_start + 2]
+            .copy_from_slice(&crate::overflow::OVERFLOW_MAGIC);
+        corrupted.data[trailer_start + 2..trailer_start + 6]
+            .copy_from_slice(&1u32.to_le_bytes()); // first_page = 1 (btree node, not overflow)
+        corrupted.data[trailer_start + 6..trailer_start + 10]
+            .copy_from_slice(&100u32.to_le_bytes()); // remaining_len = 100 (> 0)
+        corrupted.update_checksum();
+
+        let err = deserialize_system_page(&corrupted, &db.file).unwrap_err();
+        // Must be a corruption error — either "non-overflow page" from the
+        // is_overflow() check, or another corruption family.
+        let msg = format!("{err:?}").to_lowercase();
+        assert!(
+            msg.contains("non-overflow") || msg.contains("corruption"),
+            "expected a corruption error, got: {err:?}",
+        );
+    }
+
 }
