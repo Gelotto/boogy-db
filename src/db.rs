@@ -162,6 +162,9 @@ impl Row {
 
     /// Get a single column value by name.
     ///
+    /// - The synthetic auto-PK `_id` (= [`AUTO_ID_COL`]) returns
+    ///   `Some(Value::Integer(self.id as i64))` — engine equivalence with
+    ///   LibSQL, where `_id` is a real `INTEGER PRIMARY KEY` column.
     /// - Returns `None` when the column name is unknown, or when the column is
     ///   dropped.
     /// - For columns that are physically absent from the row bytes AND that have
@@ -171,6 +174,13 @@ impl Row {
     ///   the column was part of the original schema but simply not set during the
     ///   insert), returns `None` — preserving the historical contract.
     pub fn get(&self, column: &str) -> Option<Value> {
+        // Synthetic auto-PK: not a user-declared column; the row's id lives in
+        // the page bytes, not in col_names. Mirror filter_matches_row's behavior
+        // (since 79c5c97) so `_id` reads + sort_by predicates work uniformly
+        // on both engines.
+        if column == AUTO_ID_COL {
+            return Some(Value::Integer(self.id as i64));
+        }
         // Scan col_names for all positions matching `column`, picking the first
         // one that is NOT dropped.  This handles the case where a column was
         // dropped and re-added under the same name: the old slot is marked
@@ -7166,6 +7176,73 @@ mod tests {
         let result = db.find("t", opts).unwrap();
         assert_eq!(result.total, Some(2), "OR group must include both alice and id2");
         assert_eq!(result.rows.len(), 2);
+    }
+
+    // ---- _id sort + Row::get equivalence (LibSQL parity) ----------------
+
+    #[test]
+    fn test_row_get_id_returns_integer_of_rowid() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.boogy");
+        let db = BoogyDb::open(&path).unwrap();
+        db.create_table("t", &[ColumnDef::new("v", Type::Integer)]).unwrap();
+        let id1 = db.insert("t", &[("v", Value::Integer(10))]).unwrap();
+
+        let row = db.get("t", id1).unwrap().expect("row must exist");
+        assert_eq!(
+            row.get("_id"),
+            Some(Value::Integer(id1 as i64)),
+            "Row::get(\"_id\") must return Some(Integer(row.id)) — engine equivalence with LibSQL",
+        );
+        // Regression guard: known user columns still work alongside the special-case.
+        assert_eq!(row.get("v"), Some(Value::Integer(10)));
+        // Truly-unknown column still returns None.
+        assert_eq!(row.get("nonexistent_column"), None);
+    }
+
+    #[test]
+    fn test_find_sort_by_id_asc() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.boogy");
+        let db = BoogyDb::open(&path).unwrap();
+        db.create_table("t", &[ColumnDef::new("v", Type::Integer)]).unwrap();
+        // Insert in non-monotonic value order so a sort by `v` would differ
+        // from a sort by `_id` (insertion order).
+        let id1 = db.insert("t", &[("v", Value::Integer(30))]).unwrap();
+        let id2 = db.insert("t", &[("v", Value::Integer(10))]).unwrap();
+        let id3 = db.insert("t", &[("v", Value::Integer(20))]).unwrap();
+
+        let opts = FindOptions {
+            sort: vec![crate::filter::Sort::asc("_id")],
+            include_total: true,
+            ..Default::default()
+        };
+        let result = db.find("t", opts).unwrap();
+        assert_eq!(result.rows.len(), 3);
+        // Ascending by _id == insertion order.
+        let ids: Vec<u64> = result.rows.iter().map(|r| r.id).collect();
+        assert_eq!(ids, vec![id1, id2, id3], "asc by _id must yield insertion order");
+    }
+
+    #[test]
+    fn test_find_sort_by_id_desc() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.boogy");
+        let db = BoogyDb::open(&path).unwrap();
+        db.create_table("t", &[ColumnDef::new("v", Type::Integer)]).unwrap();
+        let id1 = db.insert("t", &[("v", Value::Integer(30))]).unwrap();
+        let id2 = db.insert("t", &[("v", Value::Integer(10))]).unwrap();
+        let id3 = db.insert("t", &[("v", Value::Integer(20))]).unwrap();
+
+        let opts = FindOptions {
+            sort: vec![crate::filter::Sort::desc("_id")],
+            include_total: true,
+            ..Default::default()
+        };
+        let result = db.find("t", opts).unwrap();
+        assert_eq!(result.rows.len(), 3);
+        let ids: Vec<u64> = result.rows.iter().map(|r| r.id).collect();
+        assert_eq!(ids, vec![id3, id2, id1], "desc by _id must yield reverse-insertion order");
     }
 
 }
