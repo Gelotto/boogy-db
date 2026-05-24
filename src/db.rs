@@ -8,7 +8,7 @@ use crate::error::{BoogyError, Result};
 use crate::file::{PageFile, WriteGuard};
 use crate::filter::{Filter, FilterOp, FindOptions, FindResult, SortDir};
 use crate::index::{self, IndexTreeReader, IndexTreeWriter};
-use crate::page::{Page, PAGE_SIZE, PAGE_SYSTEM};
+use crate::page::{Page, PAGE_HEADER_SIZE, PAGE_SIZE, PAGE_SYSTEM};
 use crate::row;
 use crate::table::{IndexInfo, IndexMeta, TableMeta};
 use crate::value::{ColumnDef, Type, Value};
@@ -350,261 +350,282 @@ fn tag_to_type(tag: u8) -> Result<Type> {
     }
 }
 
-/// Maximum usable payload in a system page (page size minus header and checksum).
-const SYSTEM_PAGE_PAYLOAD: usize = PAGE_SIZE - 4; // 4-byte checksum at end
+/// Inline budget for the system page: payload (4076) minus the 10-byte
+/// overflow trailer slot. Unconditionally reserved even for inline-only
+/// writes so the read path is single-case.
+///
+/// = PAGE_SIZE - PAGE_HEADER_SIZE - 4 (checksum) - OVERFLOW_TRAILER_SIZE
+/// = 4096 - 16 - 4 - 10 = 4066
+///
+/// **Invariant:** must accommodate the largest single TableMeta record's
+/// trailing `encrypted` flag byte. Shrinking this value below what the
+/// last table's encrypted flag would need would silently default that
+/// flag to `false` on inline-only reads. Currently safe because a single
+/// TableMeta never exceeds a few hundred bytes; flagged so a future
+/// trailer-extension doesn't accidentally cut into the last-flag slot.
+const SYSTEM_INLINE_BUDGET: usize = PAGE_SIZE
+    - PAGE_HEADER_SIZE
+    - 4 /* checksum */
+    - crate::overflow::OVERFLOW_TRAILER_SIZE;
 
-/// Check that writing `needed` bytes at `offset` won't overflow the system page.
-fn check_sys_page_bounds(offset: usize, needed: usize) -> Result<()> {
-    if offset + needed > SYSTEM_PAGE_PAYLOAD {
-        return Err(BoogyError::Corruption(
-            "system page overflow: metadata exceeds 4KB page".into(),
-        ));
+/// Serialize the table registry into a contiguous byte stream. Pure data —
+/// no page in mind, no bounds check, no failure mode. The page-layer
+/// `serialize_system_page` decides inline-or-chain based on the result's
+/// length.
+///
+/// Format (stable across the inline/overflow boundary — the chain just
+/// continues the byte stream from where the inline payload ended):
+///   [magic:4][next_table_id:4][num_tables:2][per-table records...]
+fn serialize_system_metas(metas: &[TableMeta], next_table_id: u32) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(SYSTEM_INLINE_BUDGET);
+
+    buf.extend_from_slice(&SYSTEM_PAGE_MAGIC.to_le_bytes());
+    buf.extend_from_slice(&next_table_id.to_le_bytes());
+    buf.extend_from_slice(&(metas.len() as u16).to_le_bytes());
+
+    for meta in metas {
+        buf.extend_from_slice(&meta.table_id.to_le_bytes());
+        buf.extend_from_slice(&meta.root_page.to_le_bytes());
+        buf.extend_from_slice(&meta.row_count.to_le_bytes());
+        buf.extend_from_slice(&meta.next_rowid.to_le_bytes());
+
+        let name_bytes = meta.name.as_bytes();
+        buf.extend_from_slice(&(name_bytes.len() as u16).to_le_bytes());
+        buf.extend_from_slice(name_bytes);
+
+        buf.extend_from_slice(&(meta.columns.len() as u16).to_le_bytes());
+        for col in &meta.columns {
+            let col_name = col.name.as_bytes();
+            buf.extend_from_slice(&(col_name.len() as u16).to_le_bytes());
+            buf.extend_from_slice(col_name);
+            buf.push(type_to_tag(col.col_type));
+            buf.push(if col.nullable { 1 } else { 0 });
+            buf.push(if col.unique { 1 } else { 0 });
+            buf.push(if col.dropped { 1 } else { 0 });
+            match &col.default {
+                None => buf.push(0), // has_default = false
+                Some(v) => {
+                    buf.push(1); // has_default = true
+                    let vb = crate::row::encode_value_to_vec(v);
+                    buf.extend_from_slice(&(vb.len() as u16).to_le_bytes());
+                    buf.extend_from_slice(&vb);
+                }
+            }
+        }
+
+        buf.extend_from_slice(&(meta.indexes.len() as u16).to_le_bytes());
+        for idx in &meta.indexes {
+            let idx_name = idx.name.as_bytes();
+            buf.extend_from_slice(&(idx_name.len() as u16).to_le_bytes());
+            buf.extend_from_slice(idx_name);
+
+            buf.extend_from_slice(&(idx.columns.len() as u16).to_le_bytes());
+            for col in &idx.columns {
+                let col_bytes = col.as_bytes();
+                buf.extend_from_slice(&(col_bytes.len() as u16).to_le_bytes());
+                buf.extend_from_slice(col_bytes);
+            }
+
+            buf.push(if idx.unique { 1 } else { 0 });
+            buf.extend_from_slice(&idx.root_page.to_le_bytes());
+        }
+
+        buf.push(if meta.encrypted { 1 } else { 0 });
     }
-    Ok(())
+
+    buf
 }
 
-/// Serialize the table registry into a system page.
-/// Takes pre-collected metadata to avoid needing per-table locks.
+/// Serialize metas into page 0 + (if needed) a chain of overflow pages.
+/// Takes an allocator callback for assigning page numbers to overflow pages.
+/// Returns (page0, vec of (page_no, overflow_page) in chain order).
+///
+/// Caller (in `persist_registry`) writes page0 first via put_page(0, _),
+/// then each (page_no, overflow_page) via put_page(page_no, _). Old
+/// overflow pages from a prior larger schema become orphaned — the
+/// engine has no free-list, consistent with how drop_table orphans
+/// data pages today.
 fn serialize_system_page(
     metas: &[TableMeta],
     next_table_id: u32,
-) -> Result<Page> {
-    let mut page = Page::new_system();
-    let data = &mut page.data;
+    allocator: &mut impl FnMut() -> Result<u32>,
+) -> Result<(Page, Vec<(u32, Page)>)> {
+    let bytes = serialize_system_metas(metas, next_table_id);
 
-    let mut offset = 16; // after page header
+    let mut page0 = Page::new_system();
 
-    // System page magic — must match on read or the page is corrupt.
-    check_sys_page_bounds(offset, 4)?;
-    data[offset..offset + 4].copy_from_slice(&SYSTEM_PAGE_MAGIC.to_le_bytes());
-    offset += 4;
-
-    // next_table_id
-    check_sys_page_bounds(offset, 4)?;
-    data[offset..offset + 4].copy_from_slice(&next_table_id.to_le_bytes());
-    offset += 4;
-
-    // num_tables
-    check_sys_page_bounds(offset, 2)?;
-    let num_tables = metas.len() as u16;
-    data[offset..offset + 2].copy_from_slice(&num_tables.to_le_bytes());
-    offset += 2;
-
-    for meta in metas {
-        // table_id + root_page + row_count + next_rowid = 4+4+8+8 = 24
-        check_sys_page_bounds(offset, 24)?;
-        data[offset..offset + 4].copy_from_slice(&meta.table_id.to_le_bytes());
-        offset += 4;
-        data[offset..offset + 4].copy_from_slice(&meta.root_page.to_le_bytes());
-        offset += 4;
-        data[offset..offset + 8].copy_from_slice(&meta.row_count.to_le_bytes());
-        offset += 8;
-        data[offset..offset + 8].copy_from_slice(&meta.next_rowid.to_le_bytes());
-        offset += 8;
-
-        // name
-        let name_bytes = meta.name.as_bytes();
-        check_sys_page_bounds(offset, 2 + name_bytes.len())?;
-        data[offset..offset + 2].copy_from_slice(&(name_bytes.len() as u16).to_le_bytes());
-        offset += 2;
-        data[offset..offset + name_bytes.len()].copy_from_slice(name_bytes);
-        offset += name_bytes.len();
-
-        // columns
-        check_sys_page_bounds(offset, 2)?;
-        data[offset..offset + 2].copy_from_slice(&(meta.columns.len() as u16).to_le_bytes());
-        offset += 2;
-
-        for col in &meta.columns {
-            let col_name = col.name.as_bytes();
-            check_sys_page_bounds(offset, 2 + col_name.len() + 3)?;
-            data[offset..offset + 2].copy_from_slice(&(col_name.len() as u16).to_le_bytes());
-            offset += 2;
-            data[offset..offset + col_name.len()].copy_from_slice(col_name);
-            offset += col_name.len();
-            data[offset] = type_to_tag(col.col_type);
-            offset += 1;
-            data[offset] = if col.nullable { 1 } else { 0 };
-            offset += 1;
-            data[offset] = if col.unique { 1 } else { 0 };
-            offset += 1;
-
-            // v2 fields: dropped flag + optional default value
-            check_sys_page_bounds(offset, 1)?;
-            data[offset] = if col.dropped { 1 } else { 0 };
-            offset += 1;
-            match &col.default {
-                None => {
-                    check_sys_page_bounds(offset, 1)?;
-                    data[offset] = 0; // has_default = false
-                    offset += 1;
-                }
-                Some(v) => {
-                    check_sys_page_bounds(offset, 1)?;
-                    data[offset] = 1; // has_default = true
-                    offset += 1;
-                    let vb = crate::row::encode_value_to_vec(v);
-                    check_sys_page_bounds(offset, 2 + vb.len())?;
-                    data[offset..offset + 2].copy_from_slice(&(vb.len() as u16).to_le_bytes());
-                    offset += 2;
-                    data[offset..offset + vb.len()].copy_from_slice(&vb);
-                    offset += vb.len();
-                }
-            }
-        }
-
-        // Indexes
-        let num_indexes = meta.indexes.len() as u16;
-        check_sys_page_bounds(offset, 2)?;
-        data[offset..offset + 2].copy_from_slice(&num_indexes.to_le_bytes());
-        offset += 2;
-
-        for idx in &meta.indexes {
-            let idx_name = idx.name.as_bytes();
-            check_sys_page_bounds(offset, 2 + idx_name.len())?;
-            data[offset..offset + 2].copy_from_slice(&(idx_name.len() as u16).to_le_bytes());
-            offset += 2;
-            data[offset..offset + idx_name.len()].copy_from_slice(idx_name);
-            offset += idx_name.len();
-
-            // columns: count (u16) + each (len-prefixed name)
-            check_sys_page_bounds(offset, 2)?;
-            data[offset..offset + 2].copy_from_slice(&(idx.columns.len() as u16).to_le_bytes());
-            offset += 2;
-            for col in &idx.columns {
-                let col_bytes = col.as_bytes();
-                check_sys_page_bounds(offset, 2 + col_bytes.len())?;
-                data[offset..offset + 2].copy_from_slice(&(col_bytes.len() as u16).to_le_bytes());
-                offset += 2;
-                data[offset..offset + col_bytes.len()].copy_from_slice(col_bytes);
-                offset += col_bytes.len();
-            }
-
-            // unique byte
-            check_sys_page_bounds(offset, 1)?;
-            data[offset] = if idx.unique { 1 } else { 0 };
-            offset += 1;
-
-            check_sys_page_bounds(offset, 4)?;
-            data[offset..offset + 4].copy_from_slice(&idx.root_page.to_le_bytes());
-            offset += 4;
-        }
-
-        // encrypted flag
-        check_sys_page_bounds(offset, 1)?;
-        data[offset] = if meta.encrypted { 1 } else { 0 };
-        offset += 1;
+    if bytes.len() <= SYSTEM_INLINE_BUDGET {
+        // Inline-only path: copy bytes into page 0 after the header. No trailer.
+        let start = PAGE_HEADER_SIZE;
+        page0.data[start..start + bytes.len()].copy_from_slice(&bytes);
+        page0.update_checksum();
+        return Ok((page0, vec![]));
     }
 
-    page.update_checksum();
-    Ok(page)
+    // Chained path: copy the first SYSTEM_INLINE_BUDGET bytes inline + write
+    // the trailer at offset PAGE_HEADER_SIZE + SYSTEM_INLINE_BUDGET. Then
+    // build overflow pages for the remainder.
+    let inline_bytes = &bytes[..SYSTEM_INLINE_BUDGET];
+    let overflow_bytes = &bytes[SYSTEM_INLINE_BUDGET..];
+
+    // Allocate overflow pages first so we know first_page for the trailer.
+    let mut overflow_pages: Vec<(u32, Page)> = Vec::new();
+    let chunks: Vec<&[u8]> = overflow_bytes
+        .chunks(crate::overflow::OVERFLOW_PAYLOAD_MAX)
+        .collect();
+    let mut page_numbers: Vec<u32> = Vec::with_capacity(chunks.len());
+    for _ in 0..chunks.len() {
+        page_numbers.push(allocator()?);
+    }
+    for (i, chunk) in chunks.iter().enumerate() {
+        let next_page = if i + 1 < page_numbers.len() {
+            page_numbers[i + 1]
+        } else {
+            0 // end-of-chain sentinel
+        };
+        overflow_pages.push((
+            page_numbers[i],
+            crate::overflow::build_overflow_page(chunk, next_page),
+        ));
+    }
+
+    // Page 0: inline bytes + trailer at offset PAGE_HEADER_SIZE + SYSTEM_INLINE_BUDGET.
+    let inline_start = PAGE_HEADER_SIZE;
+    page0.data[inline_start..inline_start + SYSTEM_INLINE_BUDGET]
+        .copy_from_slice(inline_bytes);
+
+    let trailer_start = inline_start + SYSTEM_INLINE_BUDGET;
+    page0.data[trailer_start..trailer_start + 2]
+        .copy_from_slice(&crate::overflow::OVERFLOW_MAGIC);
+    page0.data[trailer_start + 2..trailer_start + 6]
+        .copy_from_slice(&page_numbers[0].to_le_bytes());
+    // Guard against silent u32 truncation if a schema were absurdly large.
+    // Practically impossible (no schema is 4GB) but a load-bearing serializer
+    // shouldn't have a silent lossy cast.
+    debug_assert!(
+        overflow_bytes.len() <= u32::MAX as usize,
+        "system page overflow exceeds u32 ({})",
+        overflow_bytes.len(),
+    );
+    page0.data[trailer_start + 6..trailer_start + 10]
+        .copy_from_slice(&(overflow_bytes.len() as u32).to_le_bytes());
+
+    page0.update_checksum();
+    Ok((page0, overflow_pages))
 }
 
-/// Deserialize the table registry from a system page.
-/// Returns (tables, next_table_id).
-fn deserialize_system_page(
-    page: &Page,
-) -> Result<(Vec<TableMeta>, u32)> {
-    let data = &page.data;
-    let mut offset = 16; // skip page header
+/// Deserialize the table registry from a contiguous byte stream. Pure data —
+/// no page in mind. The page-layer `deserialize_system_page` reassembles
+/// the byte stream from page 0 + optional overflow chain before calling here.
+fn deserialize_system_metas(bytes: &[u8]) -> Result<(Vec<TableMeta>, u32)> {
+    let mut offset = 0usize;
 
-    // System page magic — must equal SYSTEM_PAGE_MAGIC or the page is corrupt.
-    let magic = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
+    // Magic
+    if bytes.len() < 4 {
+        return Err(BoogyError::Corruption("system page: truncated (no magic)".into()));
+    }
+    let magic = u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap());
+    offset += 4;
     if magic != SYSTEM_PAGE_MAGIC {
         return Err(BoogyError::Corruption(format!(
-            "bad system page magic: {magic:#010x}"
+            "system page magic mismatch: 0x{magic:08X} != 0x{:08X}",
+            SYSTEM_PAGE_MAGIC
         )));
     }
-    offset += 4;
-    // next_table_id follows the magic directly.
 
     // next_table_id
-    let next_table_id = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
+    if bytes.len() < offset + 4 {
+        return Err(BoogyError::Corruption("system page: truncated at next_table_id".into()));
+    }
+    let next_table_id = u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap());
     offset += 4;
 
     // num_tables
-    let num_tables = u16::from_le_bytes(data[offset..offset + 2].try_into().unwrap()) as usize;
+    if bytes.len() < offset + 2 {
+        return Err(BoogyError::Corruption("system page: truncated at num_tables".into()));
+    }
+    let num_tables = u16::from_le_bytes(bytes[offset..offset + 2].try_into().unwrap()) as usize;
     offset += 2;
 
     let mut tables = Vec::with_capacity(num_tables);
 
     for _ in 0..num_tables {
-        if offset + 24 > SYSTEM_PAGE_PAYLOAD {
+        if bytes.len() < offset + 24 {
             return Err(BoogyError::Corruption("system page truncated in table header".into()));
         }
-        let table_id = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
+        let table_id = u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap());
         offset += 4;
 
-        let root_page = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
+        let root_page = u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap());
         offset += 4;
 
-        let row_count = u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap());
+        let row_count = u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap());
         offset += 8;
 
-        let next_rowid = u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap());
+        let next_rowid = u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap());
         offset += 8;
 
-        if offset + 2 > SYSTEM_PAGE_PAYLOAD {
+        if bytes.len() < offset + 2 {
             return Err(BoogyError::Corruption("system page truncated at table name length".into()));
         }
-        let name_len = u16::from_le_bytes(data[offset..offset + 2].try_into().unwrap()) as usize;
+        let name_len = u16::from_le_bytes(bytes[offset..offset + 2].try_into().unwrap()) as usize;
         offset += 2;
-        if offset + name_len > SYSTEM_PAGE_PAYLOAD {
+        if bytes.len() < offset + name_len {
             return Err(BoogyError::Corruption("system page truncated at table name".into()));
         }
-        let name = String::from_utf8(data[offset..offset + name_len].to_vec())
+        let name = String::from_utf8(bytes[offset..offset + name_len].to_vec())
             .map_err(|_| BoogyError::Corruption("invalid utf8 in table name".into()))?;
         offset += name_len;
 
-        if offset + 2 > SYSTEM_PAGE_PAYLOAD {
+        if bytes.len() < offset + 2 {
             return Err(BoogyError::Corruption("system page truncated at column count".into()));
         }
         let num_columns =
-            u16::from_le_bytes(data[offset..offset + 2].try_into().unwrap()) as usize;
+            u16::from_le_bytes(bytes[offset..offset + 2].try_into().unwrap()) as usize;
         offset += 2;
 
         let mut columns = Vec::with_capacity(num_columns);
         for _ in 0..num_columns {
-            if offset + 2 > SYSTEM_PAGE_PAYLOAD {
+            if bytes.len() < offset + 2 {
                 return Err(BoogyError::Corruption("system page truncated at column name length".into()));
             }
             let col_name_len =
-                u16::from_le_bytes(data[offset..offset + 2].try_into().unwrap()) as usize;
+                u16::from_le_bytes(bytes[offset..offset + 2].try_into().unwrap()) as usize;
             offset += 2;
-            if offset + col_name_len + 3 > SYSTEM_PAGE_PAYLOAD {
+            if bytes.len() < offset + col_name_len + 3 {
                 return Err(BoogyError::Corruption("system page truncated at column data".into()));
             }
-            let col_name = String::from_utf8(data[offset..offset + col_name_len].to_vec())
+            let col_name = String::from_utf8(bytes[offset..offset + col_name_len].to_vec())
                 .map_err(|_| BoogyError::Corruption("invalid utf8 in column name".into()))?;
             offset += col_name_len;
-            let type_tag = data[offset];
+            let type_tag = bytes[offset];
             offset += 1;
-            let nullable = data[offset] != 0;
+            let nullable = bytes[offset] != 0;
             offset += 1;
-            let unique = data[offset] != 0;
+            let unique = bytes[offset] != 0;
             offset += 1;
 
             // dropped flag + optional default value
-            if offset + 1 > SYSTEM_PAGE_PAYLOAD {
+            if bytes.len() < offset + 1 {
                 return Err(BoogyError::Corruption("system page truncated at column dropped flag".into()));
             }
-            let dropped = data[offset] != 0;
+            let dropped = bytes[offset] != 0;
             offset += 1;
-            if offset + 1 > SYSTEM_PAGE_PAYLOAD {
+            if bytes.len() < offset + 1 {
                 return Err(BoogyError::Corruption("system page truncated at column has_default flag".into()));
             }
-            let has_default = data[offset] != 0;
+            let has_default = bytes[offset] != 0;
             offset += 1;
             let col_default = if has_default {
-                if offset + 2 > SYSTEM_PAGE_PAYLOAD {
+                if bytes.len() < offset + 2 {
                     return Err(BoogyError::Corruption("system page truncated at column default length".into()));
                 }
-                let vlen = u16::from_le_bytes(data[offset..offset + 2].try_into().unwrap()) as usize;
+                let vlen = u16::from_le_bytes(bytes[offset..offset + 2].try_into().unwrap()) as usize;
                 offset += 2;
-                if offset + vlen > SYSTEM_PAGE_PAYLOAD {
+                if bytes.len() < offset + vlen {
                     return Err(BoogyError::Corruption("system page truncated at column default value".into()));
                 }
-                let (v, _) = crate::row::decode_value(&data[offset..offset + vlen])?;
+                let (v, _) = crate::row::decode_value(&bytes[offset..offset + vlen])?;
                 offset += vlen;
                 Some(v)
             } else {
@@ -628,61 +649,61 @@ fn deserialize_system_page(
         meta.next_rowid = next_rowid;
 
         // Indexes
-        if offset + 2 > SYSTEM_PAGE_PAYLOAD {
+        if bytes.len() < offset + 2 {
             return Err(BoogyError::Corruption("system page truncated at index count".into()));
         }
-        let num_indexes = u16::from_le_bytes(data[offset..offset + 2].try_into().unwrap()) as usize;
+        let num_indexes = u16::from_le_bytes(bytes[offset..offset + 2].try_into().unwrap()) as usize;
         offset += 2;
 
         for _ in 0..num_indexes {
-            if offset + 2 > SYSTEM_PAGE_PAYLOAD {
+            if bytes.len() < offset + 2 {
                 return Err(BoogyError::Corruption("system page truncated at index name length".into()));
             }
             let idx_name_len =
-                u16::from_le_bytes(data[offset..offset + 2].try_into().unwrap()) as usize;
+                u16::from_le_bytes(bytes[offset..offset + 2].try_into().unwrap()) as usize;
             offset += 2;
-            if offset + idx_name_len > SYSTEM_PAGE_PAYLOAD {
+            if bytes.len() < offset + idx_name_len {
                 return Err(BoogyError::Corruption("system page truncated at index name".into()));
             }
-            let idx_name = String::from_utf8(data[offset..offset + idx_name_len].to_vec())
+            let idx_name = String::from_utf8(bytes[offset..offset + idx_name_len].to_vec())
                 .map_err(|_| BoogyError::Corruption("invalid utf8 in index name".into()))?;
             offset += idx_name_len;
 
             // columns: count (u16) + each (len-prefixed name)
-            if offset + 2 > SYSTEM_PAGE_PAYLOAD {
+            if bytes.len() < offset + 2 {
                 return Err(BoogyError::Corruption("system page truncated at index column count".into()));
             }
             let num_idx_cols =
-                u16::from_le_bytes(data[offset..offset + 2].try_into().unwrap()) as usize;
+                u16::from_le_bytes(bytes[offset..offset + 2].try_into().unwrap()) as usize;
             offset += 2;
             let mut idx_columns = Vec::with_capacity(num_idx_cols);
             for _ in 0..num_idx_cols {
-                if offset + 2 > SYSTEM_PAGE_PAYLOAD {
+                if bytes.len() < offset + 2 {
                     return Err(BoogyError::Corruption("system page truncated at index column length".into()));
                 }
                 let idx_col_len =
-                    u16::from_le_bytes(data[offset..offset + 2].try_into().unwrap()) as usize;
+                    u16::from_le_bytes(bytes[offset..offset + 2].try_into().unwrap()) as usize;
                 offset += 2;
-                if offset + idx_col_len > SYSTEM_PAGE_PAYLOAD {
+                if bytes.len() < offset + idx_col_len {
                     return Err(BoogyError::Corruption("system page truncated at index column".into()));
                 }
-                let idx_col = String::from_utf8(data[offset..offset + idx_col_len].to_vec())
+                let idx_col = String::from_utf8(bytes[offset..offset + idx_col_len].to_vec())
                     .map_err(|_| BoogyError::Corruption("invalid utf8 in index column".into()))?;
                 offset += idx_col_len;
                 idx_columns.push(idx_col);
             }
 
             // unique byte
-            if offset + 1 > SYSTEM_PAGE_PAYLOAD {
+            if bytes.len() < offset + 1 {
                 return Err(BoogyError::Corruption("system page truncated at index unique flag".into()));
             }
-            let idx_unique = data[offset] != 0;
+            let idx_unique = bytes[offset] != 0;
             offset += 1;
 
-            if offset + 4 > SYSTEM_PAGE_PAYLOAD {
+            if bytes.len() < offset + 4 {
                 return Err(BoogyError::Corruption("system page truncated at index root page".into()));
             }
-            let idx_root_page = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
+            let idx_root_page = u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap());
             offset += 4;
 
             meta.indexes.push(IndexMeta {
@@ -694,8 +715,8 @@ fn deserialize_system_page(
         }
 
         // encrypted flag
-        let encrypted = if offset < SYSTEM_PAGE_PAYLOAD {
-            let e = data[offset] != 0;
+        let encrypted = if offset < bytes.len() {
+            let e = bytes[offset] != 0;
             offset += 1;
             e
         } else {
@@ -707,6 +728,77 @@ fn deserialize_system_page(
     }
 
     Ok((tables, next_table_id))
+}
+
+/// Deserialize page 0 (+ any overflow chain) into the table registry.
+fn deserialize_system_page(
+    page0: &Page,
+    file: &PageFile,
+) -> Result<(Vec<TableMeta>, u32)> {
+    // Inline bytes start right after the page header.
+    let inline_start = PAGE_HEADER_SIZE;
+    let trailer_start = inline_start + SYSTEM_INLINE_BUDGET;
+    let trailer_end = trailer_start + crate::overflow::OVERFLOW_TRAILER_SIZE;
+
+    // Check for overflow trailer at the fixed offset.
+    let has_trailer = page0.data[trailer_start..trailer_start + 2]
+        == crate::overflow::OVERFLOW_MAGIC;
+
+    if !has_trailer {
+        // Inline-only: the bytes the metas were serialized into start at
+        // PAGE_HEADER_SIZE and end at PAGE_HEADER_SIZE + SYSTEM_INLINE_BUDGET.
+        // The pure-data deserializer reads until num_tables tells it to stop;
+        // any trailing zero bytes are ignored by that bounds-driven parse.
+        return deserialize_system_metas(&page0.data[inline_start..trailer_start]);
+    }
+
+    // Chained: decode the trailer + walk the chain.
+    let first_page = u32::from_le_bytes(
+        page0.data[trailer_start + 2..trailer_start + 6].try_into().unwrap(),
+    );
+    let remaining_len = u32::from_le_bytes(
+        page0.data[trailer_start + 6..trailer_end].try_into().unwrap(),
+    ) as usize;
+
+    // Defensive: a present trailer with first_page == 0 and remaining_len > 0
+    // is a corrupt trailer (clearer diagnostic than "chain truncated: 0 of N").
+    if first_page == 0 && remaining_len > 0 {
+        return Err(BoogyError::Corruption(format!(
+            "system page trailer present but first_page is 0 (remaining_len={remaining_len})"
+        )));
+    }
+
+    let mut bytes = Vec::with_capacity(SYSTEM_INLINE_BUDGET + remaining_len);
+    bytes.extend_from_slice(&page0.data[inline_start..trailer_start]);
+
+    let mut current = first_page;
+    let mut accumulated = 0usize;
+    while current != 0 && accumulated < remaining_len {
+        let page = file.read_page(current)?;
+        // Defensive: in a corrupt or future-free-list scenario, a chain link
+        // could point at a non-overflow page (e.g. a btree node). Validate the
+        // page type before trusting its overflow-payload-len byte.
+        if !page.is_overflow() {
+            return Err(BoogyError::Corruption(format!(
+                "system page chain hit non-overflow page {current} (flags=0x{:04X})",
+                page.flags()
+            )));
+        }
+        let payload = crate::overflow::read_overflow_payload(&page);
+        let take = (remaining_len - accumulated).min(payload.len());
+        bytes.extend_from_slice(&payload[..take]);
+        accumulated += take;
+        current = page.overflow_next();
+    }
+
+    if accumulated < remaining_len {
+        return Err(BoogyError::Corruption(format!(
+            "system page overflow chain truncated: accumulated {} of {} bytes",
+            accumulated, remaining_len
+        )));
+    }
+
+    deserialize_system_metas(&bytes)
 }
 
 /// Validate that a path does not contain traversal attacks or null bytes.
@@ -771,7 +863,7 @@ impl BoogyDb {
         if file.page_count() > 0 {
             let sys_page = file.read_page(0)?;
             if sys_page.flags() & PAGE_SYSTEM != 0 {
-                let (metas, next_id) = deserialize_system_page(&sys_page)?;
+                let (metas, next_id) = deserialize_system_page(&sys_page, &file)?;
                 next_table_id = next_id;
                 for meta in metas {
                     let name = meta.name.clone();
@@ -926,8 +1018,12 @@ impl BoogyDb {
             guard.allocate_page()?;
         }
 
-        let page = serialize_system_page(metas, next_table_id)?;
-        guard.put_page(0, page);
+        let (page0, overflow_pages) =
+            serialize_system_page(metas, next_table_id, &mut || guard.allocate_page())?;
+        guard.put_page(0, page0);
+        for (page_no, overflow_page) in overflow_pages {
+            guard.put_page(page_no, overflow_page);
+        }
 
         Self::commit_write(guard, file, wal, durability, 0, None)?;
         Ok(())
@@ -3309,8 +3405,13 @@ impl Drop for BoogyDb {
             if self.file.page_count() == 0 {
                 let _ = guard.allocate_page();
             }
-            if let Ok(page) = serialize_system_page(&metas, next_id) {
-                guard.put_page(0, page);
+            if let Ok((page0, overflow_pages)) =
+                serialize_system_page(&metas, next_id, &mut || guard.allocate_page())
+            {
+                guard.put_page(0, page0);
+                for (page_no, overflow_page) in overflow_pages {
+                    guard.put_page(page_no, overflow_page);
+                }
             }
             let _ = guard.commit();
         }
@@ -6137,6 +6238,332 @@ mod tests {
         assert!(
             msg.contains("no_such_table"),
             "error must name the missing table; got: {msg}",
+        );
+    }
+
+    // ─── System-page overflow chain tests ────────────────────────────────────
+
+    #[test]
+    fn test_system_page_inline_when_schema_fits() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.boogy");
+        let db = BoogyDb::open(&path).unwrap();
+
+        // 3 small tables — fits comfortably inline (~150 bytes total).
+        for i in 0..3 {
+            db.create_table(
+                &format!("t{i}"),
+                &[ColumnDef::new("c", Type::Text)],
+            ).unwrap();
+        }
+
+        // Reopen + verify all 3 tables present.
+        drop(db);
+        let db = BoogyDb::open(&path).unwrap();
+        let tables = db.tables.read().unwrap();
+        assert_eq!(tables.len(), 3);
+        for i in 0..3 {
+            assert!(tables.contains_key(&format!("t{i}")));
+        }
+
+        // Verify page 0 has NO overflow trailer.
+        let page0 = db.file.read_page(0).unwrap();
+        let trailer_start = PAGE_HEADER_SIZE + SYSTEM_INLINE_BUDGET;
+        assert_ne!(
+            page0.data[trailer_start..trailer_start + 2],
+            crate::overflow::OVERFLOW_MAGIC,
+            "small schema must not produce an overflow trailer"
+        );
+    }
+
+    #[test]
+    fn test_system_page_overflows_to_chain() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.boogy");
+        let db = BoogyDb::open(&path).unwrap();
+
+        // 25 tables with long names + 2 indexes each → ~200-300 bytes per table,
+        // ~5-7.5KB total > SYSTEM_INLINE_BUDGET.
+        let long_col_a = "very_long_column_name_for_overflow_test_a";
+        let long_col_b = "very_long_column_name_for_overflow_test_b";
+        for i in 0..25 {
+            let table = format!("table_with_long_name_{i:02}");
+            db.create_table(&table, &[
+                ColumnDef::new(long_col_a, Type::Text),
+                ColumnDef::new(long_col_b, Type::Integer),
+            ]).unwrap();
+            db.create_index(&table, &format!("idx_a_{i}"), long_col_a).unwrap();
+            db.create_index(&table, &format!("idx_b_{i}"), long_col_b).unwrap();
+        }
+
+        // Page 0 must have the overflow trailer.
+        let page0 = db.file.read_page(0).unwrap();
+        let trailer_start = PAGE_HEADER_SIZE + SYSTEM_INLINE_BUDGET;
+        assert_eq!(
+            page0.data[trailer_start..trailer_start + 2],
+            crate::overflow::OVERFLOW_MAGIC,
+            "schema with 25 tables must produce an overflow trailer"
+        );
+
+        // All 25 tables present.
+        let tables = db.tables.read().unwrap();
+        assert_eq!(tables.len(), 25);
+        for i in 0..25 {
+            assert!(tables.contains_key(&format!("table_with_long_name_{i:02}")));
+        }
+    }
+
+    #[test]
+    fn test_system_page_overflow_chain_reopen_persistence() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.boogy");
+
+        {
+            let db = BoogyDb::open(&path).unwrap();
+            for i in 0..25 {
+                let table = format!("table_persist_{i:02}");
+                db.create_table(&table, &[
+                    ColumnDef::new("text_col", Type::Text),
+                    ColumnDef::new("int_col", Type::Integer),
+                    ColumnDef::new("real_col", Type::Real),
+                    ColumnDef::new("bool_col", Type::Boolean),
+                    ColumnDef::new("blob_col", Type::Blob),
+                ]).unwrap();
+                db.create_index(&table, &format!("idx_text_{i}"), "text_col").unwrap();
+                db.create_index_ex(&table, &format!("idx_uniq_{i}"), &["int_col"], true).unwrap();
+            }
+        } // db dropped — WAL flushed
+
+        // Reopen + verify full round-trip.
+        let db = BoogyDb::open(&path).unwrap();
+        let tables = db.tables.read().unwrap();
+        assert_eq!(tables.len(), 25);
+
+        for i in 0..25 {
+            let name = format!("table_persist_{i:02}");
+            let table_state = tables.get(&name).expect("table missing after reopen");
+            let state = table_state.read().unwrap();
+            let meta = &state.meta;
+
+            assert_eq!(meta.columns.len(), 5);
+            assert_eq!(meta.columns[0].name, "text_col");
+            assert_eq!(meta.columns[0].col_type, Type::Text);
+            assert_eq!(meta.columns[1].col_type, Type::Integer);
+            assert_eq!(meta.columns[2].col_type, Type::Real);
+            assert_eq!(meta.columns[3].col_type, Type::Boolean);
+            assert_eq!(meta.columns[4].col_type, Type::Blob);
+
+            assert_eq!(meta.indexes.len(), 2);
+            assert!(meta.indexes.iter().any(|idx| idx.name == format!("idx_text_{i}") && !idx.unique));
+            assert!(meta.indexes.iter().any(|idx| idx.name == format!("idx_uniq_{i}") && idx.unique));
+        }
+    }
+
+    #[test]
+    fn test_system_page_overflow_chain_shrinks_when_tables_dropped() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.boogy");
+        let db = BoogyDb::open(&path).unwrap();
+
+        // Use same sizing as test_system_page_overflows_to_chain: 2 long columns
+        // + 2 indexes per table to guarantee we exceed the inline budget.
+        let long_col_a = "very_long_column_name_for_overflow_test_a";
+        let long_col_b = "very_long_column_name_for_overflow_test_b";
+        for i in 0..25 {
+            let table = format!("shrink_table_{i:02}");
+            db.create_table(&table, &[
+                ColumnDef::new(long_col_a, Type::Text),
+                ColumnDef::new(long_col_b, Type::Integer),
+            ]).unwrap();
+            db.create_index(&table, &format!("shrink_idx_a_{i}"), long_col_a).unwrap();
+            db.create_index(&table, &format!("shrink_idx_b_{i}"), long_col_b).unwrap();
+        }
+
+        // Trailer present after creating 25 large tables.
+        {
+            let page0 = db.file.read_page(0).unwrap();
+            let trailer_start = PAGE_HEADER_SIZE + SYSTEM_INLINE_BUDGET;
+            assert_eq!(
+                page0.data[trailer_start..trailer_start + 2],
+                crate::overflow::OVERFLOW_MAGIC,
+                "25 large tables must produce an overflow trailer"
+            );
+        }
+
+        // Drop 22 of 25.
+        for i in 0..22 {
+            db.drop_table(&format!("shrink_table_{i:02}")).unwrap();
+        }
+
+        // Trailer GONE — schema now fits inline.
+        let page0 = db.file.read_page(0).unwrap();
+        let trailer_start = PAGE_HEADER_SIZE + SYSTEM_INLINE_BUDGET;
+        assert_ne!(
+            page0.data[trailer_start..trailer_start + 2],
+            crate::overflow::OVERFLOW_MAGIC,
+            "after dropping most tables, schema should fit inline (no trailer)"
+        );
+        // NOTE: page reuse is NOT asserted — the engine has no free-list;
+        // old overflow pages are orphaned, consistent with drop_table's existing
+        // behavior for data pages (see followup §5 in migration-followups).
+    }
+
+    #[test]
+    fn test_system_page_overflow_survives_partial_write_via_wal() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.boogy");
+
+        // Phase 1: small schema, persisted normally.
+        {
+            let db = BoogyDb::open(&path).unwrap();
+            for i in 0..3 {
+                db.create_table(
+                    &format!("phase1_{i}"),
+                    &[ColumnDef::new("c", Type::Text)],
+                ).unwrap();
+            }
+        } // db dropped — WAL checkpointed
+
+        // Phase 2: add many tables to force overflow, then drop without explicit
+        // sync (simulating a process exit before WAL checkpoint).
+        {
+            let db = BoogyDb::open(&path).unwrap();
+            let long_col = "very_long_column_name_for_overflow_test";
+            for i in 0..25 {
+                db.create_table(
+                    &format!("phase2_{i:02}"),
+                    &[ColumnDef::new(long_col, Type::Text)],
+                ).unwrap();
+            }
+            // Drop without explicit sync — WAL atomicity protects us.
+        }
+
+        // Phase 3: reopen. Schema must be parseable (no corruption); EITHER
+        // the pre-phase-2 state (3 tables) or the post-phase-2 state (28 tables)
+        // is acceptable — a torn intermediate state is NOT acceptable.
+        let db = BoogyDb::open(&path).unwrap();
+        let tables = db.tables.read().unwrap();
+        let count = tables.len();
+        assert!(
+            count == 3 || count == 28,
+            "schema must be either pre-crash (3) or post-crash (28), got {count}",
+        );
+        for (name, table_state) in tables.iter() {
+            let state = table_state.read().unwrap();
+            assert!(!state.meta.columns.is_empty(), "table {name} has no columns — corrupt");
+        }
+    }
+
+    #[test]
+    fn test_serialize_system_metas_handles_large_schemas_without_panic() {
+        let metas: Vec<TableMeta> = (0..100)
+            .map(|i| {
+                let mut meta = TableMeta::new(
+                    format!("t{i:03}"),
+                    i as u32 + 1,
+                    vec![
+                        ColumnDef::new("c1", Type::Text),
+                        ColumnDef::new("c2", Type::Integer),
+                    ],
+                    100 + i as u32, // root_page
+                );
+                meta.indexes.push(IndexMeta {
+                    name: format!("idx_{i}"),
+                    columns: vec!["c1".to_string()],
+                    unique: false,
+                    root_page: 1000 + i as u32,
+                });
+                meta
+            })
+            .collect();
+
+        let bytes = serialize_system_metas(&metas, 101);
+
+        // Must be large enough to need overflow.
+        assert!(
+            bytes.len() > SYSTEM_INLINE_BUDGET,
+            "100 tables must overflow inline budget (got {} bytes)", bytes.len(),
+        );
+
+        // Must round-trip through deserialize_system_metas.
+        let (recovered_metas, next_id) = deserialize_system_metas(&bytes).unwrap();
+        assert_eq!(recovered_metas.len(), 100);
+        assert_eq!(next_id, 101);
+        for (i, meta) in recovered_metas.iter().enumerate() {
+            assert_eq!(meta.name, format!("t{i:03}"));
+            assert_eq!(meta.columns.len(), 2);
+            assert_eq!(meta.indexes.len(), 1);
+        }
+    }
+
+    // ─── Regression tests for T1's defensive paths ───────────────────────────
+
+    #[test]
+    fn test_deserialize_system_page_errors_on_corrupt_trailer_with_zero_first_page() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.boogy");
+        let db = BoogyDb::open(&path).unwrap();
+        db.create_table("t", &[ColumnDef::new("c", Type::Text)]).unwrap();
+
+        // Read page 0, craft a corrupt trailer: magic present, first_page == 0,
+        // remaining_len > 0. This should trigger the defensive check:
+        // "trailer present but first_page is 0".
+        let mut corrupted = (*db.file.read_page(0).unwrap()).clone();
+        let trailer_start = PAGE_HEADER_SIZE + SYSTEM_INLINE_BUDGET;
+        corrupted.data[trailer_start..trailer_start + 2]
+            .copy_from_slice(&crate::overflow::OVERFLOW_MAGIC);
+        corrupted.data[trailer_start + 2..trailer_start + 6]
+            .copy_from_slice(&0u32.to_le_bytes()); // first_page = 0 (corrupt)
+        corrupted.data[trailer_start + 6..trailer_start + 10]
+            .copy_from_slice(&100u32.to_le_bytes()); // remaining_len = 100 (> 0)
+        corrupted.update_checksum();
+
+        let err = deserialize_system_page(&corrupted, &db.file).unwrap_err();
+        let msg = format!("{err:?}").to_lowercase();
+        assert!(
+            msg.contains("first_page is 0") || msg.contains("first_page=0"),
+            "expected first-page-zero corruption error, got: {err:?}",
+        );
+    }
+
+    #[test]
+    fn test_deserialize_system_page_errors_on_chain_pointing_at_non_overflow_page() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.boogy");
+        let db = BoogyDb::open(&path).unwrap();
+
+        // Create enough tables to force an overflow chain so we have at least
+        // one real data page (page 1 = system page's first overflow page).
+        // Then create one table (a btree root) to guarantee a non-overflow page
+        // exists at some page number > 0.
+        db.create_table("t", &[ColumnDef::new("c", Type::Text)]).unwrap();
+
+        // Craft a corrupt trailer on page 0 that points at page 0's next data
+        // page (page 1, which is a btree root — NOT an overflow page).
+        // This hits the `is_overflow()` defensive check in the chain walk.
+        //
+        // We need a page > 0 to point at. After create_table the btree root
+        // for "t" is at some page > 0. We'll point at page 1 regardless.
+        // If the engine happens to write an overflow page at page 1 this test
+        // might not hit the is_overflow() path, but for a single small table
+        // page 1 will be a btree leaf, not an overflow page.
+        let mut corrupted = (*db.file.read_page(0).unwrap()).clone();
+        let trailer_start = PAGE_HEADER_SIZE + SYSTEM_INLINE_BUDGET;
+        corrupted.data[trailer_start..trailer_start + 2]
+            .copy_from_slice(&crate::overflow::OVERFLOW_MAGIC);
+        corrupted.data[trailer_start + 2..trailer_start + 6]
+            .copy_from_slice(&1u32.to_le_bytes()); // first_page = 1 (btree node, not overflow)
+        corrupted.data[trailer_start + 6..trailer_start + 10]
+            .copy_from_slice(&100u32.to_le_bytes()); // remaining_len = 100 (> 0)
+        corrupted.update_checksum();
+
+        let err = deserialize_system_page(&corrupted, &db.file).unwrap_err();
+        // Must be a corruption error — either "non-overflow page" from the
+        // is_overflow() check, or another corruption family.
+        let msg = format!("{err:?}").to_lowercase();
+        assert!(
+            msg.contains("non-overflow") || msg.contains("corruption"),
+            "expected a corruption error, got: {err:?}",
         );
     }
 
