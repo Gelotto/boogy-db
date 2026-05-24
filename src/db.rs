@@ -2811,6 +2811,22 @@ impl BoogyDb {
         Ok(rowid)
     }
 
+    /// Atomic insert-or-update by unique-index key. Wraps the
+    /// transaction-scoped `AcidTransaction::upsert` in a one-shot
+    /// transaction for non-tx callers. See
+    /// `AcidTransaction::upsert` for the contract.
+    pub fn upsert(
+        &self,
+        table: &str,
+        key: &[(&str, Value)],
+        set: &[(&str, Value)],
+    ) -> Result<u64> {
+        let mut tx = AcidTransaction::new(self);
+        let rowid = tx.upsert(table, key, set)?;
+        tx.commit()?;
+        Ok(rowid)
+    }
+
     /// Run a multi-table transaction.
     pub fn transaction<F, R>(&self, f: F) -> Result<R>
     where
@@ -3993,6 +4009,83 @@ impl<'a> AcidTransaction<'a> {
                 data.push((*c, v.clone()));
             }
             data.push((counter, delta));
+            for (c, v) in set {
+                data.push((*c, v.clone()));
+            }
+            self.insert(table, &data)
+        }
+    }
+
+    /// Atomic insert-or-update by unique-index key (general set-semantics).
+    ///
+    /// If a row exists whose `key` column values match (looked up via a
+    /// table-scan with equality filters on the key columns), update
+    /// `set` columns on it (key columns untouched). Otherwise insert a
+    /// new row with `key + set`. Returns the row id (existing or
+    /// newly-inserted).
+    ///
+    /// Requires a unique index whose columns are exactly the `key`
+    /// columns (in any order) — the index is validated to exist (so
+    /// concurrent racing inserts on the same key fail at commit time
+    /// rather than producing duplicates), but the index is NOT used to
+    /// accelerate the lookup. Errors with `SchemaMismatch` if no such
+    /// unique index exists.
+    ///
+    /// If `set` overlaps `key` (i.e. `set` contains a column also in
+    /// `key`), the `set` value wins on the update path and the caller's
+    /// supplied key value is overwritten — same field-merge semantics
+    /// as `update`. Callers who need the key columns preserved should
+    /// pass them only in `key`, not in both.
+    pub fn upsert(
+        &mut self,
+        table: &str,
+        key: &[(&str, Value)],
+        set: &[(&str, Value)],
+    ) -> Result<u64> {
+        // Validate that a unique index exists with exactly the key columns
+        // (in any order — set-equality). Without this guard, an ambiguous
+        // key would silently use whatever filter find chooses — surface the
+        // contract violation as a loud SchemaMismatch instead.
+        let key_col_names: Vec<&str> = key.iter().map(|(c, _)| *c).collect();
+        let has_unique_idx = {
+            let table_state = self.table_state(table)?;
+            let state = table_state.read().unwrap();
+            let mut want: Vec<&str> = key_col_names.iter().copied().collect();
+            want.sort_unstable();
+            state.meta.indexes.iter().any(|m| {
+                if !m.unique || m.columns.len() != key_col_names.len() {
+                    return false;
+                }
+                let mut have: Vec<&str> = m.columns.iter().map(|s| s.as_str()).collect();
+                have.sort_unstable();
+                have == want
+            })
+        };
+        if !has_unique_idx {
+            let cols_disp = key_col_names.join(", ");
+            return Err(BoogyError::SchemaMismatch(format!(
+                "upsert requires a unique index on columns [{cols_disp}]; none found on table '{table}'"
+            )));
+        }
+
+        // Lookup by the full key tuple. Same uncommitted overlay as the write below.
+        let filters: Vec<Filter> = key.iter().map(|(c, v)| Filter::eq(*c, v.clone())).collect();
+        let existing = self.find(
+            table,
+            FindOptions { filters, limit: Some(1), ..Default::default() },
+        )?;
+
+        if let Some(row) = existing.rows.into_iter().next() {
+            // Update path: write set columns; key columns untouched.
+            let fields: Vec<(&str, Value)> = set.iter().map(|(c, v)| (*c, v.clone())).collect();
+            self.update(table, row.id, &fields)?;
+            Ok(row.id)
+        } else {
+            // Insert path: combine key + set columns into one insert.
+            let mut data: Vec<(&str, Value)> = Vec::with_capacity(key.len() + set.len());
+            for (c, v) in key {
+                data.push((*c, v.clone()));
+            }
             for (c, v) in set {
                 data.push((*c, v.clone()));
             }
@@ -6079,6 +6172,183 @@ mod tests {
         ]).unwrap();
         let r = db.upsert_increment("t", &[("k", "x".into())], "n", Value::Text("nope".into()), &[]);
         assert!(matches!(r, Err(BoogyError::SchemaMismatch(_))));
+    }
+
+    // ----- upsert (general set-semantics) -----
+
+    #[test]
+    fn test_upsert_insert_path_when_no_match() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.boogy");
+        let db = BoogyDb::open(&path).unwrap();
+        db.create_table("edges", &[
+            ColumnDef::new("user_a", Type::Text),
+            ColumnDef::new("user_b", Type::Text),
+            ColumnDef::new("weight", Type::Real),
+            ColumnDef::new("updated_at", Type::Integer),
+        ]).unwrap();
+        db.create_index_ex("edges", "uq_pair", &["user_a", "user_b"], true).unwrap();
+
+        let rowid = db.upsert(
+            "edges",
+            &[("user_a", Value::Text("alice".into())), ("user_b", Value::Text("bob".into()))],
+            &[("weight", Value::Real(0.85)), ("updated_at", Value::Integer(100))],
+        ).unwrap();
+
+        assert!(rowid > 0, "upsert should return a real row id, got {rowid}");
+
+        let row = db.get("edges", rowid).unwrap().expect("row should exist");
+        assert_eq!(row.get("user_a").unwrap(), Value::Text("alice".into()));
+        assert_eq!(row.get("user_b").unwrap(), Value::Text("bob".into()));
+        assert_eq!(row.get("weight").unwrap(), Value::Real(0.85));
+        assert_eq!(row.get("updated_at").unwrap(), Value::Integer(100));
+    }
+
+    #[test]
+    fn test_upsert_update_path_when_match_exists() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.boogy");
+        let db = BoogyDb::open(&path).unwrap();
+        db.create_table("edges", &[
+            ColumnDef::new("user_a", Type::Text),
+            ColumnDef::new("user_b", Type::Text),
+            ColumnDef::new("weight", Type::Real),
+            ColumnDef::new("updated_at", Type::Integer),
+        ]).unwrap();
+        db.create_index_ex("edges", "uq_pair", &["user_a", "user_b"], true).unwrap();
+
+        let first_id = db.insert("edges", &[
+            ("user_a", Value::Text("alice".into())),
+            ("user_b", Value::Text("bob".into())),
+            ("weight", Value::Real(0.5)),
+            ("updated_at", Value::Integer(50)),
+        ]).unwrap();
+
+        let returned_id = db.upsert(
+            "edges",
+            &[("user_a", Value::Text("alice".into())), ("user_b", Value::Text("bob".into()))],
+            &[("weight", Value::Real(0.9)), ("updated_at", Value::Integer(200))],
+        ).unwrap();
+
+        assert_eq!(returned_id, first_id,
+            "update path must return the existing row id, not allocate a new one");
+
+        let all = db.find("edges", FindOptions::default()).unwrap();
+        assert_eq!(all.rows.len(), 1, "upsert must not duplicate on key match");
+
+        let row = db.get("edges", first_id).unwrap().expect("row should still exist");
+        assert_eq!(row.get("user_a").unwrap(), Value::Text("alice".into()), "key column unchanged");
+        assert_eq!(row.get("user_b").unwrap(), Value::Text("bob".into()), "key column unchanged");
+        assert_eq!(row.get("weight").unwrap(), Value::Real(0.9), "set column updated");
+        assert_eq!(row.get("updated_at").unwrap(), Value::Integer(200), "set column updated");
+    }
+
+    #[test]
+    fn test_upsert_errors_without_matching_unique_index() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.boogy");
+        let db = BoogyDb::open(&path).unwrap();
+        db.create_table("edges", &[
+            ColumnDef::new("user_a", Type::Text),
+            ColumnDef::new("user_b", Type::Text),
+            ColumnDef::new("weight", Type::Real),
+        ]).unwrap();
+        // Note: NO unique index on (user_a, user_b).
+
+        let err = db.upsert(
+            "edges",
+            &[("user_a", Value::Text("alice".into())), ("user_b", Value::Text("bob".into()))],
+            &[("weight", Value::Real(0.5))],
+        ).unwrap_err();
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("unique index") || msg.contains("upsert"),
+            "error should clearly identify the missing-unique-index condition, got: {msg}",
+        );
+    }
+
+    #[test]
+    fn test_upsert_set_overlapping_key_overwrites_on_update_path() {
+        // Spec: when `set` overlaps `key`, the `set` value wins on the
+        // update path (same field-merge semantics as `update`).
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.boogy");
+        let db = BoogyDb::open(&path).unwrap();
+        db.create_table("edges", &[
+            ColumnDef::new("user_a", Type::Text),
+            ColumnDef::new("user_b", Type::Text),
+            ColumnDef::new("weight", Type::Real),
+        ]).unwrap();
+        db.create_index_ex("edges", "uq_pair", &["user_a", "user_b"], true).unwrap();
+
+        // Insert.
+        db.upsert(
+            "edges",
+            &[("user_a", Value::Text("alice".into())), ("user_b", Value::Text("bob".into()))],
+            &[("weight", Value::Real(0.5))],
+        ).unwrap();
+
+        // Second upsert with same key, BUT `set` also includes user_a with
+        // a different value. The find still matches the existing row
+        // (key filter on the original value), then the update writes the
+        // `set` columns — including user_a's new value.
+        db.upsert(
+            "edges",
+            &[("user_a", Value::Text("alice".into())), ("user_b", Value::Text("bob".into()))],
+            &[
+                ("user_a", Value::Text("alice_renamed".into())),  // overlaps key; wins on update
+                ("weight", Value::Real(0.9)),
+            ],
+        ).unwrap();
+
+        // Verify the overlap behavior: user_a is now "alice_renamed".
+        let all = db.find("edges", FindOptions::default()).unwrap();
+        assert_eq!(all.rows.len(), 1, "still only one row");
+        assert_eq!(all.rows[0].get("user_a").unwrap(), Value::Text("alice_renamed".into()),
+            "set value for user_a overrode the key value on the update path");
+        assert_eq!(all.rows[0].get("user_b").unwrap(), Value::Text("bob".into()),
+            "user_b unchanged (not in set)");
+        assert_eq!(all.rows[0].get("weight").unwrap(), Value::Real(0.9));
+    }
+
+    #[test]
+    fn test_upsert_unique_index_match_is_order_insensitive() {
+        // Spec: unique-index match is set-equality, not order-sensitive.
+        // A caller can pass key columns in any order as long as a unique
+        // index with the same column set exists.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.boogy");
+        let db = BoogyDb::open(&path).unwrap();
+        db.create_table("edges", &[
+            ColumnDef::new("user_a", Type::Text),
+            ColumnDef::new("user_b", Type::Text),
+            ColumnDef::new("weight", Type::Real),
+        ]).unwrap();
+        // Index declared as (user_a, user_b).
+        db.create_index_ex("edges", "uq_pair", &["user_a", "user_b"], true).unwrap();
+
+        // Caller passes key in REVERSED order: (user_b, user_a). Should still match.
+        let rowid = db.upsert(
+            "edges",
+            &[("user_b", Value::Text("bob".into())), ("user_a", Value::Text("alice".into()))],
+            &[("weight", Value::Real(0.7))],
+        ).unwrap();
+        assert!(rowid > 0, "reversed-key upsert should succeed");
+
+        // Verify the row.
+        let row = db.get("edges", rowid).unwrap().expect("row exists");
+        assert_eq!(row.get("user_a").unwrap(), Value::Text("alice".into()));
+        assert_eq!(row.get("user_b").unwrap(), Value::Text("bob".into()));
+        assert_eq!(row.get("weight").unwrap(), Value::Real(0.7));
+
+        // Re-upsert with key in YET ANOTHER order — should hit update path.
+        let same_id = db.upsert(
+            "edges",
+            &[("user_a", Value::Text("alice".into())), ("user_b", Value::Text("bob".into()))],
+            &[("weight", Value::Real(0.99))],
+        ).unwrap();
+        assert_eq!(same_id, rowid, "different key column order still finds the same row");
     }
 
     // --- Task 2: versioned system-page column format tests ---
