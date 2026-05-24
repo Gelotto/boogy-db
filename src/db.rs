@@ -356,6 +356,13 @@ fn tag_to_type(tag: u8) -> Result<Type> {
 ///
 /// = PAGE_SIZE - PAGE_HEADER_SIZE - 4 (checksum) - OVERFLOW_TRAILER_SIZE
 /// = 4096 - 16 - 4 - 10 = 4066
+///
+/// **Invariant:** must accommodate the largest single TableMeta record's
+/// trailing `encrypted` flag byte. Shrinking this value below what the
+/// last table's encrypted flag would need would silently default that
+/// flag to `false` on inline-only reads. Currently safe because a single
+/// TableMeta never exceeds a few hundred bytes; flagged so a future
+/// trailer-extension doesn't accidentally cut into the last-flag slot.
 const SYSTEM_INLINE_BUDGET: usize = PAGE_SIZE
     - PAGE_HEADER_SIZE
     - 4 /* checksum */
@@ -492,6 +499,14 @@ fn serialize_system_page(
         .copy_from_slice(&crate::overflow::OVERFLOW_MAGIC);
     page0.data[trailer_start + 2..trailer_start + 6]
         .copy_from_slice(&page_numbers[0].to_le_bytes());
+    // Guard against silent u32 truncation if a schema were absurdly large.
+    // Practically impossible (no schema is 4GB) but a load-bearing serializer
+    // shouldn't have a silent lossy cast.
+    debug_assert!(
+        overflow_bytes.len() <= u32::MAX as usize,
+        "system page overflow exceeds u32 ({})",
+        overflow_bytes.len(),
+    );
     page0.data[trailer_start + 6..trailer_start + 10]
         .copy_from_slice(&(overflow_bytes.len() as u32).to_le_bytes());
 
@@ -745,6 +760,14 @@ fn deserialize_system_page(
         page0.data[trailer_start + 6..trailer_end].try_into().unwrap(),
     ) as usize;
 
+    // Defensive: a present trailer with first_page == 0 and remaining_len > 0
+    // is a corrupt trailer (clearer diagnostic than "chain truncated: 0 of N").
+    if first_page == 0 && remaining_len > 0 {
+        return Err(BoogyError::Corruption(format!(
+            "system page trailer present but first_page is 0 (remaining_len={remaining_len})"
+        )));
+    }
+
     let mut bytes = Vec::with_capacity(SYSTEM_INLINE_BUDGET + remaining_len);
     bytes.extend_from_slice(&page0.data[inline_start..trailer_start]);
 
@@ -752,6 +775,15 @@ fn deserialize_system_page(
     let mut accumulated = 0usize;
     while current != 0 && accumulated < remaining_len {
         let page = file.read_page(current)?;
+        // Defensive: in a corrupt or future-free-list scenario, a chain link
+        // could point at a non-overflow page (e.g. a btree node). Validate the
+        // page type before trusting its overflow-payload-len byte.
+        if !page.is_overflow() {
+            return Err(BoogyError::Corruption(format!(
+                "system page chain hit non-overflow page {current} (flags=0x{:04X})",
+                page.flags()
+            )));
+        }
         let payload = crate::overflow::read_overflow_payload(&page);
         let take = (remaining_len - accumulated).min(payload.len());
         bytes.extend_from_slice(&payload[..take]);
